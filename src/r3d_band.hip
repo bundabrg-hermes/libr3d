@@ -281,7 +281,7 @@ extern "C" int r3d_rad_quant_act_fp8(const RadArgs* a, RadStream s) {
     if (row2_pitch(sc, ngrp, &sp)) return RAD_E_STRIDE;
     quant_act_fp8_kernel<<<dim3((uint32_t)(rows * ngrp)), dim3(kThreads), 0,
                            (hipStream_t)(uintptr_t)s>>>(
-        (const uint8_t*)x->data, x->dtype, xp, (uint8_t*)q->data, qp,
+        (const uint8_t*)x->data, x->dtype, rad_dtype_bytes(x->dtype, xp), (uint8_t*)q->data, qp,
         (float*)sc->data, sp, n, g, ngrp);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
@@ -313,9 +313,10 @@ extern "C" int r3d_rad_gated_quant_fp8(const RadArgs* a, RadStream s) {
     if (ob) { if (row2_pitch(ob, n, &op)) return RAD_E_STRIDE; }
     gated_quant_fp8_kernel<<<dim3((uint32_t)rows), dim3(kThreads), 0,
                              (hipStream_t)(uintptr_t)s>>>(
-        (const uint8_t*)gu->data, gu->dtype, gp, 1,
+        (const uint8_t*)gu->data, gu->dtype, rad_dtype_bytes(gu->dtype, gp), 1,
         (uint8_t*)q->data, qp, (float*)sc->data, sp,
-        ob ? (uint8_t*)ob->data : nullptr, ob ? ob->dtype : RAD_F32, op,
+        ob ? (uint8_t*)ob->data : nullptr, ob ? ob->dtype : RAD_F32,
+        ob ? rad_dtype_bytes(ob->dtype, op) : 0,
         n, g, ngrp, silu);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
@@ -343,9 +344,9 @@ extern "C" int r3d_rad_add(const RadArgs* a, RadStream s) {
     if (bcast) { if (row2_pitch(B, n, &bp)) return RAD_E_STRIDE; bp = 0; }
     else if (row2_pitch(B, n, &bp)) return RAD_E_STRIDE;
     add_kernel<<<dim3((uint32_t)rows), dim3(kThreads), 0, (hipStream_t)(uintptr_t)s>>>(
-        (const uint8_t*)A->data, A->dtype, ap, 1,
-        (const uint8_t*)B->data, B->dtype, bp, 1,
-        (uint8_t*)Y->data, Y->dtype, yp, 1,
+        (const uint8_t*)A->data, A->dtype, rad_dtype_bytes(A->dtype, ap), 1,
+        (const uint8_t*)B->data, B->dtype, rad_dtype_bytes(B->dtype, bp), 1,
+        (uint8_t*)Y->data, Y->dtype, rad_dtype_bytes(Y->dtype, yp), 1,
         n, div, use_div);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
@@ -368,8 +369,8 @@ extern "C" int r3d_rad_gather_rows(const RadArgs* a, RadStream s) {
     if (row2_pitch(x, n, &xp)) return RAD_E_STRIDE;
     if (row2_pitch(y, n, &yp)) return RAD_E_STRIDE;
     gather_rows_kernel<<<dim3((uint32_t)rows), dim3(kThreads), 0, (hipStream_t)(uintptr_t)s>>>(
-        (const uint8_t*)x->data, x->dtype, xp, 1,
+        (const uint8_t*)x->data, x->dtype, rad_dtype_bytes(x->dtype, xp), 1,
         (const int32_t*)idx->data,
-        (uint8_t*)y->data, y->dtype, yp, 1, n, src_rows);
+        (uint8_t*)y->data, y->dtype, rad_dtype_bytes(y->dtype, yp), 1, n, src_rows);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
