@@ -425,12 +425,14 @@ __global__ __launch_bounds__(kThreads) void penalties_kernel(
  * -- the oracle is the plugin). Distinct continuation tokens and their longest repeat live
  * in dynamic LDS (8 bytes a window slot); the entry refuses windows past 6144. The penalty
  * is the repeated-multiplication form with ref's FLT_MAX/base stop, so every
- * implementation computes the same float. */
+ * implementation computes the same float. The breaker plane is read as declared: u8 is
+ * what the engine and the reference shapes pass, i32 is accepted too. */
+template <typename BrkT>
 __global__ __launch_bounds__(kThreads) void dry_kernel(
     float* __restrict__ lg, int64_t lg_pitch, int64_t n_vocab,
     const RadSampleParams* __restrict__ p,
     const int32_t* __restrict__ hist, int64_t hist_pitch,
-    const int32_t* __restrict__ brk, int64_t brk_pitch,
+    const BrkT* __restrict__ brk, int64_t brk_pitch,
     int32_t voff) {
     extern __shared__ int32_t sm32[];          /* [hl] tokens then [hl] lengths */
     if (threadIdx.x != 0) return;
@@ -446,7 +448,7 @@ __global__ __launch_bounds__(kThreads) void dry_kernel(
     if (cap < allowed) return;
 
     const int32_t* __restrict__ hr = hist + m * hist_pitch + ho;
-    const int32_t* __restrict__ br = brk ? brk + m * brk_pitch + ho : nullptr;
+    const BrkT* __restrict__ br = brk ? brk + m * brk_pitch + ho : nullptr;
     float* __restrict__ lr = lg + m * lg_pitch;
     int32_t* __restrict__ tl = sm32;
     int32_t* __restrict__ ll = sm32 + hl;
@@ -767,14 +769,29 @@ extern "C" int r3d_rad_sample_dry(const RadArgs* a, RadStream s) {
     int64_t hi_p; if (hist_plane(hi, M, &hi_p)) return RAD_E_SHAPE;
     /* The distinct-token map is two int32 arrays of the window, in LDS. */
     if (hi_p > 6144) return RAD_E_SHAPE;
+    /* Breakers: [M, max_hist] beside history, u8 as the reference shapes declare (about
+     * half the positions marked in the recorded cases), i32 accepted too. */
+    const bool brk_u8 = bk && (bk->dtype == RAD_U8 || bk->dtype == RAD_I32);
+    if (bk && !brk_u8) return RAD_E_DTYPE;
     int64_t bk_p = 0;
-    if (bk && hist_plane(bk, M, &bk_p)) return RAD_E_SHAPE;
+    if (bk) {
+        if (bk->rank != 2 || bk->stride[1] != 1 || bk->stride[0] != bk->shape[1])
+            return RAD_E_STRIDE;
+        if (bk->shape[1] < hi_p || rad_tensor_numel(bk) < M * hi_p) return RAD_E_SHAPE;
+        bk_p = bk->stride[0];
+    }
     long long voff = 0; rad_args_geti(a, "vocab_off", &voff);
-    hipLaunchKernelGGL(dry_kernel, dim3((uint32_t)M), dim3(kThreads),
-                       (unsigned)(2 * hi_p * (int64_t)sizeof(int32_t)),
-                       (hipStream_t)(uintptr_t)s, (float*)lg->data, lg_p, nv,
-                       (const RadSampleParams*)pr->data, (const int32_t*)hi->data, hi_p,
-                       bk ? (const int32_t*)bk->data : nullptr, bk_p, (int32_t)voff);
+    const unsigned smem = (unsigned)(2 * hi_p * (int64_t)sizeof(int32_t));
+    if (bk && bk->dtype == RAD_I32)
+        hipLaunchKernelGGL(dry_kernel<int32_t>, dim3((uint32_t)M), dim3(kThreads), smem,
+                           (hipStream_t)(uintptr_t)s, (float*)lg->data, lg_p, nv,
+                           (const RadSampleParams*)pr->data, (const int32_t*)hi->data, hi_p,
+                           (const int32_t*)bk->data, bk_p, (int32_t)voff);
+    else
+        hipLaunchKernelGGL(dry_kernel<uint8_t>, dim3((uint32_t)M), dim3(kThreads), smem,
+                           (hipStream_t)(uintptr_t)s, (float*)lg->data, lg_p, nv,
+                           (const RadSampleParams*)pr->data, (const int32_t*)hi->data, hi_p,
+                           bk ? (const uint8_t*)bk->data : nullptr, bk_p, (int32_t)voff);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
