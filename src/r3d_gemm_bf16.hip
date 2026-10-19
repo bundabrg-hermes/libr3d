@@ -222,10 +222,16 @@ static int gemm_nt_launch(const RadArgs* a, RadStream s, const char* n_name, con
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
 
 #ifdef R3D_DIAG
-    fprintf(stderr, "[r3d-diag] gemm M=%lld N=%lld K=%lld a16=%d b16=%d b_pitch=%lld\n",
-                        M, N, K,
-                        ((uintptr_t)A->data & 15u) == 0, ((uintptr_t)B->data & 15u) == 0,
-                        (long long)b_pitch);
+    {
+        char ys[96]; int yl = snprintf(ys, sizeof ys, "y=[");
+        for (uint32_t i = 0; i < Y->rank && yl < 60; ++i)
+            yl += snprintf(ys + yl, sizeof ys - yl, "%lld,", (long long)Y->shape[i]);
+        snprintf(ys + yl, sizeof ys - yl, "]");
+        fprintf(stderr, "[r3d-diag] gemm M=%lld N=%lld K=%lld %s a16=%d b16=%d b_pitch=%lld\n",
+                            M, N, K, ys,
+                            ((uintptr_t)A->data & 15u) == 0, ((uintptr_t)B->data & 15u) == 0,
+                            (long long)b_pitch);
+    }
 #endif
 
     /* Decode band: M == 1 goes to the GEMV row when vectors can be trusted -- K and the
