@@ -49,7 +49,8 @@ __device__ __forceinline__ uint16_t r3d_f32_to_bf16(float f) {
 template <typename Tok>
 __global__ __launch_bounds__(kThreads) void rope_kernel(
     uint16_t* __restrict__ qkv, const Tok* __restrict__ pos,
-    int64_t row_pitch, int64_t ds, uint32_t half, uint32_t rot, uint32_t heads, int mode,
+    int64_t row_pitch, int64_t pos_stride, int64_t ds,
+    uint32_t half, uint32_t rot, uint32_t heads, int mode,
     float theta, float div) {
     extern __shared__ float inv[];
     const int64_t m = blockIdx.x;
@@ -60,9 +61,9 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
         inv[i] = 1.0f / (float)pow((double)theta, (double)((float)(2u * i) / (float)rot));
     __syncthreads();
 
-    /* rope_pos: the position's value divided by the position scale in f32. An integer
-     * operand contributes its (float) value; a float operand its own. */
-    const float p = (float)(double)pos[m] / div;
+    /* rope_pos at the oracle's offset: ref reads offlin(pos, m), which is m * the position
+     * tensor's element stride -- a view into a packed buffer is expressible and recorded. */
+    const float p = (float)(double)pos[m * pos_stride] / div;
 
     uint16_t* __restrict__ xr = qkv + m * row_pitch;
     const uint32_t work = heads * half;
@@ -116,6 +117,8 @@ extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
     const float scale = (float)rad_args_getf_or(a, "scale", 1.0);
     const float div = scale != 0.0f ? scale : 1.0f;
 
+    /* ref's offlin(pos, m) for a rank-1 position tensor: m * its element stride. */
+    const int64_t pos_stride = pos->rank >= 1 ? pos->stride[pos->rank - 1] : 1;
     const int64_t M = rad_tensor_numel(pos);
     const int64_t stride_row = (n_head + 2 * n_head_kv) * head_dim;
     if (M <= 0 || M > 0x7fffffffLL) return RAD_E_SHAPE;
@@ -151,14 +154,14 @@ extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
     if (pos->dtype == RAD_I32)
         hipLaunchKernelGGL((rope_kernel<int32_t>), dim3((uint32_t)M), dim3(kThreads),
                            shmem, stream, (uint16_t*)qkv->data, (const int32_t*)pos->data,
-                           row_pitch, ds, half, (uint32_t)rot, heads, mode, theta, div);
+                           row_pitch, pos_stride, ds, half, (uint32_t)rot, heads, mode, theta, div);
     else if (pos->dtype == RAD_I64)
         hipLaunchKernelGGL((rope_kernel<int64_t>), dim3((uint32_t)M), dim3(kThreads),
                            shmem, stream, (uint16_t*)qkv->data, (const int64_t*)pos->data,
-                           row_pitch, ds, half, (uint32_t)rot, heads, mode, theta, div);
+                           row_pitch, pos_stride, ds, half, (uint32_t)rot, heads, mode, theta, div);
     else
         hipLaunchKernelGGL((rope_kernel<float>), dim3((uint32_t)M), dim3(kThreads),
                            shmem, stream, (uint16_t*)qkv->data, (const float*)pos->data,
-                           row_pitch, ds, half, (uint32_t)rot, heads, mode, theta, div);
+                           row_pitch, pos_stride, ds, half, (uint32_t)rot, heads, mode, theta, div);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
