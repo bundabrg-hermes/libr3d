@@ -31,3 +31,5 @@ HIP_FLAGS = -O3 -DNDEBUG -std=gnu++20 --offload-arch=gfx1101 --offload-arch=gfx1
 
 # Custom options: CMakeFiles/libr3d.dir/src/r3d_attn_paged.hip.o_OPTIONS = -ffp-contract=off;-mno-wavefrontsize64;-cuid=c19035bcdb39e2e6
 
+# Custom options: CMakeFiles/libr3d.dir/src/r3d_sample.hip.o_OPTIONS = -ffp-contract=off;-mno-wavefrontsize64;-cuid=79a0591dc101df7a
+

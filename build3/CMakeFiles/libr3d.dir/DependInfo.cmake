@@ -16,6 +16,7 @@ set(CMAKE_DEPENDS_CHECK_HIP
   "/work/src/r3d_kvstore.hip" "/work/build3/CMakeFiles/libr3d.dir/src/r3d_kvstore.hip.o"
   "/work/src/r3d_rmsnorm.hip" "/work/build3/CMakeFiles/libr3d.dir/src/r3d_rmsnorm.hip.o"
   "/work/src/r3d_rope.hip" "/work/build3/CMakeFiles/libr3d.dir/src/r3d_rope.hip.o"
+  "/work/src/r3d_sample.hip" "/work/build3/CMakeFiles/libr3d.dir/src/r3d_sample.hip.o"
   )
 set(CMAKE_HIP_COMPILER_ID "Clang")
 

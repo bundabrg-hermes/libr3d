@@ -390,6 +390,30 @@ src/r3d_rows.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/libr3d.dir/build.make CMakeFiles/libr3d.dir/src/r3d_rows.cpp.s
 .PHONY : src/r3d_rows.cpp.s
 
+src/r3d_sample.o: src/r3d_sample.hip.o
+.PHONY : src/r3d_sample.o
+
+# target to build an object file
+src/r3d_sample.hip.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/libr3d.dir/build.make CMakeFiles/libr3d.dir/src/r3d_sample.hip.o
+.PHONY : src/r3d_sample.hip.o
+
+src/r3d_sample.i: src/r3d_sample.hip.i
+.PHONY : src/r3d_sample.i
+
+# target to preprocess a source file
+src/r3d_sample.hip.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/libr3d.dir/build.make CMakeFiles/libr3d.dir/src/r3d_sample.hip.i
+.PHONY : src/r3d_sample.hip.i
+
+src/r3d_sample.s: src/r3d_sample.hip.s
+.PHONY : src/r3d_sample.s
+
+# target to generate assembly for a file
+src/r3d_sample.hip.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/libr3d.dir/build.make CMakeFiles/libr3d.dir/src/r3d_sample.hip.s
+.PHONY : src/r3d_sample.hip.s
+
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -430,6 +454,9 @@ help:
 	@echo "... src/r3d_rows.o"
 	@echo "... src/r3d_rows.i"
 	@echo "... src/r3d_rows.s"
+	@echo "... src/r3d_sample.o"
+	@echo "... src/r3d_sample.i"
+	@echo "... src/r3d_sample.s"
 .PHONY : help
 
 

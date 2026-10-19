@@ -49,3 +49,10 @@ CMakeFiles/libr3d.dir/src/r3d_rope.hip.o: \
  /opt/radiance/include/radiance/rad_plugin.h \
  /opt/radiance/include/radiance/rad_types.h \
  /work/src/r3d_rope.hip
+CMakeFiles/libr3d.dir/src/r3d_sample.hip.o: \
+ /opt/radiance/include/radiance/rad_abi.h \
+ /opt/radiance/include/radiance/rad_encoding.h \
+ /opt/radiance/include/radiance/rad_plugin.h \
+ /opt/radiance/include/radiance/rad_sample.h \
+ /opt/radiance/include/radiance/rad_types.h \
+ /work/src/r3d_sample.hip

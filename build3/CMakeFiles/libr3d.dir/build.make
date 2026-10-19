@@ -187,6 +187,19 @@ CMakeFiles/libr3d.dir/src/r3d_attn_paged.hip.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling HIP source to assembly CMakeFiles/libr3d.dir/src/r3d_attn_paged.hip.s"
 	/opt/rocm/core-10.1/lib/llvm/bin/clang++ $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -ffp-contract=off -mno-wavefrontsize64 -cuid=c19035bcdb39e2e6 -S /work/src/r3d_attn_paged.hip -o CMakeFiles/libr3d.dir/src/r3d_attn_paged.hip.s
 
+CMakeFiles/libr3d.dir/src/r3d_sample.hip.o: CMakeFiles/libr3d.dir/flags.make
+CMakeFiles/libr3d.dir/src/r3d_sample.hip.o: /work/src/r3d_sample.hip
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/work/build3/CMakeFiles --progress-num=$(CMAKE_PROGRESS_10) "Building HIP object CMakeFiles/libr3d.dir/src/r3d_sample.hip.o"
+	/opt/rocm/core-10.1/lib/llvm/bin/clang++  $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -ffp-contract=off -mno-wavefrontsize64 -cuid=79a0591dc101df7a -o CMakeFiles/libr3d.dir/src/r3d_sample.hip.o -x hip -c /work/src/r3d_sample.hip
+
+CMakeFiles/libr3d.dir/src/r3d_sample.hip.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing HIP source to CMakeFiles/libr3d.dir/src/r3d_sample.hip.i"
+	/opt/rocm/core-10.1/lib/llvm/bin/clang++ $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -ffp-contract=off -mno-wavefrontsize64 -cuid=79a0591dc101df7a -E /work/src/r3d_sample.hip > CMakeFiles/libr3d.dir/src/r3d_sample.hip.i
+
+CMakeFiles/libr3d.dir/src/r3d_sample.hip.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling HIP source to assembly CMakeFiles/libr3d.dir/src/r3d_sample.hip.s"
+	/opt/rocm/core-10.1/lib/llvm/bin/clang++ $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -ffp-contract=off -mno-wavefrontsize64 -cuid=79a0591dc101df7a -S /work/src/r3d_sample.hip -o CMakeFiles/libr3d.dir/src/r3d_sample.hip.s
+
 # Object files for target libr3d
 libr3d_OBJECTS = \
 "CMakeFiles/libr3d.dir/src/r3d_rows.cpp.o" \
@@ -197,7 +210,8 @@ libr3d_OBJECTS = \
 "CMakeFiles/libr3d.dir/src/r3d_cast.hip.o" \
 "CMakeFiles/libr3d.dir/src/r3d_rope.hip.o" \
 "CMakeFiles/libr3d.dir/src/r3d_gemm_bf16.hip.o" \
-"CMakeFiles/libr3d.dir/src/r3d_attn_paged.hip.o"
+"CMakeFiles/libr3d.dir/src/r3d_attn_paged.hip.o" \
+"CMakeFiles/libr3d.dir/src/r3d_sample.hip.o"
 
 # External object files for target libr3d
 libr3d_EXTERNAL_OBJECTS =
@@ -211,11 +225,12 @@ radiance_home/kernels/libr3d.so: CMakeFiles/libr3d.dir/src/r3d_cast.hip.o
 radiance_home/kernels/libr3d.so: CMakeFiles/libr3d.dir/src/r3d_rope.hip.o
 radiance_home/kernels/libr3d.so: CMakeFiles/libr3d.dir/src/r3d_gemm_bf16.hip.o
 radiance_home/kernels/libr3d.so: CMakeFiles/libr3d.dir/src/r3d_attn_paged.hip.o
+radiance_home/kernels/libr3d.so: CMakeFiles/libr3d.dir/src/r3d_sample.hip.o
 radiance_home/kernels/libr3d.so: CMakeFiles/libr3d.dir/build.make
 radiance_home/kernels/libr3d.so: /opt/rocm/lib/libamdhip64.so
 radiance_home/kernels/libr3d.so: /opt/rocm/core-10.1/lib/libamdhip64.so.7.16.26385-0000000
 radiance_home/kernels/libr3d.so: CMakeFiles/libr3d.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/work/build3/CMakeFiles --progress-num=$(CMAKE_PROGRESS_10) "Linking HIP shared module radiance_home/kernels/libr3d.so"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/work/build3/CMakeFiles --progress-num=$(CMAKE_PROGRESS_11) "Linking HIP shared module radiance_home/kernels/libr3d.so"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/libr3d.dir/link.txt --verbose=$(VERBOSE)
 	/usr/bin/cmake -E make_directory /work/build3/radiance_home/kernels/../architectures
 

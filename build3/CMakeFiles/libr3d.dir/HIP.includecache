@@ -26,6 +26,10 @@ rad_abi.h
 string.h
 -
 
+/opt/radiance/include/radiance/rad_sample.h
+rad_types.h
+/opt/radiance/include/radiance/rad_types.h
+
 /opt/radiance/include/radiance/rad_types.h
 stdint.h
 -
@@ -34,11 +38,13 @@ stddef.h
 string.h
 -
 
-/work/src/r3d_attn_paged.hip
+/work/src/r3d_sample.hip
 hip/hip_runtime.h
 -
 rad_abi.h
 /work/src/rad_abi.h
 rad_plugin.h
 /work/src/rad_plugin.h
+rad_sample.h
+/work/src/rad_sample.h
 

@@ -9,6 +9,7 @@ file(REMOVE_RECURSE
   "CMakeFiles/libr3d.dir/src/r3d_rope.hip.o"
   "CMakeFiles/libr3d.dir/src/r3d_rows.cpp.o"
   "CMakeFiles/libr3d.dir/src/r3d_rows.cpp.o.d"
+  "CMakeFiles/libr3d.dir/src/r3d_sample.hip.o"
   "radiance_home/kernels/libr3d.pdb"
   "radiance_home/kernels/libr3d.so"
 )

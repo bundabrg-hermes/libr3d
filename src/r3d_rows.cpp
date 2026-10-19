@@ -187,6 +187,56 @@ static const RadOperandSpec oAttnPaged[] = {
     { "out",         RAD_OPD_OUT, 0 },
 };
 
+/* ---- sampling chain specs (verbatim from libr4d: pMVocab/pTopk/pMCand, oTemp/oMask/
+ * oTopk/oArgmax/oNarrow/oPick). The engine's `params` operand is the RadSampleParams byte
+ * blob (abi/rad_sample.h); n_vocab/n_cand name the leading dimension, vocab_off is the
+ * shard origin and stays 0 in this single-rank scope. */
+static const RadParamSpec pMVocab[] = {
+    { "M",       RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab", RAD_P_INT, RAD_REQUIRED },
+};
+static const RadParamSpec pTopk[] = {
+    { "M",         RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab",   RAD_P_INT, RAD_REQUIRED },
+    { "vocab_off", RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadParamSpec pMCand[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "n_cand", RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oTemp[] = {
+    { "logits", RAD_OPD_INOUT, 0 },
+    { "params", RAD_OPD_IN,    0 },
+};
+static const RadOperandSpec oMask[] = {
+    { "logits",  RAD_OPD_INOUT, 0 },
+    { "params",  RAD_OPD_IN,    0 },
+    { "bitmask", RAD_OPD_IN,    0 },
+};
+static const RadOperandSpec oTopk[] = {
+    { "logits",   RAD_OPD_IN,  0 },
+    { "params",   RAD_OPD_IN,  0 },
+    { "cand_idx", RAD_OPD_OUT, 0 },
+    { "cand_val", RAD_OPD_OUT, 0 },
+    { "pairs",    RAD_OPD_OUT, 1 },
+};
+static const RadOperandSpec oArgmax[] = {
+    { "logits", RAD_OPD_IN,  0 },
+    { "params", RAD_OPD_IN,  0 },
+    { "token",  RAD_OPD_OUT, 0 },
+};
+static const RadOperandSpec oNarrow[] = {
+    { "cand_idx", RAD_OPD_INOUT, 0 },
+    { "cand_val", RAD_OPD_INOUT, 0 },
+    { "params",   RAD_OPD_IN,    0 },
+};
+static const RadOperandSpec oPick[] = {
+    { "cand_idx", RAD_OPD_IN,  0 },
+    { "cand_val", RAD_OPD_IN,  0 },
+    { "params",   RAD_OPD_IN,  0 },
+    { "token",    RAD_OPD_OUT, 0 },
+};
+
 static const RadOpSchema kSchemas[] = {
     { "rmsnorm", pRmsNorm, (int)(sizeof(pRmsNorm)/sizeof(pRmsNorm[0])),
       oRmsNorm,  (int)(sizeof(oRmsNorm)/sizeof(oRmsNorm[0])),
@@ -230,7 +280,35 @@ static const RadOpSchema kSchemas[] = {
       "optional and apply to an fp8 cache. `scale` is not in docs/OPS.md and defaults to "
       "1/sqrt(head_dim). Declared verbatim from libr4d so both plugins agree wherever they "
       "co-load." },
-};
+
+      /* ---- the sampling chain (classic stages only; see r3d_sample.hip's scope note). ---- */
+      /* Param/operand tables verbatim from libr4d (pMVocab/pTopk/pMCand and the o* tables),
+      * so the loader's schema-duplication check passes wherever both plugins co-load. */
+      { "sample_temp", pMVocab, (int)(sizeof(pMVocab)/sizeof(pMVocab[0])),
+       oTemp,   (int)(sizeof(oTemp)/sizeof(oTemp[0])),
+       "per-request temperature. temp <= 0 leaves the row untouched; greedy is sample_argmax." },
+      { "sample_mask", pMVocab, (int)(sizeof(pMVocab)/sizeof(pMVocab[0])),
+       oMask,   (int)(sizeof(oMask)/sizeof(oMask[0])),
+       "A SET BIT MEANS ALLOWED. Word w bit b covers token 32w + b; a cleared bit sets "
+       "-infinity. The row's mask_row selects the plane row, or -1 when unconstrained." },
+      { "sample_topk", pTopk, (int)(sizeof(pTopk)/sizeof(pTopk[0])),
+       oTopk,   (int)(sizeof(oTopk)/sizeof(oTopk[0])),
+       "the exact top-k candidate set, descending, ties to the lower token id. The width is "
+       "the buffer's; a row's own top_k may be narrower and leaves holes." },
+      { "sample_argmax", pMVocab, (int)(sizeof(pMVocab)/sizeof(pMVocab[0])),
+       oArgmax, (int)(sizeof(oArgmax)/sizeof(oArgmax[0])),
+       "greedy, ties to the lower token id." },
+      { "sample_topp", pMCand, (int)(sizeof(pMCand)/sizeof(pMCand[0])),
+       oNarrow, (int)(sizeof(oNarrow)/sizeof(oNarrow[0])),
+       "nucleus: keep the shortest prefix whose cumulative probability reaches top_p, always "
+       "at least one. The candidates are assumed descending, as sample_topk leaves them." },
+      { "sample_minp", pMCand, (int)(sizeof(pMCand)/sizeof(pMCand[0])),
+       oNarrow, (int)(sizeof(oNarrow)/sizeof(oNarrow[0])),
+       "keep candidates whose probability is at least min_p times the most likely one's." },
+      { "sample_pick", pMCand, (int)(sizeof(pMCand)/sizeof(pMCand[0])),
+       oPick,   (int)(sizeof(oPick)/sizeof(oPick[0])),
+       "the inverse-CDF draw over the candidate set, from the specified splitmix64 stream." },
+      };
 
 /* The rmsnorm row. Field order is RadKernelInfo's positional form (rad_abi.h): after the prose,
  * constraints and (absent) tunables come init, fini, launch, scratch, layout, relayout, and
@@ -289,6 +367,11 @@ static const RadConstraint cRopeRow[] = {
     { "mode",     RAD_C_IN, 0, "neox gptj" },
 };
 
+/* Sampler row constraints, mirroring libr4d's cSampleVoc / cSampleCand. */
+static const RadConstraint cSampleVoc[]  = { { "n_vocab", RAD_C_GE, 1, nullptr } };
+static const RadConstraint cSampleCand[] = { { "n_cand", RAD_C_GE, 1, nullptr },
+                                             { "n_cand", RAD_C_LE, 4096, nullptr } };
+
 extern "C" int r3d_rad_rmsnorm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_embed_lookup(const RadArgs*, RadStream);
 extern "C" int r3d_rad_kv_store(const RadArgs*, RadStream);
@@ -297,6 +380,13 @@ extern "C" int r3d_rad_cast(const RadArgs*, RadStream);
 extern "C" int r3d_rad_rope(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt(const RadArgs*, RadStream);
 extern "C" int r3d_rad_attn_paged(const RadArgs*, RadStream);
+extern "C" int r3d_rad_sample_temp(const RadArgs*, RadStream);
+extern "C" int r3d_rad_sample_mask(const RadArgs*, RadStream);
+extern "C" int r3d_rad_sample_argmax(const RadArgs*, RadStream);
+extern "C" int r3d_rad_sample_topk(const RadArgs*, RadStream);
+extern "C" int r3d_rad_sample_topp(const RadArgs*, RadStream);
+extern "C" int r3d_rad_sample_minp(const RadArgs*, RadStream);
+extern "C" int r3d_rad_sample_pick(const RadArgs*, RadStream);
 
 static const RadKernelInfo kRows[] = {
 
@@ -386,6 +476,75 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cAttnPaged, 3, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_attn_paged },
+
+/* ---- the sampling chain. The candidate-width cap on the cand-plane rows mirrors
+ * libr4d's: the engine's declare-time bound is the buffer width, and 4096 covers it.
+ * sample_topk here is k parallel argmax rounds under the (v desc, id asc) order --
+ * exact, deterministic, no radix sort; the vocab widths the fixtures record make the
+ * re-reads L2-resident, and a correctness-first pass is the point of this library. */
+
+{ "sample_temp_f32", "sample_temp", "sample",
+  "per-request temperature over the logits row",
+  "any vocabulary; a row with temp <= 0 or exactly 1 is skipped whole",
+  "f32 logits in place, per-row params",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cSampleVoc, 1, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_sample_temp },
+
+{ "sample_mask_f32", "sample_mask", "sample",
+  "the grammar bitmask -- a cleared bit sets -infinity",
+  "any vocabulary; the plane is [rows, ceil(n_vocab/32)], addressed by the row's mask_row",
+  "f32 logits in place, u32 bitmask, per-row params",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cSampleVoc, 1, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_sample_mask },
+
+{ "sample_argmax_f32", "sample_argmax", "sample",
+  "greedy, ties to the lower token id",
+  "any vocabulary; the block reduction uses the same (value desc, id asc) order as top-k, "
+  "so greedy and top-1 agree",
+  "f32 logits, i32 token",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cSampleVoc, 1, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_sample_argmax },
+
+{ "sample_topk_f32", "sample_topk", "sample",
+  "the exact top-k candidate set, descending, ties to the lower token id",
+  "any vocabulary; n_cand <= 4096; k rounds of block argmax under the (value desc, id asc) "
+  "order reproduce the reference selection exactly, including the tie window after the "
+  "previous pick; the vocab-parallel pairs plane is refused (single-rank scope)",
+  "f32 logits, i32 candidate ids, f32 candidate LOGITS (not probabilities)",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cSampleVoc, 1, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_sample_topk },
+
+{ "sample_topp_f32", "sample_topp", "sample",
+  "nucleus narrowing in place",
+  "n_cand <= 4096; the prefix sum is SEQUENTIAL in f32 in candidate order -- a parallel "
+  "prefix sums in a different order and a candidate at the cut would survive in one and "
+  "not the other",
+  "i32 candidate ids and f32 candidate logits, both in place",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cSampleCand, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_sample_topp },
+
+{ "sample_minp_f32", "sample_minp", "sample",
+  "min-p narrowing in place",
+  "n_cand <= 4096; exp ratios against the max in candidate order, the max always survives",
+  "i32 candidate ids and f32 candidate logits, both in place",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cSampleCand, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_sample_minp },
+
+{ "sample_pick_f32", "sample_pick", "sample",
+  "the inverse-CDF draw over the candidate set, from the spec splitmix64 stream",
+  "n_cand <= 4096; one thread per row accumulates in candidate order so the draw "
+  "reproduces the reference token for token; a fall-through takes the last candidate "
+  "ABOVE -infinity, never a masked tail entry",
+  "i32 candidate ids, f32 candidate logits, i32 token out",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cSampleCand, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_sample_pick },
 
 };
 
