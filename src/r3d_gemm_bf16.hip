@@ -27,8 +27,6 @@
 
 #include <hip/hip_runtime.h>
 
-#include <cstdio>
-
 #include "rad_abi.h"
 #include "rad_plugin.h"
 
@@ -206,7 +204,16 @@ static int gemm_nt_launch(const RadArgs* a, RadStream s, const char* n_name, con
     long long M = 0, N = 0, K = 0;
     if (!rad_args_geti(a, "M", &M) || !rad_args_geti(a, n_name, &N) || !rad_args_geti(a, k_name, &K))
         return RAD_E_SHAPE;
-    if (M <= 0 || N <= 0 || K <= 0) return RAD_E_SHAPE;
+    if (N <= 0 || K <= 0) return RAD_E_SHAPE;
+
+    /* The row count is numel(Y)/N, exactly how ref_gemm.cpp gemm_nt_impl derives it. The
+     * schema-required "M" parameter is NOT it: the engine passes the step-batch arena
+     * capacity there (8192 at --max-num-batched-tokens 8192) while Y carries the live
+     * rows ([1,N] at decode). Trusting the parameter computes a full prefill batch on
+     * every decode token -- 0.35 tok/s measured -- and writes garbage into arena rows
+     * the engine never reads, which no guard catches because the arena is that big. */
+    M = rad_tensor_numel(Y) / N;
+    if (M <= 0) return RAD_E_SHAPE;
     if (M > 0x7ffffffLL || N > 0x7ffffffLL || K > 0x7ffffffLL) return RAD_E_SHAPE;
 
     /* Contiguous innermost axes or nothing: this kernel's loads index elements directly. */
@@ -220,19 +227,6 @@ static int gemm_nt_launch(const RadArgs* a, RadStream s, const char* n_name, con
     if (rad_tensor_numel(B) < N * K) return RAD_E_SHAPE;
 
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
-
-#ifdef R3D_DIAG
-    {
-        char ys[96]; int yl = snprintf(ys, sizeof ys, "y=[");
-        for (uint32_t i = 0; i < Y->rank && yl < 60; ++i)
-            yl += snprintf(ys + yl, sizeof ys - yl, "%lld,", (long long)Y->shape[i]);
-        snprintf(ys + yl, sizeof ys - yl, "]");
-        fprintf(stderr, "[r3d-diag] gemm M=%lld N=%lld K=%lld %s a16=%d b16=%d b_pitch=%lld\n",
-                            M, N, K, ys,
-                            ((uintptr_t)A->data & 15u) == 0, ((uintptr_t)B->data & 15u) == 0,
-                            (long long)b_pitch);
-    }
-#endif
 
     /* Decode band: M == 1 goes to the GEMV row when vectors can be trusted -- K and the
      * weight row pitch divisible by 8 (a uint4 walk stays inside the row and stays
