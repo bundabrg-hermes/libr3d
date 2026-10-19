@@ -222,8 +222,8 @@ static int gemm_nt_launch(const RadArgs* a, RadStream s, const char* n_name, con
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
 
 #ifdef R3D_DIAG
-    if (M == 1) fprintf(stderr, "[r3d-diag] gemm M=1 N=%lld K=%lld a=%p b=%p a16=%d b16=%d b_pitch=%lld\n",
-                        N, K, A->data, B->data,
+    fprintf(stderr, "[r3d-diag] gemm M=%lld N=%lld K=%lld a16=%d b16=%d b_pitch=%lld\n",
+                        M, N, K,
                         ((uintptr_t)A->data & 15u) == 0, ((uintptr_t)B->data & 15u) == 0,
                         (long long)b_pitch);
 #endif
