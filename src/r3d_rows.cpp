@@ -929,7 +929,7 @@ static const RadKernelInfo kRows[] = {
   "n a multiple of 4, group 128; one workgroup per row, the row staged in LDS (<= 30720)",
   "bf16 in, fp8_e4m3 codes with an f32 per-group scale, optional bf16/f32 out_bf16",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
-  cRmsNormQuantFp8, 6, nullptr, 0, nullptr,
+  cRmsNormQuantFp8, 3, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_rmsnorm_quant_fp8 },
 
 };
