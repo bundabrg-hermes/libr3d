@@ -24,10 +24,38 @@ const RadPluginInfo* rad_plugin_info(void) {
     return &info;
 }
 
-/* Kernel rows and their op schemas. libr3d declares no schemas: libref already fixes the
- * rmsnorm schema (first declarer wins), and re-declaring it risks the loader's disagreement
- * refusal for zero gain. Every op libr3d implements gets a RadKernelInfo row here, honouring
- * libref's schema for its op. */
+/* Kernel rows and their op schemas. Every op a plugin implements must have its schema
+ * declared by some *loaded kernel plugin* (loader.cpp stages rad_kernel_schema_count/at per
+ * plugin; libref is a kbench oracle, not a search-path plugin, so it fixes nothing). On RDNA3
+ * libr3d is that declarer, and a kernel whose op has no declared schema is an error:
+ *   "implements op 'rmsnorm', which no loaded plugin declares a schema for"
+ * The schema below is copied verbatim from libr4d's kSchemas entry, so where libr4d is also
+ * present (an RDNA4 box or a mixed rig) the loader's schema_same() check passes and first
+ * declarer wins with no refusal. Any future op libr3d implements must likewise arrive with
+ * its schema declared here, identical to libr4d's where one exists. */
+
+/* rmsnorm: verbatim libr4d (r4d_rows.cpp pRmsNorm/oRmsNorm). `wadd` is GemmaRMSNorm's `1 +`;
+ * `mult` scales the row before its one rounding. `w` optional: absent, the gain is one. */
+static const RadParamSpec pRmsNorm[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "eps",   RAD_P_F64, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    { "wadd",  RAD_P_F64, RAD_OPTIONAL },
+    { "mult",  RAD_P_F64, RAD_OPTIONAL },
+};
+static const RadOperandSpec oRmsNorm[] = {
+    { "x", RAD_OPD_IN,     0 },
+    { "w", RAD_OPD_WEIGHT, 1 },
+    { "y", RAD_OPD_OUT,    0 },
+};
+
+static const RadOpSchema kSchemas[] = {
+    { "rmsnorm", pRmsNorm, (int)(sizeof(pRmsNorm)/sizeof(pRmsNorm[0])),
+      oRmsNorm,  (int)(sizeof(oRmsNorm)/sizeof(oRmsNorm[0])),
+      "y = x * rsqrt(mean(x^2) + eps) * (w + wadd). Declared verbatim from libr4d so both "
+      "plugins agree wherever they co-load." },
+};
 
 /* The rmsnorm row. Field order is RadKernelInfo's positional form (rad_abi.h): after the prose,
  * constraints and (absent) tunables come init, fini, launch, scratch, layout, relayout, and
@@ -56,8 +84,10 @@ static const RadKernelInfo kRows[] = {
 
 };
 
-int rad_kernel_schema_count(void) { return 0; }
-const RadOpSchema* rad_kernel_schema_at(int) { return nullptr; }
+int rad_kernel_schema_count(void) { return (int)(sizeof(kSchemas) / sizeof(kSchemas[0])); }
+const RadOpSchema* rad_kernel_schema_at(int i) {
+    return (i >= 0 && i < rad_kernel_schema_count()) ? &kSchemas[i] : nullptr;
+}
 
 int rad_kernel_count(void) { return (int)(sizeof(kRows) / sizeof(kRows[0])); }
 const RadKernelInfo* rad_kernel_at(int i) {

@@ -34,5 +34,14 @@ rad_add_plugin(libr3d kernels
   GPU_TARGETS ${R3D_GPU_TARGETS}
   INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+# rad_add_plugin stages ${CMAKE_BINARY_DIR}/radiance_home/kernels/. The engine's search path
+# demands a sibling architectures/ directory to exist (loader: "plugin directory
+# '<home>/architectures': No such file or directory"), which a real $RADIANCE_HOME always has.
+# We ship no architecture plugins, so an empty one makes the build output directly usable as
+# --home for rad-info.
+add_custom_command(TARGET libr3d POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory
+          "$<TARGET_FILE_DIR:libr3d>/../architectures")
+
 # Later phases add HIP_SOURCES units beside their entry points, one translation unit per
 # kernel geometry, as libr4d does.
