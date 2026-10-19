@@ -144,7 +144,7 @@ __device__ __forceinline__ float r3d_dot8_bf16(const uint4& av, const uint4& bv,
 __global__ __launch_bounds__(kGemvThreads) void gemv_nt_bf16_kernel(
     const uint16_t* __restrict__ A, const uint16_t* __restrict__ B,
     uint16_t* __restrict__ Y, float* __restrict__ Yf,
-    int N, int K, int64_t b_pitch, int64_t y_pitch) {
+    int N, int K, int64_t b_pitch) {
 
     const int lane = threadIdx.x & (kWave - 1);
     const int row  = blockIdx.x * kGemvRows + (threadIdx.x / kWave);
@@ -162,9 +162,14 @@ __global__ __launch_bounds__(kGemvThreads) void gemv_nt_bf16_kernel(
     for (int o = kWave / 2; o > 0; o >>= 1)
         acc += __shfl_xor_sync(0xffffffffffffffffull, acc, o);  /* ROCm 10.1: mask must be 64-bit */
 
+    /* Store flat at [row], NOT row*y_pitch: y_pitch is the pitch BETWEEN M rows (the
+     * ref fold), and this kernel is the M == 1 band -- the tile kernel's m = 0 store is
+     * Y[0 + n] for every column n, so the matching store here is Y[row]. Scaling by
+     * y_pitch walks off the end: kbench's first M=1 gemm_nt case caught exactly that
+     * as a write fault ~1.4 MiB past the end of the operand pool. */
     if (row < N && lane == 0) {
-        if (Yf) Yf[(int64_t)row * y_pitch] = acc;
-        else    Y[(int64_t)row * y_pitch]  = r3d_f32_to_bf16(acc);
+        if (Yf) Yf[row] = acc;
+        else    Y[row]  = r3d_f32_to_bf16(acc);
     }
 }
 
@@ -225,7 +230,7 @@ static int gemm_nt_launch(const RadArgs* a, RadStream s, const char* n_name, con
                            (const uint16_t*)A->data, (const uint16_t*)B->data,
                            (uint16_t*)Y->data,
                            Y->dtype == RAD_F32 ? (float*)Y->data : nullptr,
-                           (int)N, (int)K, b_pitch, y_pitch);
+                           (int)N, (int)K, b_pitch);
         return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
     }
 
