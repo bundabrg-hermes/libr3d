@@ -1,0 +1,38 @@
+# Dev image for libr3d: ROCm toolchain + a pinned out-of-tree install of radiance.
+#
+# Deliberately NOT radiance's shipping Dockerfile: that rebuilds ROCm's libLLVM for shipped-
+# binary repeatability (VOPD pairing patch) and builds the RDNA4 image. For developing and
+# kbench-checking an out-of-tree plugin we need the same ROCm (10.1.0-full, matching the
+# shipping image's) with radiance installed so `find_package(radiance)` resolves.
+#
+#   docker build -t radiance-dev docker/
+#   docker run --device /dev/kfd --device /dev/dri -v $PWD:/work radiance-dev <cmd>   # on a GPU host
+#
+# RAM note: a device-kernel TU takes 2-3 GB under hipcc; the -j below suits an 8 GB VM.
+
+FROM rocm/dev-ubuntu-24.04:10.1.0-full
+
+ARG RAD_REF=v1.8.1
+ARG GPU_TARGETS=gfx1101;gfx11-generic
+ARG JOBS=4
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      cmake ninja-build git ca-certificates gawk \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --quiet https://codeberg.org/StillDeadcode/radiance.git /opt/radiance-src \
+ && cd /opt/radiance-src && git checkout --detach "$RAD_REF"
+
+# Prefix must be named at configure time (README: install-tree plugin discovery).
+RUN cmake -S /opt/radiance-src -B /opt/radiance-build -G Ninja \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_INSTALL_PREFIX=/opt/radiance \
+      -DRAD_GPU_TARGETS="${GPU_TARGETS}" \
+ && cmake --build /opt/radiance-build -j"${JOBS}" \
+ && cmake --install /opt/radiance-build \
+ && rm -rf /opt/radiance-build
+
+ENV CMAKE_PREFIX_PATH=/opt/radiance
+ENV RADIANCE_HOME=/opt/radiance/share/radiance
+ENV PATH=/opt/radiance/bin:$PATH
+WORKDIR /work
