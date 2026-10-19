@@ -44,9 +44,10 @@ sample_logprobs` — exact served subset to be confirmed with `--debug-graph` on
 
 **Ported and oracle-green on the card (2026-10-19):** embed_lookup, rmsnorm, kv_store,
 act_mul (all four acts), cast (bf16 copy / widen / narrow), rope (neox+gptj; multi-component
-modes and yarn/llama3 refused by constraint), gemm_nt (bf16, correctness-first tile).
-Remaining Tier 1: **attn_paged** (second big one; per head_dim/gqa geometry), then the
-sampler chain. WMMA speed variants of gemm_nt are a Tier-1.5 optimization, not a gate.
+modes and yarn/llama3 refused by constraint), gemm_nt (bf16, correctness-first tile),
+attn_paged (decode + windowed, correctness-first).
+Remaining Tier 1: the sampler chain, then the MiniCPM5-2B bf16 serve test. WMMA speed
+variants of gemm_nt are a Tier-1.5 optimization, not a gate.
 
 ## Tier 2 — multi-rank and shapes
 
@@ -84,6 +85,7 @@ w4a16-style weight formats that avoid fp8 MMA. Device-only fused ops: last, with
   | cast_bf16_* (3 rows) | replayed with act_mul: 76 passed in that run | 0 OOB |
   | rope_bf16          | 17 device-rope cases, all passed in the 221/221 sweep | 0 OOB |
   | gemm_nt_bf16       | 269 checked, 269 passed, worst rel_l2 0.000e+00 | 28 cases, 0 OOB |
+  | attn_paged_bf16    | 138 checked, 138 passed, worst rel_l2 0.000e+00 | 69 cases, 0 OOB |
 
   gemm_nt ran alone at 269/269 **bit-exact** against libref across every recorded geometry
   (qkv / gate+up / down / lm_head shapes to 2^27). The zero is structural, not luck: the
@@ -97,6 +99,23 @@ w4a16-style weight formats that avoid fp8 MMA. Device-only fused ops: last, with
   red zone.** `rad-info --plugins` now reports 8 kernels / 6 schemas.
   Exact zeros are what the copy-shaped ops should give: a bf16 gather/scatter that matches the
   oracle bit-for-bit cannot round differently. Any future nonzero there is a regression signal.
+
+  attn_paged_bf16 ran at **138/138, all bit-exact**, after fixing a thread-local score max:
+  only thread 0 updated it, so threads 1..head_dim-1 saw "no visible keys", took the zero-row
+  path, and stored zero columns. The repro harness `tools/repro_attn.hip` named it in one run;
+  the same class of bug as the rope store-address race noted under Pitfalls below.
+  Like gemm_nt the zero is structural: max-subtract then sum in the oracle's order,
+  so no reassociation to disagree about.
+
+  Final full-fixture sweep (all ops, default budget): **881 checked, 881 passed, 24 skipped,
+  164 red-zone cases, 0 violations.** The 24 skips are the 7-14 GiB embed/logits_gemm cases
+  that did not fit -- see the RAM pitfall below. `rad-info --plugins`: 9 kernels / 7 schemas.
+
+- **RAM pitfall (rdna3-dev):** co-tenant serve's host-resident model holds ~25 GB of rdna3-dev's 31 GB, so the
+  kbench auto budget drops to ~1.7 GiB and big embed/logits cases skip. Forcing them with
+  `--max-bytes 12288` while co-tenant serve runs OOM-kills the container (exit 137, no dmesg line --
+  `ps aux --sort=-rss` is how to spot it). Either run big sweeps while co-tenant serve is down, or
+  re-run the ops that previously passed at 12288 (embed) with the auto budget and accept skips.
 
 Reproduce (on rdna3-dev, after `cmake -B build3 -S . && cmake --build build3`):
 
