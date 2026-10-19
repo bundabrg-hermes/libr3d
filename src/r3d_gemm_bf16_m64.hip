@@ -46,7 +46,12 @@
  * engine would have matched chip-first. On a chip the runtime does not have a gfxNNNN code
  * object for, the launch fails with hipErrorNotFound and the caller falls back to the
  * scalar tile exactly as before. */
-constexpr int kMB = 64, kNB = 64, kKB = 32;   /* output tile, k slice */
+constexpr int kMB = 64, kNB = 64, kKB = 16;   /* output tile, k slice */
+/* kKB MUST equal the fragment kDim (16). A 16x16x16 fragment consumes exactly
+ * 16 k columns per load+mma pair; staging a 32-wide slice while the fragments
+ * read only columns 0..15 silently dropped half of every operand's k range
+ * (rel_l2 ~ 0.5 everywhere, bit-exact only when K <= 16). If widening kKB for
+ * double-buffering, drive two fragment loads per slice at +0/+16 k offsets. */
 constexpr int kLdsPad = 4;                    /* LDS row padding */
 constexpr int kThreads = 256;                 /* 8 wave32s; 2 wmma tiles each */
 constexpr int kWave = 32;                     /* wave32 ABI pinned in CMakeLists */
