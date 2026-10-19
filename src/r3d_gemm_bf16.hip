@@ -27,6 +27,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstdio>
+
 #include "rad_abi.h"
 #include "rad_plugin.h"
 
@@ -218,6 +220,13 @@ static int gemm_nt_launch(const RadArgs* a, RadStream s, const char* n_name, con
     if (rad_tensor_numel(B) < N * K) return RAD_E_SHAPE;
 
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
+
+#ifdef R3D_DIAG
+    if (M == 1) fprintf(stderr, "[r3d-diag] gemm M=1 N=%lld K=%lld a=%p b=%p a16=%d b16=%d b_pitch=%lld\n",
+                        N, K, A->data, B->data,
+                        ((uintptr_t)A->data & 15u) == 0, ((uintptr_t)B->data & 15u) == 0,
+                        (long long)b_pitch);
+#endif
 
     /* Decode band: M == 1 goes to the GEMV row when vectors can be trusted -- K and the
      * weight row pitch divisible by 8 (a uint4 walk stays inside the row and stays
