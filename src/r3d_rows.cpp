@@ -157,6 +157,36 @@ static const RadOperandSpec oGemmNt[] = {
     { "y", RAD_OPD_OUT,    0 },
 };
 
+/* attn_paged, the parameter and operand lists copied verbatim from libr4d's pAttnPaged /
+ * oAttnPaged (r4d_rows.cpp) so co-load schema_same() passes. block_size is RAD_DERIVED --
+ * read off the cache tensor, its constraint admits any value -- and the trailing
+ * n_head / max_seqs exist for libr4d's split-KV scratch hook; ref ignores them and so does
+ * our row, but both plugins must agree on the list. */
+static const RadParamSpec pAttnPaged[] = {
+    { "q_len",      RAD_P_INT, RAD_REQUIRED },
+    { "head_dim",   RAD_P_INT, RAD_REQUIRED },
+    { "gqa",        RAD_P_INT, RAD_REQUIRED },
+    { "block_size", RAD_P_INT, RAD_DERIVED  },
+    { "causal",     RAD_P_INT, RAD_REQUIRED },
+    { "window",     RAD_P_INT, RAD_REQUIRED },
+    { "q_dtype",    RAD_P_STR, RAD_REQUIRED },
+    { "kv_dtype",   RAD_P_STR, RAD_REQUIRED },
+    { "scale",      RAD_P_F64, RAD_OPTIONAL },
+    { "max_ctx",    RAD_P_INT, RAD_OPTIONAL },
+    { "n_head",     RAD_P_INT, RAD_OPTIONAL },
+    { "max_seqs",   RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oAttnPaged[] = {
+    { "q",           RAD_OPD_IN,  0 },
+    { "kv_cache",    RAD_OPD_IN,  0 },
+    { "block_table", RAD_OPD_IN,  0 },
+    { "seqused",     RAD_OPD_IN,  0 },
+    { "k_descale",   RAD_OPD_IN,  1 },
+    { "v_descale",   RAD_OPD_IN,  1 },
+    { "cu_seqlens",  RAD_OPD_IN,  1 },
+    { "out",         RAD_OPD_OUT, 0 },
+};
+
 static const RadOpSchema kSchemas[] = {
     { "rmsnorm", pRmsNorm, (int)(sizeof(pRmsNorm)/sizeof(pRmsNorm[0])),
       oRmsNorm,  (int)(sizeof(oRmsNorm)/sizeof(oRmsNorm[0])),
@@ -191,6 +221,15 @@ static const RadOpSchema kSchemas[] = {
       "Y[M,N] = A[M,K] @ B[N,K]^T. B is stored transposed (the layout transformer weights "
       "already have), so both operands are k-contiguous and the inner loop is a dot product "
       "over k." },
+    { "attn_paged", pAttnPaged, (int)(sizeof(pAttnPaged)/sizeof(pAttnPaged[0])),
+      oAttnPaged, (int)(sizeof(oAttnPaged)/sizeof(oAttnPaged[0])),
+      "Paged attention over kv_cache[num_blocks, kv_heads, block_size, 2*head_dim] (K then "
+      "V per slot), f32 softmax with the max subtracted, causal and sliding-window masking, "
+      "q_len >= 1 so one kernel serves decode, speculative verify and prefill. seqused is "
+      "the TOTAL key count including this step's query rows. k_descale / v_descale are "
+      "optional and apply to an fp8 cache. `scale` is not in docs/OPS.md and defaults to "
+      "1/sqrt(head_dim). Declared verbatim from libr4d so both plugins agree wherever they "
+      "co-load." },
 };
 
 /* The rmsnorm row. Field order is RadKernelInfo's positional form (rad_abi.h): after the prose,
@@ -231,6 +270,17 @@ static const RadConstraint cCastNarrow[] = {
     { "from", RAD_C_IN, 0, "f32" }, { "to", RAD_C_IN, 0, "bf16" },
 };
 
+/* attn_paged: the row admits what the kernel serves. head_dim is a thread count here, so
+ * the entry point refuses > 1024; the constraint stays open above that and a query for a
+ * bigger head resolves past the row to nothing -- an honest miss. f32 q is served by the
+ * kernel but not advertised: the model path is bf16, and a constraint the fixtures never
+ * probe is a constraint never checked. */
+static const RadConstraint cAttnPaged[] = {
+    { "head_dim", RAD_C_GE, 1, nullptr },
+    { "q_dtype",  RAD_C_IN, 0, "bf16" },
+    { "kv_dtype", RAD_C_IN, 0, "bf16 f32 fp8_e4m3" },
+};
+
 /* rope: neox and gptj over [M] positions -- a subset of libr4d's five modes. A query for
  * mrope/imrope/axial resolves to no device row on this card, which is an honest failure at
  * issue, not an approximation. */
@@ -246,6 +296,7 @@ extern "C" int r3d_rad_act_mul(const RadArgs*, RadStream);
 extern "C" int r3d_rad_cast(const RadArgs*, RadStream);
 extern "C" int r3d_rad_rope(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt(const RadArgs*, RadStream);
+extern "C" int r3d_rad_attn_paged(const RadArgs*, RadStream);
 
 static const RadKernelInfo kRows[] = {
 
@@ -324,6 +375,17 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cBf16Row, 1, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gemm_nt },
+
+{ "attn_paged_bf16", "attn_paged", "attn",
+  "paged causal / sliding-window attention, one workgroup per (query row, head), any "
+  "query length, varlen, split-free (no scratch)",
+  "any head_dim to 1024, any gqa, any block size, window and causal masking, ragged "
+  "batches via cu_seqlens, unmapped (negative) block table entries skipped",
+  "bf16 query, bf16 / f32 / fp8-e4m3 kv cache with optional per-(seq,head) descales, "
+  "bf16 or f32 out, f32 softmax with the max subtracted",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cAttnPaged, 3, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_attn_paged },
 
 };
 
