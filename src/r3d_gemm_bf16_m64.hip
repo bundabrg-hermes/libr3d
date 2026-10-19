@@ -31,27 +31,31 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "rad_abi.h"
 #include "r3d_gemm.h"
 
 /* rocWMMA's config gate whitelists specific chips and rejects family-generic targets
- * (static_assert "Unsupported architecture" on gfx11-generic), and the engine picks code
- * objects chip-first-then-family: gfx11-generic is what carries every existing libr3d row
- * onto a gfx1100 card. So the WMMA tile compiles for the RDNA3 chips only, and the generic
- * build of this TU degrades to a refusal that hands the entry back to the scalar tile in
- * r3d_gemm_bf16.hip. The standalone build therefore ships gfx1100-03 beside gfx11-generic:
- * on a 7900 the chip object wins and the WMMA path runs. */
+ * (static_assert "Unsupported architecture" on gfx11-generic), so the WMMA kernel body
+ * compiles for the RDNA3 chips only. The LAUNCHER cannot live behind the same #if: an
+ * unmarked function is __host__ only, and the host pass sees no __gfxNNNN__ macro at all,
+ * so gating the launcher itself compiled the refusal into the host object on every target
+ * and the WMMA tile was unreachable even where it was built. The launcher therefore lives
+ * outside the gate and decides at runtime by the device's gcnArchName -- the same list the
+ * engine would have matched chip-first. On a chip the runtime does not have a gfxNNNN code
+ * object for, the launch fails with hipErrorNotFound and the caller falls back to the
+ * scalar tile exactly as before. */
+constexpr int kMB = 64, kNB = 64, kKB = 32;   /* output tile, k slice */
+constexpr int kLdsPad = 4;                    /* LDS row padding */
+constexpr int kThreads = 256;                 /* 8 wave32s; 2 wmma tiles each */
+constexpr int kWave = 32;                     /* wave32 ABI pinned in CMakeLists */
+
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
 
 #include <rocwmma/rocwmma.hpp>
 
 namespace {
-
-constexpr int kMB = 64, kNB = 64, kKB = 32;   /* output tile, k slice */
-constexpr int kLdsPad = 4;                    /* LDS row padding */
-constexpr int kThreads = 256;                 /* 8 wave32s; 2 wmma tiles each */
-constexpr int kWave = 32;                     /* wave32 ABI pinned in CMakeLists */
 
 using bf16 = rocwmma::bfloat16_t;
 
@@ -128,9 +132,38 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_kernel(
 
 } /* anonymous namespace */
 
+#else  /* generic and every non-RDNA3 target: the kernel exists as a no-op so the host
+        * pass has the symbol to launch; the launcher below never dispatches it there. */
+
+namespace {
+__global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_kernel(
+    const uint16_t*, const uint16_t*, uint16_t*, float*,
+    int, int, int, int64_t, int64_t, int64_t) {}
+} /* anonymous namespace */
+
+#endif
+
 int r3d_gemm_nt_m64_launch(const void* A, const void* B, void* Y, float* Yf,
                            int M, int N, int K, int64_t a_pitch, int64_t b_pitch,
                            int64_t y_pitch, hipStream_t stream) {
+    /* Chip gate, evaluated once against the device this stream's launches land on. */
+    static int allowed = -1;
+    if (allowed < 0) {
+        int dev = 0;
+        if (hipGetDevice(&dev) != hipSuccess) dev = 0;
+        hipDeviceProp_t p{};
+        allowed = (hipGetDeviceProperties(&p, dev) == hipSuccess) &&
+                  (strstr(p.gcnArchName, "gfx1100") || strstr(p.gcnArchName, "gfx1101") ||
+                   strstr(p.gcnArchName, "gfx1102") || strstr(p.gcnArchName, "gfx1103"));
+    }
+    if (!allowed) {
+        static bool once = false;
+        if (!once && getenv("R3D_DEBUG_GEMM")) {
+            once = true;
+            fprintf(stderr, "libr3d: m64 refused (device is not an RDNA3 chip)\n");
+        }
+        return RAD_E_DEVICE;
+    }
     dim3 grid((unsigned)((N + kNB - 1) / kNB), (unsigned)((M + kMB - 1) / kMB));
     hipLaunchKernelGGL((gemm_nt_bf16_m64_kernel), grid, dim3(kThreads), 0, stream,
                        (const uint16_t*)A, (const uint16_t*)B, (uint16_t*)Y, Yf,
@@ -144,17 +177,3 @@ int r3d_gemm_nt_m64_launch(const void* A, const void* B, void* Y, float* Yf,
     }
     return le == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
-
-#else  /* gfx11-generic and every other target: refuse, scalar tile takes the op */
-
-int r3d_gemm_nt_m64_launch(const void*, const void*, void*, float*,
-                           int, int, int, int64_t, int64_t, int64_t, hipStream_t) {
-    static bool once = false;
-    if (!once && getenv("R3D_DEBUG_GEMM")) {
-        once = true;
-        fprintf(stderr, "libr3d: m64 refusal stub ran (generic code object selected)\n");
-    }
-    return RAD_E_DEVICE;
-}
-
-#endif
