@@ -204,6 +204,48 @@ static const RadParamSpec pMCand[] = {
     { "M",      RAD_P_INT, RAD_REQUIRED },
     { "n_cand", RAD_P_INT, RAD_REQUIRED },
 };
+/* ---- band-op specs (verbatim from libr4d, the plugin that fixes these schemas). ---- */
+static const RadParamSpec pAdd[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    { "div",   RAD_P_F64, RAD_OPTIONAL },
+};
+/* oBinary (a, b, y) is already declared above for the act/cast batch -- identical table. */
+static const RadParamSpec pMnDtype[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oGather[] = {
+    { "x",   RAD_OPD_IN,  0 },
+    { "idx", RAD_OPD_IN,  0 },
+    { "y",   RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pQuantActFp8[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "group", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oQuantActFp8[] = {
+    { "x",     RAD_OPD_IN,  0 },
+    { "q",     RAD_OPD_OUT, 0 },
+    { "scale", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pGatedQuantFp8[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "group", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    { "act",   RAD_P_STR, RAD_OPTIONAL },
+};
+static const RadOperandSpec oGatedQuantFp8[] = {
+    { "gate_up",  RAD_OPD_IN,  0 },
+    { "q",        RAD_OPD_OUT, 0 },
+    { "scale",    RAD_OPD_OUT, 0 },
+    { "out_bf16", RAD_OPD_OUT, 1 },
+};
 static const RadOperandSpec oTemp[] = {
     { "logits", RAD_OPD_INOUT, 0 },
     { "params", RAD_OPD_IN,    0 },
@@ -306,8 +348,28 @@ static const RadOpSchema kSchemas[] = {
        oNarrow, (int)(sizeof(oNarrow)/sizeof(oNarrow[0])),
        "keep candidates whose probability is at least min_p times the most likely one's." },
       { "sample_pick", pMCand, (int)(sizeof(pMCand)/sizeof(pMCand[0])),
-       oPick,   (int)(sizeof(oPick)/sizeof(oPick[0])),
-       "the inverse-CDF draw over the candidate set, from the specified splitmix64 stream." },
+        oPick,   (int)(sizeof(oPick)/sizeof(oPick[0])),
+        "the inverse-CDF draw over the candidate set, from the specified splitmix64 stream." },
+
+      /* ---- the band ops that gate the quantising bf16 trunk (see r3d_band.hip). ---- */
+      { "add", pAdd, (int)(sizeof(pAdd)/sizeof(pAdd[0])),
+        oBinary, (int)(sizeof(oBinary)/sizeof(oBinary[0])),
+        "y = a + b. `b` carrying exactly n elements against an output of M rows broadcasts "
+        "along rows, and nothing else broadcasts at all. With `div`, y = rd(rd(a + b) / div), "
+        "rd y's dtype." },
+      { "gather_rows", pMnDtype, (int)(sizeof(pMnDtype)/sizeof(pMnDtype[0])),
+        oGather, (int)(sizeof(oGather)/sizeof(oGather[0])),
+        "y[i, :] = x[idx[i], :]. A negative index writes a zero row -- the padding convention a "
+        "step with fewer sampled rows than the buffer's extent leaves behind." },
+      { "gated_quant_fp8", pGatedQuantFp8, (int)(sizeof(pGatedQuantFp8)/sizeof(pGatedQuantFp8[0])),
+        oGatedQuantFp8, (int)(sizeof(oGatedQuantFp8)/sizeof(oGatedQuantFp8[0])),
+        "silu(a)*b or sigmoid(a)*b, then the same quantiser, in one pass." },
+      { "quant_act_fp8", pQuantActFp8, (int)(sizeof(pQuantActFp8)/sizeof(pQuantActFp8[0])),
+        oQuantActFp8, (int)(sizeof(oQuantActFp8)/sizeof(oQuantActFp8[0])),
+        "per-(row, `group`-column) symmetric E4M3 quantisation of a token-major activation, in "
+        "PLAIN ROW-MAJOR order rather than quant_act_i8's fragment order. The scale is "
+        "amax/448 -- a DEQUANT multiplier, the same sense as the checkpoint's "
+        "weight_scale_inv, so the fp8 GEMMs multiply both scales and never divide." },
       };
 
 /* The rmsnorm row. Field order is RadKernelInfo's positional form (rad_abi.h): after the prose,
@@ -372,6 +434,14 @@ static const RadConstraint cSampleVoc[]  = { { "n_vocab", RAD_C_GE, 1, nullptr }
 static const RadConstraint cSampleCand[] = { { "n_cand", RAD_C_GE, 1, nullptr },
                                              { "n_cand", RAD_C_LE, 4096, nullptr } };
 
+/* Band-op constraints: the widths the kernels stride, and the activation dtypes
+ * r3d_band.hip actually reads (f32/bf16) -- an f16 band resolves to the reference
+ * instead of being refused at launch. */
+static const RadConstraint cBandMn[] = {
+    { "n",     RAD_C_GE, 1, nullptr },
+    { "dtype", RAD_C_IN, 0, "f32 bf16" },
+};
+
 extern "C" int r3d_rad_rmsnorm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_embed_lookup(const RadArgs*, RadStream);
 extern "C" int r3d_rad_kv_store(const RadArgs*, RadStream);
@@ -387,6 +457,10 @@ extern "C" int r3d_rad_sample_topk(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_topp(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_minp(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_pick(const RadArgs*, RadStream);
+extern "C" int r3d_rad_quant_act_fp8(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gated_quant_fp8(const RadArgs*, RadStream);
+extern "C" int r3d_rad_add(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gather_rows(const RadArgs*, RadStream);
 
 static const RadKernelInfo kRows[] = {
 
@@ -545,6 +619,48 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cSampleCand, 2, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_sample_pick },
+
+/* ---- the band ops. Until these exist, a bf16 trunk that quantises its MLP activations
+ * cannot START on this card at all: quant_act_fp8 / gated_quant_fp8 / add / gather_rows
+ * carry no weights, so the planner cannot place them on a host kernel and the graph is
+ * unsupported at resolve. fp8 is storage here, not arithmetic -- no E4M3 hardware is
+ * touched, only the ABI encoder. */
+
+{ "quant_act_fp8_act", "quant_act_fp8", "band",
+  "per-group symmetric E4M3 quantisation of an activation, plain row-major",
+  "f32/bf16 inputs; the scale is amax/448, a dequant multiplier; group clamped to n",
+  "activation in, f8e4m3 codes and f32 group scales out",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cBandMn, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_quant_act_fp8 },
+
+{ "gated_quant_fp8_act", "gated_quant_fp8", "band",
+  "silu(gate)*up (or sigmoid(gate)*up) fused with the same quantiser",
+  "f32/bf16 gate_up [M, 2n]; the gated value narrows to bf16 once and the quantiser sees "
+  "the widened narrow; the gate is recomputed per pass rather than staged, deterministically",
+  "f32/bf16 gate_up in, f8e4m3 codes, f32 scales, optional bf16/f32 gated output",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cBandMn, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gated_quant_fp8 },
+
+{ "add_act", "add", "band",
+  "elementwise add with the double-rounded div form",
+  "f32/bf16 operands; b broadcasts along rows only at exactly n elements; with div, "
+  "y = rd(rd(a+b)/div)",
+  "f32/bf16 in and out",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cBandMn, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_add },
+
+{ "gather_rows_act", "gather_rows", "band",
+  "row gather with the zero-row padding convention",
+  "f32/bf16 rows, i32 indices; a negative index writes a zero row; an index >= the "
+  "source rows ALSO writes zeros rather than failing the launch (a device kernel cannot "
+  "pre-validate like the host reference; documented deviation)",
+  "f32/bf16 x and y, i32 idx",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cBandMn, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gather_rows },
 
 };
 
