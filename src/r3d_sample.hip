@@ -150,12 +150,17 @@ __global__ __launch_bounds__(kThreads) void argmax_kernel(
     if (threadIdx.x == 0) tok[blockIdx.x] = (int32_t)bi;
 }
 
-/* ------------------------------------------------------------------ sample_topk */
+/* ------------------------------------------------------------------ sample_topk
+ * `pairs`, when present, is the vocab-parallel plane the all-gather reads: each slot
+ * holds (u32 global id, f32 logit bits); the hole id is 0xffffffff (the merge reads the
+ * pair plane as int32, so that reads -1) and the hole value is the bit pattern of
+ * -infinity. Global ids are the local column plus vocab_off, exactly as ref packs them. */
 __global__ __launch_bounds__(kThreads) void topk_kernel(
     const float* __restrict__ lg, int64_t lg_pitch, int64_t n_vocab,
     const RadSampleParams* __restrict__ p,
     int32_t* __restrict__ cidx, float* __restrict__ cval,
-    int64_t ci_pitch, int32_t n_cand) {
+    int64_t ci_pitch, int32_t n_cand,
+    uint32_t* __restrict__ pairs, int64_t pairs_pitch, int32_t voff) {
     __shared__ float s_v[kWarps]; __shared__ int64_t s_i[kWarps];
     __shared__ float s_pv; __shared__ int64_t s_pi;
 
@@ -168,10 +173,12 @@ __global__ __launch_bounds__(kThreads) void topk_kernel(
     const float* __restrict__ row = lg + m * lg_pitch;
     int32_t* __restrict__ ir = cidx + m * ci_pitch;
     float*   __restrict__ vr = cval + m * ci_pitch;
+    uint32_t* __restrict__ pr = pairs ? pairs + m * pairs_pitch : nullptr;
 
     /* Holes first; the rounds overwrite the first k. */
     for (int32_t r = (int32_t)threadIdx.x; r < n_cand; r += (int64_t)kThreads) {
         ir[r] = -1; vr[r] = -INFINITY;
+        if (pr) { pr[2 * r] = 0xffffffffu; pr[2 * r + 1] = 0xff800000u; }  /* bits(-inf) */
     }
     __syncthreads();
     if (threadIdx.x == 0) { s_pv = INFINITY; s_pi = -1; }
@@ -181,7 +188,16 @@ __global__ __launch_bounds__(kThreads) void topk_kernel(
         float bv; int64_t bi;
         r3d_block_argmax(row, n_vocab, R3dAfter{s_pv, s_pi}, s_v, s_i, &bv, &bi);
         if (bi < 0) break;                      /* exhausted: the rest are holes */
-        if (threadIdx.x == 0) { ir[r] = (int32_t)bi; vr[r] = bv; s_pv = bv; s_pi = bi; }
+        if (threadIdx.x == 0) {
+            ir[r] = (int32_t)bi; vr[r] = bv;
+            if (pr) {
+                uint32_t bits;
+                __builtin_memcpy(&bits, &bv, 4);
+                pr[2 * r] = (uint32_t)((int32_t)bi + voff);
+                pr[2 * r + 1] = bits;
+            }
+            s_pv = bv; s_pi = bi;
+        }
         __syncthreads();
     }
 }
@@ -376,9 +392,11 @@ extern "C" int r3d_rad_sample_topk(const RadArgs* a, RadStream s) {
     const RadTensor* ci  = rad_arg_in(a, 2);
     const RadTensor* cv  = rad_arg_in(a, 3);
     if (!lg || !pr || !ci || !cv) return RAD_E_INVAL;
-    /* The vocab-parallel pairs plane belongs to the merge path; single-rank only here. */
-    if (a->n_t > 4 && a->t[4].data) return RAD_E_UNSUPPORTED;
+    /* The vocab-parallel pairs plane is written when present (the 27B-class fixtures were
+     * recorded under a sharded lm_head); its width is 2 * n_cand words. */
+    const RadTensor* pp = (a->n_t > 4 && a->t[4].data) ? &a->t[4] : nullptr;
     if (lg->dtype != RAD_F32 || ci->dtype != RAD_I32 || cv->dtype != RAD_F32) return RAD_E_DTYPE;
+    if (pp && pp->dtype != RAD_U32 && pp->dtype != RAD_I32) return RAD_E_DTYPE;
     long long nv = 0;
     if (!rad_args_geti(a, "n_vocab", &nv) || nv <= 0) nv = lg->rank >= 2 ? lg->shape[1] : 0;
     if (nv <= 0) return RAD_E_SHAPE;
@@ -394,10 +412,18 @@ extern "C" int r3d_rad_sample_topk(const RadArgs* a, RadStream s) {
     if (row2(lg, nv, &lg_p)) return RAD_E_STRIDE;
     if (row2(ci, n_cand, &ci_p)) return RAD_E_STRIDE;
     if (row2(cv, n_cand, &cv_p) || cv_p != ci_p) return RAD_E_STRIDE;
+    int64_t pp_p = 0;
+    if (pp) {
+        if (row2(pp, 2 * (long long)n_cand, &pp_p)) return RAD_E_STRIDE;
+        if (rad_tensor_numel(pp) < M * 2 * (int64_t)n_cand) return RAD_E_SHAPE;
+    }
+    long long voff = 0;
+    rad_args_geti(a, "vocab_off", &voff);
     hipLaunchKernelGGL(topk_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
                        (hipStream_t)(uintptr_t)s, (const float*)lg->data, lg_p, nv,
                        (const RadSampleParams*)pr->data,
-                       (int32_t*)ci->data, (float*)cv->data, ci_p, n_cand);
+                       (int32_t*)ci->data, (float*)cv->data, ci_p, n_cand,
+                       pp ? (uint32_t*)pp->data : nullptr, pp_p, (int32_t)voff);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 

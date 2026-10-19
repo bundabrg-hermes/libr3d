@@ -512,7 +512,7 @@ static const RadKernelInfo kRows[] = {
   "the exact top-k candidate set, descending, ties to the lower token id",
   "any vocabulary; n_cand <= 4096; k rounds of block argmax under the (value desc, id asc) "
   "order reproduce the reference selection exactly, including the tie window after the "
-  "previous pick; the vocab-parallel pairs plane is refused (single-rank scope)",
+  "previous pick; the optional vocab-parallel pairs plane is packed when present",
   "f32 logits, i32 candidate ids, f32 candidate LOGITS (not probabilities)",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cSampleVoc, 1, nullptr, 0, nullptr,
