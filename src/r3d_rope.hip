@@ -22,6 +22,7 @@
  * The V heads that follow are untouched.
  */
 
+#include <cstdio>
 #include <cstring>
 
 #include <hip/hip_runtime.h>
@@ -116,6 +117,25 @@ extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
     const float theta = (float)rad_args_getf_or(a, "theta", 10000.0);
     const float scale = (float)rad_args_getf_or(a, "scale", 1.0);
     const float div = scale != 0.0f ? scale : 1.0f;
+
+    /* TEMP DEBUG: what descriptors does kbench actually hand this row? */
+    {
+        std::fprintf(stderr, "R3D-DBG qkv rank=%d dtype=%u shape=[", (int)qkv->rank, qkv->dtype);
+            for (int i = 0; i < (int)qkv->rank; ++i)
+                std::fprintf(stderr, "%ld,", (long)qkv->shape[i]);
+            std::fprintf(stderr, "] stride=[");
+            for (int i = 0; i < (int)qkv->rank; ++i)
+                std::fprintf(stderr, "%ld,", (long)qkv->stride[i]);
+            std::fprintf(stderr, "] pos rank=%d dtype=%u shape=[", (int)pos->rank, pos->dtype);
+            for (int i = 0; i < (int)pos->rank; ++i)
+                std::fprintf(stderr, "%ld,", (long)pos->shape[i]);
+            std::fprintf(stderr, "] stride=[");
+            for (int i = 0; i < (int)pos->rank; ++i)
+                std::fprintf(stderr, "%ld,", (long)pos->stride[i]);
+            std::fprintf(stderr, "] M_param=%lld rot_param=%lld n_t=%d\n",
+                         (long long)rad_args_geti_or(a, "M", -1),
+                         (long long)rad_args_geti_or(a, "rotary_dim", -1), a->n_t);
+    }
 
     /* ref's offlin(pos, m) for a rank-1 position tensor: m * its element stride. */
     const int64_t pos_stride = pos->rank >= 1 ? pos->stride[pos->rank - 1] : 1;
