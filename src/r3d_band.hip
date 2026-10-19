@@ -238,8 +238,17 @@ __global__ __launch_bounds__(kThreads) void gather_rows_kernel(
 
 /* ------------------------------------------------------------------ entry helpers */
 static inline bool dt_act_ok(uint32_t dt) { return dt == RAD_F32 || dt == RAD_BF16; }
+/* Row-major [rows, cols] reader, rank-2 with a unit last stride, OR rank-1 single row
+ * (pitch 0 -- the reference's rowoff walks a rank-1 tensor to offset 0 for every row, so
+ * a broadcast `b` arrives as a bare [n] vector; requiring rank 2 refused those cases). */
 static inline int row2_pitch(const RadTensor* t, int64_t cols, int64_t* pitch) {
-    if (!t || !t->data || t->rank != 2 || t->shape[1] != cols || t->stride[1] != 1) return -1;
+    if (!t || !t->data) return -1;
+    if (t->rank == 1) {
+        if (rad_tensor_numel(t) != cols || t->stride[0] != 1) return -2;
+        *pitch = 0;
+        return 0;
+    }
+    if (t->rank != 2 || t->shape[1] != cols || t->stride[1] != 1) return -3;
     *pitch = t->stride[0];
     return 0;
 }
@@ -331,10 +340,8 @@ extern "C" int r3d_rad_add(const RadArgs* a, RadStream s) {
     int64_t ap = 0, bp = 0, yp = 0;
     if (row2_pitch(A, n, &ap)) return RAD_E_STRIDE;
     if (row2_pitch(Y, n, &yp)) return RAD_E_STRIDE;
-    if (bcast) {
-        if (B->rank != 2 || B->shape[1] != n || B->stride[1] != 1) return RAD_E_STRIDE;
-        bp = 0;   /* every row reads the same B row */
-    } else if (row2_pitch(B, n, &bp)) return RAD_E_STRIDE;
+    if (bcast) { if (row2_pitch(B, n, &bp)) return RAD_E_STRIDE; bp = 0; }
+    else if (row2_pitch(B, n, &bp)) return RAD_E_STRIDE;
     add_kernel<<<dim3((uint32_t)rows), dim3(kThreads), 0, (hipStream_t)(uintptr_t)s>>>(
         (const uint8_t*)A->data, A->dtype, ap, 1,
         (const uint8_t*)B->data, B->dtype, bp, 1,
