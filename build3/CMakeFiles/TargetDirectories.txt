@@ -1,0 +1,7 @@
+/work/build3/CMakeFiles/libr3d.dir
+/work/build3/CMakeFiles/edit_cache.dir
+/work/build3/CMakeFiles/rebuild_cache.dir
+/work/build3/CMakeFiles/list_install_components.dir
+/work/build3/CMakeFiles/install.dir
+/work/build3/CMakeFiles/install/local.dir
+/work/build3/CMakeFiles/install/strip.dir

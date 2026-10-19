@@ -129,7 +129,7 @@ __global__ void attn_paged_kernel(AttnParams P) {
     __shared__ int64_t sh_kb;                    /* key j's cache offset, or -1 */
     __shared__ int64_t sh_s, sh_qlen, sh_i;      /* sequence, its q length, row index in it */
     __shared__ int64_t sh_ctx, sh_pos, sh_kh;
-    __shared__ float sh_kds, sh_vds, sh_w;
+    __shared__ float sh_kds, sh_vds, sh_w, sh_mx;
 
     const int64_t d  = threadIdx.x;
     const int64_t h  = blockIdx.x % P.q_heads;
@@ -198,6 +198,14 @@ __global__ void attn_paged_kernel(AttnParams P) {
     }
 
     const int64_t ob = tok * P.o_rs + h * P.o_hs;
+
+    /* thread 0 alone saw the scores; every thread's zero-row test and pass-two exp read
+     * THE SAME max. (First cut kept mx thread-local: threads 1..hd-1 stayed at -inf,
+     * took the zero-row return, and stored head_dim-1 zero columns -- repro_attn names
+     * this failure instantly: d=0 alive, d>0 zero.) */
+    if (d == 0) sh_mx = mx;
+    __syncthreads();
+    mx = sh_mx;
 
     /* No visible key (an empty sliding window) gives a zero row, not NaN. */
     if (mx == -INFINITY) {
