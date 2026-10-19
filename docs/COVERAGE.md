@@ -66,6 +66,45 @@ w4a16-style weight formats that avoid fp8 MMA. Device-only fused ops: last, with
 3. On rdna3-dev with the RDNA3 card: `rad-kbench` vs libref over recorded geometries, red-zone OOB;
    then `rad-info --plugins`; then serve MiniCPM5-2B bf16.
 
+## Serve on the 7900 + decode GEMV (2026-10-19, later)
+
+Supersedes the "no full-model serve has run" bullet in the section below. MiniCPM5-2B bf16 serves on
+the 7900 (`libr3d-serve` container, radiance-dev:v1.8.1, :9005, `--radiance-home
+/rhome:/opt/radiance/share/radiance` with `build/radiance_home/kernels/libr3d.so`).
+Measured decode: **0.35 -> 11.1 tok/s** (96-token request), warmup 22.5 s -> 0.71 s;
+text coherent end to end. Two findings did that, one kernel and one contract:
+
+1. **The `M` parameter is arena capacity, not the row count.** The engine passes
+   `M=8192` (the `--max-num-batched-tokens` step-batch capacity) on every call while Y
+   carries the live rows: `[1,N]` at decode, `[12,N]` at prefill. `ref_gemm.cpp` never
+   reads the parameter -- it derives `M = numel(Y) / N`. A row that trusts the parameter
+   computes a full prefill batch on every decode token *and writes garbage into arena
+   rows past Y's own* -- invisible to every guard, because the arena is exactly that
+   big. libr3d's gemm entries now mirror ref's derivation. This -- not bandwidth -- was
+   the whole 0.35 tok/s: profile-ops showed decode calls taking the same 34 ms as
+   prefill calls at identical geometry.
+2. **Decode GEMV row** (M==1 band) in `r3d_gemm_bf16.hip`: one wave32 per output row,
+   uint4 (8 x bf16) vector walks, `shfl_xor` butterfly reduce, flat `[row]` store
+   (`y_pitch` is the between-M-rows pitch and M==1 has none -- scaling by it was a
+   1.4 MiB OOB write fault kbench caught on the first case). The tile kernel keeps
+   every other M. Guards: K%8, weight pitch %8, 16 B-aligned bases, else tile.
+
+Two more lessons, both from kbench on this row:
+- **Wave width is a project-wide ABI pin.** `-mno-wavefrontsize64` is set per TU in
+  CMakeLists; a wave64-shaped shuffle reduce (lane=tid&63, offsets 32..1) fails with
+  rel_l2 ~= 1.0 on exactly the dispatched cases and nothing else. Derive lane math
+  from the pinned width, not the hardware default.
+- **kbench must own the card.** Running it while the serve container held the 7900
+  produced 28 false `refused ... device error` FAILs (queue faults from contention);
+  a solo re-run of the identical build was 269/269. Check `docker ps` before believing
+  a fault-laden sweep.
+
+GEMV reassociates through the butterfly, so M=1 cases now land at worst rel_l2
+4.48e-08, not the tile's structural 0 -- that line is the GEMV's expected signature;
+the M>1 bit-exact zeros remain the regression tripwire. logits_gemm's seven 7.1 GiB
+fixture cases stay budget-skipped while co-tenant serve holds 25 GB of 31 GB host RAM; the
+GEMV serves them live in the model (decode steps at `y=[1,130560]`, coherent output).
+
 ## Verified state on hardware (gfx1100, RX 7900 XTX class, rdna3-dev ROCR index 0)
 
 2026-10-19, radiance-dev:v1.8.1 (radiance v1.8.1, ROCm 10.1):
