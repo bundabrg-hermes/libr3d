@@ -20,6 +20,17 @@ if(NOT R3D_GPU_TARGETS)
   return()
 endif()
 
+# The WMMA prefill tile is chip-gated (rocWMMA rejects family-generic targets; see the TU
+# header), and the engine picks code objects chip-first-then-family -- so without a gfx1100
+# object the 7900 XTX would take the gfx11-generic objects and never reach the WMMA rows.
+# Radiance's default target list is gfx1101+generic; the test card is gfx1100. Generic stays
+# in the list: it carries every other row (and the m64 refusal stub) onto chips we did not
+# put an object for.
+list(FIND R3D_GPU_TARGETS "gfx1100" R3D_HAVE_1100)
+if(R3D_HAVE_1100 EQUAL -1)
+  list(APPEND R3D_GPU_TARGETS gfx1100)
+endif()
+
 # Per-unit device flags, the libr4d mechanism (set_source_files_properties COMPILE_OPTIONS):
 #   * -ffp-contract=off is a correctness flag in this project (rad_plugin.h: the oracle forbids
 #     FMA contraction);

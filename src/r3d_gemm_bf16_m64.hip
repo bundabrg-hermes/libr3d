@@ -29,10 +29,19 @@
 
 #include <hip/hip_runtime.h>
 
-#include <rocwmma/rocwmma.hpp>
-
 #include "rad_abi.h"
 #include "r3d_gemm.h"
+
+/* rocWMMA's config gate whitelists specific chips and rejects family-generic targets
+ * (static_assert "Unsupported architecture" on gfx11-generic), and the engine picks code
+ * objects chip-first-then-family: gfx11-generic is what carries every existing libr3d row
+ * onto a gfx1100 card. So the WMMA tile compiles for the RDNA3 chips only, and the generic
+ * build of this TU degrades to a refusal that hands the entry back to the scalar tile in
+ * r3d_gemm_bf16.hip. The standalone build therefore ships gfx1100-03 beside gfx11-generic:
+ * on a 7900 the chip object wins and the WMMA path runs. */
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+
+#include <rocwmma/rocwmma.hpp>
 
 namespace {
 
@@ -125,3 +134,12 @@ int r3d_gemm_nt_m64_launch(const void* A, const void* B, void* Y, float* Yf,
                        M, N, K, a_pitch, b_pitch, y_pitch);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
+
+#else  /* gfx11-generic and every other target: refuse, scalar tile takes the op */
+
+int r3d_gemm_nt_m64_launch(const void*, const void*, void*, float*,
+                           int, int, int, int64_t, int64_t, int64_t, hipStream_t) {
+    return RAD_E_DEVICE;
+}
+
+#endif
