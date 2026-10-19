@@ -42,6 +42,11 @@ Sampler ops issued by core (`sample_*`), ~11 in the default chain:
 sample_dry, sample_xtc, sample_mask, sample_merge_topk, sample_pick, sample_argmax,
 sample_logprobs` — exact served subset to be confirmed with `--debug-graph` on the card.
 
+**Ported and oracle-green on the card (2026-10-19):** embed_lookup, rmsnorm, kv_store,
+act_mul (all four acts), cast (bf16 copy / widen / narrow), rope (neox+gptj; multi-component
+modes and yarn/llama3 refused by constraint). Remaining Tier 1: **gemm_nt** (the big one) and
+**attn_paged**, then the sampler chain.
+
 ## Tier 2 — multi-rank and shapes
 
 `all_reduce` / `all_gather` (+ `_host` twins — consumer P2P needs them even on RDNA4, so the
@@ -74,6 +79,13 @@ w4a16-style weight formats that avoid fp8 MMA. Device-only fused ops: last, with
   | rmsnorm_bf16       | 90 checked, 90 passed, worst rel_l2 2.395e-04 | 40 cases, 0 OOB |
   | embed_lookup_bf16  | 20 checked, 20 passed, worst rel_l2 0.000e+00 | 10 cases, 0 OOB |
   | kv_store_bf16      | 20 checked, 20 passed, worst rel_l2 0.000e+00 | 0 cases (draw tier), 0 OOB |
+  | act_mul_bf16       | 44 checked, 44 passed (silu/gelu families) | 0 OOB |
+  | cast_bf16_* (3 rows) | replayed with act_mul: 76 passed in that run | 0 OOB |
+  | rope_bf16          | 17 device-rope cases, all passed in the 221/221 sweep | 0 OOB |
+
+  Full sweep `--op rmsnorm --op embed_lookup --op kv_store --op rope --op act_mul --op cast
+  --max-bytes 12288`: **221 checked, 221 passed, worst rel_l2 2.395e-04, 0 wrote outside a
+  red zone.** `rad-info --plugins` now reports 8 kernels / 6 schemas.
   Exact zeros are what the copy-shaped ops should give: a bf16 gather/scatter that matches the
   oracle bit-for-bit cannot round differently. Any future nonzero there is a regression signal.
 
@@ -97,3 +109,18 @@ Pitfalls this settled:
 - kbench needs ~3 GiB free in the container; case budget auto-shrinks and names skips.
 - `--max-bytes` is plain MiB (`12g` parses as 12 MiB). The 27B fixture's embed_lookup cases need
   ~7.1 GiB each; `--max-bytes 12288` runs all 20 on the 24 GiB card.
+- A kbench PASS can be vacuous: a case whose positions are 0 rotates by the identity, so an
+  addressing bug in rope hid there while every sampled-position case failed. Prefer a repro
+  with unit impulses (`tools/repro_rope.hip`, `UNIT=1`) -- the output element then names the
+  angle the kernel actually used.
+
+## The rope race (2026-10-19), worth remembering
+
+The first rope port dropped the head axis from the store address (`xr = row + h*head_dim`):
+every head's threads read-modify-wrote head 0's pairs, compounding rotations into
+`cos(k*ang)` with k set by the scheduler -- large, deterministic-looking, slightly
+run-stable rel errors that grew with M. Neither the row-stride fold (ref_gemm.h `row_stride`'s
+trailing-dimension walk, kept: rank-3 `[M, heads, head_dim]` qkv is expressible) nor the
+position-stride read (ref's `offlin`, kept) was implicated; the fixture descriptors were plain
+rank-2 stride-1. The decisive tools were the standalone repro and a direct compile of the
+kernel outside the plugin .so, which together split "plumbing vs code" in one step.
