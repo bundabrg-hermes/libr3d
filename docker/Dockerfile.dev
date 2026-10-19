@@ -19,7 +19,7 @@ ARG JOBS=2
 
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      cmake ninja-build git ca-certificates gawk \
+      cmake ninja-build git ca-certificates gawk gcc-14 g++-14 \
  && rm -rf /var/lib/apt/lists/*
 
 RUN git clone --quiet https://codeberg.org/StillDeadcode/radiance.git /opt/radiance-src \
@@ -32,7 +32,7 @@ RUN git clone --quiet https://codeberg.org/StillDeadcode/radiance.git /opt/radia
 # Device code stays on ROCm's clang++ via CMAKE_HIP_COMPILER, as radiance's CMakeLists requires.
 RUN cmake -S /opt/radiance-src -B /opt/radiance-build -G Ninja \
       -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_INSTALL_PREFIX=/opt/radiance \
-      -DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13 \
+      -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
       -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
       -DRAD_GPU_TARGETS="${GPU_TARGETS}" \
  && cmake --build /opt/radiance-build -j"${JOBS}" \
