@@ -50,11 +50,57 @@ static const RadOperandSpec oRmsNorm[] = {
     { "y", RAD_OPD_OUT,    0 },
 };
 
+/* embed_lookup: verbatim libr4d (r4d_rows.cpp pEmbedM/oEmbed). `mult` is Gemma's sqrt(hidden);
+ * `vocab_offset` shards the table across TP ranks; `wscale` belongs to embed_lookup_q's
+ * quantised table and is unused by this bf16 row. */
+static const RadParamSpec pEmbedM[] = {
+    { "M",       RAD_P_INT, RAD_REQUIRED },
+    { "n_embd",  RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab", RAD_P_INT, RAD_REQUIRED },
+    { "dtype",   RAD_P_STR, RAD_REQUIRED },
+    { "vocab_offset", RAD_P_INT, RAD_OPTIONAL },
+    { "wscale",  RAD_P_F64, RAD_OPTIONAL },
+    { "mult",    RAD_P_F64, RAD_OPTIONAL },
+};
+static const RadOperandSpec oEmbed[] = {
+    { "tokens", RAD_OPD_IN,     0 },
+    { "wte",    RAD_OPD_WEIGHT, 0 },
+    { "x",      RAD_OPD_OUT,    0 },
+};
+
+/* kv_store: verbatim libr4d (r4d_rows.cpp pKvStore/oKvStore). The scales are the reader's
+ * descales and unused for the bf16 cache this row serves. */
+static const RadParamSpec pKvStore[] = {
+    { "M",          RAD_P_INT, RAD_REQUIRED },
+    { "head_dim",   RAD_P_INT, RAD_REQUIRED },
+    { "n_head_kv",  RAD_P_INT, RAD_REQUIRED },
+    { "block_size", RAD_P_INT, RAD_REQUIRED },
+    { "kv_dtype",   RAD_P_STR, RAD_REQUIRED },
+    { "k_scale",    RAD_P_F64, RAD_OPTIONAL },
+    { "v_scale",    RAD_P_F64, RAD_OPTIONAL },
+};
+static const RadOperandSpec oKvStore[] = {
+    { "k",            RAD_OPD_IN,    0 },
+    { "v",            RAD_OPD_IN,    0 },
+    { "slot_mapping", RAD_OPD_IN,    0 },
+    { "kv_cache",     RAD_OPD_INOUT, 0 },
+};
+
 static const RadOpSchema kSchemas[] = {
     { "rmsnorm", pRmsNorm, (int)(sizeof(pRmsNorm)/sizeof(pRmsNorm[0])),
       oRmsNorm,  (int)(sizeof(oRmsNorm)/sizeof(oRmsNorm[0])),
       "y = x * rsqrt(mean(x^2) + eps) * (w + wadd). Declared verbatim from libr4d so both "
       "plugins agree wherever they co-load." },
+    { "embed_lookup", pEmbedM, (int)(sizeof(pEmbedM)/sizeof(pEmbedM[0])),
+      oEmbed,  (int)(sizeof(oEmbed)/sizeof(oEmbed[0])),
+      "the embedding gather. A negative token id writes a zero row, and so does one outside "
+      "[vocab_offset, vocab_offset + n_vocab) -- which is what makes the table shardable "
+      "across the vocabulary, the symmetry lm_head already had. Ids stay GLOBAL; summing the "
+      "ranks reconstructs x, so the caller follows this with an exact all_reduce." },
+    { "kv_store", pKvStore, (int)(sizeof(pKvStore)/sizeof(pKvStore[0])),
+      oKvStore,  (int)(sizeof(oKvStore)/sizeof(oKvStore[0])),
+      "scatter k and v into kv_cache[n_blocks, kv_heads, block_size, 2*head_dim] -- K at "
+      "[.., d] and V at [.., head_dim + d]. A negative slot stores nothing." },
 };
 
 /* The rmsnorm row. Field order is RadKernelInfo's positional form (rad_abi.h): after the prose,
@@ -66,11 +112,20 @@ static const RadConstraint cBf16Row[] = {
     { "dtype", RAD_C_IN, 0, "bf16" },
 };
 
+/* kv_store constraints, the positional form of libr4d's cKvStore = { C_GE("block_size", 1),
+ * C_IN("kv_dtype", "bf16") }. */
+static const RadConstraint cKvStore[] = {
+    { "block_size", RAD_C_GE, 1, nullptr },
+    { "kv_dtype",   RAD_C_IN, 0, "bf16" },
+};
+
 /* libr3d is the only device library on RDNA3, so no in-plugin arbitration; the value only
  * needs to sit above a future fallback row. */
 enum { R3D_PRIO_ONLY = 1000 };
 
 extern "C" int r3d_rad_rmsnorm(const RadArgs*, RadStream);
+extern "C" int r3d_rad_embed_lookup(const RadArgs*, RadStream);
+extern "C" int r3d_rad_kv_store(const RadArgs*, RadStream);
 
 static const RadKernelInfo kRows[] = {
 
@@ -81,6 +136,23 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cBf16Row, 1, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_rmsnorm },
+
+{ "embed_lookup_bf16", "embed_lookup", "vocab",
+  "embedding gather, one workgroup a token",
+  "any n_embd and n_vocab; a negative or out-of-range id writes a zero row",
+  "i32 tokens, bf16 table and output",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cBf16Row, 1, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_embed_lookup },
+
+{ "kv_store_bf16", "kv_store", "attn",
+  "scatter k and v into the paged cache, one workgroup a token",
+  "cache exactly [n_blocks, kv_heads, block_size, 2*head_dim]; a negative or out-of-range slot "
+  "stores nothing",
+  "bf16 k / v / cache, i32 slot mapping",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cKvStore, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_kv_store },
 
 };
 

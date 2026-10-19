@@ -27,10 +27,12 @@ endif()
 #     gfx1101 and gfx11-generic to wave32 (verified: their ISA has no ACCVGPR-joined wave64
 #     shuffles); pinned anyway so no future default change silently mis-sizes the block reduce.
 set_source_files_properties(src/r3d_rmsnorm.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
+set_source_files_properties(src/r3d_embed.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
+set_source_files_properties(src/r3d_kvstore.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
 
 rad_add_plugin(libr3d kernels
   SOURCES     src/r3d_rows.cpp
-  HIP_SOURCES src/r3d_rmsnorm.hip
+  HIP_SOURCES src/r3d_rmsnorm.hip src/r3d_embed.hip src/r3d_kvstore.hip
   GPU_TARGETS ${R3D_GPU_TARGETS}
   INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
