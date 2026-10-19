@@ -66,6 +66,34 @@ __device__ __forceinline__ int64_t r3d_i8_step_pos(int64_t c) {
     return (c & ~(int64_t)12) | ((c & 4) << 1) | ((c & 8) >> 1);
 }
 
+__device__ __forceinline__ uint8_t r3d_f32_to_e4m3(float f) {
+    const uint32_t u = __float_as_uint(f);
+    const uint8_t  s = (uint8_t)((u >> 24) & 0x80u);
+    const uint32_t a = u & 0x7fffffffu;
+    if (a > 0x7f800000u) return (uint8_t)(s | 0x7fu);     /* nan */
+    if (a >= 0x43e00000u) return (uint8_t)(s | 0x7eu);    /* >= 448: clamp to the largest */
+    const int e = (int)(a >> 23) - 127;
+    uint32_t m = a & 0x7fffffu;
+    if (e < -10) return s;                                /* below half the smallest subnormal */
+    if (e < -6) {                                         /* subnormal fp8 */
+        const int sh = -6 - e + 20;
+        m |= 0x800000u;
+        const uint32_t lo = m & ((1u << sh) - 1u);
+        uint32_t q = m >> sh;
+        const uint32_t half = 1u << (sh - 1);
+        if (lo > half || (lo == half && (q & 1u))) ++q;
+        return (uint8_t)(s | q);
+    }
+    uint32_t q = m >> 20;
+    const uint32_t lo = m & 0xfffffu;
+    int ee;
+    if (lo > 0x80000u || (lo == 0x80000u && (q & 1u))) ++q;
+    ee = e + 7;
+    if (q == 0x8u) { q = 0; ++ee; }
+    if (ee > 15 || (ee == 15 && q >= 7u)) return (uint8_t)(s | 0x7eu);
+    return (uint8_t)(s | ((uint32_t)ee << 3) | q);
+}
+
 /* Block reduce: maximum of per-thread partials (same as r3d_band.hip's). */
 __device__ __forceinline__ float block_max(float v, float* s_part) {
     for (uint32_t off = 16; off; off >>= 1)
@@ -209,6 +237,94 @@ __global__ __launch_bounds__(kThreads) void row_topk_kernel(
     }
 }
 
+/* ------------------------------------------------------------------ rmsnorm_quant_fp8
+ * One block a row. With `residual` it is the fused_add_rms_norm form: the bf16-narrowed
+ * sum is STORED first and the variance reads the stored value -- exactly as ref writes
+ * res before src() reads it. The normed values narrow to bf16 once (they are what
+ * out_bf16 carries and what the quantiser sees), staged in LDS, then group-quantised
+ * with the band file's fp8 semantics: strict-max amax, scale amax*(1/448) (1.0 for an
+ * all-zero group), codes clamp(v*(1/scale)) through the ABI encoder. */
+__global__ __launch_bounds__(kThreads) void rmsnorm_quant_fp8_kernel(
+    const uint8_t* __restrict__ x, uint32_t xdt, int64_t x_pitch,
+    uint8_t* __restrict__ res, uint32_t rdt, int64_t r_pitch,   /* res null: no add */
+    const uint8_t* __restrict__ w, uint32_t wdt, int64_t w_pitch,
+    uint8_t* __restrict__ q, int64_t q_pitch,
+    float* __restrict__ scale, int64_t s_pitch,
+    uint8_t* __restrict__ ob, uint32_t obdt, int64_t ob_pitch,   /* ob null: none */
+    int64_t n, int64_t g, float eps, float wadd, int64_t ngrp) {
+    __shared__ float s_part[kWarps];
+    __shared__ float s_ss;
+    extern __shared__ uint16_t s_h[];   /* the row, bf16: sum value, then normed value */
+    const int64_t row = blockIdx.x;
+    const uint8_t* __restrict__ xr = x + row * x_pitch;
+    uint8_t* __restrict__ rr = res ? res + row * r_pitch : nullptr;
+    uint8_t* __restrict__ qr = q + row * q_pitch;
+
+    /* Pass 1: the sum of squares. With a residual the store lands before the square,
+     * and the value squared is the widened stored one. */
+    float ss = 0.0f;
+    for (int64_t i = (int64_t)threadIdx.x; i < n; i += (int64_t)kThreads) {
+        const float v = ldt2(xr, xdt, i);
+        if (rr) {
+            const float y = ldt2(rr, rdt, i) + v;      /* widened add */
+            const uint16_t h = r3d_f32_to_bf16(y);
+            if (rdt == RAD_F32) ((float*)rr)[i] = r3d_bf16_to_f32(h);
+            else ((uint16_t*)rr)[i] = h;
+            s_h[i] = h;
+            ss += r3d_bf16_to_f32(h) * r3d_bf16_to_f32(h);
+        } else {
+            s_h[i] = 0u;
+            ss += v * v;
+        }
+    }
+    /* Block reduce (sum). */
+    for (uint32_t off = 16; off; off >>= 1)
+        ss += __shfl_down_sync(0xFFFFFFFFull, ss, off);
+    const uint32_t lane = threadIdx.x & 31u, wid = threadIdx.x >> 5;
+    if (lane == 0) s_part[wid] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float r = s_part[0];
+        for (uint32_t k = 1; k < kWarps; ++k) r += s_part[k];
+        s_ss = 1.0f / sqrtf(r / (float)n + eps);       /* ref: 1/std::sqrt(ss/n+eps) */
+    }
+    __syncthreads();
+    const float rs = s_ss;
+
+    /* Pass 2: h = bf16(src * rs * (w + wadd)), out_bf16 gets the same narrowing, the
+     * LDS staging keeps h for the quantiser. */
+    for (int64_t i = (int64_t)threadIdx.x; i < n; i += (int64_t)kThreads) {
+        const float src = rr ? r3d_bf16_to_f32(s_h[i]) : ldt2(xr, xdt, i);
+        const float wv = ldt2((const uint8_t*)w, wdt, i) + wadd;
+        const uint16_t h = r3d_f32_to_bf16(src * rs * wv);
+        if (ob) {
+            if (obdt == RAD_F32) ((float*)(ob + row * ob_pitch))[i] = r3d_bf16_to_f32(h);
+            else ((uint16_t*)(ob + row * ob_pitch))[i] = h;
+        }
+        s_h[i] = h;
+    }
+    __syncthreads();
+
+    /* One group a thread: the band's q8_group verbatim on the staged h. */
+    for (int64_t gi = (int64_t)threadIdx.x; gi < ngrp; gi += (int64_t)kThreads) {
+        const int64_t k0 = gi * g, k1 = (k0 + g < n) ? k0 + g : n;
+        float amax = 0.0f;
+        for (int64_t i = k0; i < k1; ++i) {
+            const float m = fabsf(r3d_bf16_to_f32(s_h[i]));
+            if (m > amax) amax = m;
+        }
+        const float sc = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
+        const float inv = 1.0f / sc;
+        scale[row * s_pitch + gi] = sc;
+        for (int64_t i = k0; i < k1; ++i) {
+            float c = r3d_bf16_to_f32(s_h[i]) * inv;
+            if (c >  448.0f) c =  448.0f;
+            if (c < -448.0f) c = -448.0f;
+            qr[i] = r3d_f32_to_e4m3(c);
+        }
+    }
+}
+
 /* Shared host-side helpers (pattern-copied from r3d_band.hip). */
 static inline bool dt_act_ok(uint32_t dt) { return dt == RAD_F32 || dt == RAD_BF16; }
 static inline int row2_pitch(const RadTensor* t, int64_t cols, int64_t* pitch) {
@@ -225,6 +341,9 @@ static inline int row2_pitch(const RadTensor* t, int64_t cols, int64_t* pitch) {
 static inline int64_t param_i(const RadArgs* a, const char* k, int64_t fb) {
     long long v;
     return rad_args_geti(a, k, &v) ? (int64_t)v : fb;
+}
+static inline double param_f(const RadArgs* a, const char* k, double fb) {
+    return rad_args_getf_or(a, k, fb);
 }
 
 } /* anonymous namespace */
@@ -329,5 +448,63 @@ extern "C" int r3d_rad_row_topk(const RadArgs* a, RadStream s) {
         (int32_t*)idx->data, ip, (float*)val->data, vp,
         pairs ? (float*)pairs->data : nullptr, pairs ? rad_dtype_bytes(pairs->dtype, pp) : 0,
         N, R, off);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+extern "C" int r3d_rad_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
+    if (a->n_t < 5) return RAD_E_INVAL;                      /* ref requires x, res?, w, q, scale */
+    const RadTensor* x  = rad_arg_in(a, 0);
+    const RadTensor* res = (a->n_t > 1 && a->t[1].data) ? &a->t[1] : nullptr;
+    const RadTensor* w  = rad_arg_in(a, 2);
+    const RadTensor* q  = rad_arg_in(a, 3);
+    const RadTensor* sc = rad_arg_in(a, 4);
+    const RadTensor* ob = (a->n_t > 5 && a->t[5].data) ? &a->t[5] : nullptr;
+    if (!x || !w || !q || !sc) return RAD_E_INVAL;
+    if (x->dtype != RAD_BF16) return RAD_E_DTYPE;             /* the published row is bf16 */
+    /* The fused form narrows its sum to the residual's dtype before the variance reads it;
+     * the graphs that carry this op have bf16 residuals, so an f32 one stays on the host
+     * kernel rather than getting a silently different (un-narrowed) contract here. */
+    if (res && res->dtype != RAD_BF16) return RAD_E_DTYPE;
+    if (!dt_act_ok(w->dtype)) return RAD_E_DTYPE;
+    if (q->dtype != RAD_F8E4M3 || sc->dtype != RAD_F32) return RAD_E_DTYPE;
+    if (ob && !dt_act_ok(ob->dtype)) return RAD_E_DTYPE;
+    const int64_t n = param_i(a, "n", w->rank ? w->shape[w->rank - 1] : 0);
+    if (n <= 0 || n > 30720) return RAD_E_SHAPE;              /* the row is staged in LDS */
+    int64_t g = param_i(a, "group", 0);
+    if (g <= 0 || g > n) g = n;                               /* ref's clamp */
+    const int64_t ngrp = (n + g - 1) / g;
+    const float eps  = (float)param_f(a, "eps", 1e-6);
+    const float wadd = (float)param_f(a, "wadd", 0.0);
+    const int64_t rows = rad_tensor_numel(x) / n;
+    if (rows <= 0 || rows > 0xffff) return RAD_E_SHAPE;
+    if (rad_tensor_numel(q) < rows * n || rad_tensor_numel(sc) < rows * ngrp
+        || rad_tensor_numel(w) < n) return RAD_E_SHAPE;
+    if (res && rad_tensor_numel(res) < rows * n) return RAD_E_SHAPE;
+    if (ob && rad_tensor_numel(ob) < rows * n) return RAD_E_SHAPE;
+    int64_t xp, rp = 0, qp, sp, op = 0;
+    if (row2_pitch(x, n, &xp)) return RAD_E_STRIDE;
+    if (res && row2_pitch(res, n, &rp)) return RAD_E_STRIDE;
+    if (w->rank != 1 || w->stride[0] != 1) return RAD_E_STRIDE;
+    if (row2_pitch(q, n, &qp)) return RAD_E_STRIDE;
+    if (row2_pitch(sc, ngrp, &sp)) return RAD_E_STRIDE;
+    if (ob && row2_pitch(ob, n, &op)) return RAD_E_STRIDE;
+    const int64_t smem = n * 2;
+    static bool attr_set = false;
+    if (!attr_set && smem > 48 * 1024) {
+        if (hipFuncSetAttribute((const void*)rmsnorm_quant_fp8_kernel,
+                                hipFuncAttributeMaxDynamicSharedMemorySize,
+                                61 * 1024) != hipSuccess) return RAD_E_DEVICE;
+        attr_set = true;
+    }
+    rmsnorm_quant_fp8_kernel<<<dim3((uint32_t)rows), dim3(kThreads), (int)smem,
+                               (hipStream_t)(uintptr_t)s>>>(
+        (const uint8_t*)x->data, x->dtype, rad_dtype_bytes(x->dtype, xp),
+        res ? (uint8_t*)res->data : nullptr, res ? res->dtype : RAD_BF16,
+        res ? rad_dtype_bytes(res->dtype, rp) : 0,
+        (const uint8_t*)w->data, w->dtype, 0,
+        (uint8_t*)q->data, qp, (float*)sc->data, sp,
+        ob ? (uint8_t*)ob->data : nullptr, ob ? ob->dtype : RAD_F32,
+        ob ? rad_dtype_bytes(ob->dtype, op) : 0,
+        n, g, eps, wadd, ngrp);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }

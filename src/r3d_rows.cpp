@@ -351,6 +351,23 @@ static const RadOperandSpec oRowTopk[] = {
     { "val",   RAD_OPD_OUT, 0 },
     { "pairs", RAD_OPD_OUT, 1 },
 };
+/* rmsnorm_quant_fp8 (verbatim libr4d pRmsNormQuantFp8 / oRmsNormQuantFp8). */
+static const RadParamSpec pRmsNormQuantFp8[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "eps",   RAD_P_F64, RAD_REQUIRED },
+    { "group", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    { "wadd",  RAD_P_F64, RAD_OPTIONAL },
+};
+static const RadOperandSpec oRmsNormQuantFp8[] = {
+    { "x",        RAD_OPD_IN,     0 },
+    { "residual", RAD_OPD_INOUT,  1 },   /* present = the fused_add_rms_norm form */
+    { "w",        RAD_OPD_WEIGHT, 0 },
+    { "q",        RAD_OPD_OUT,    0 },
+    { "scale",    RAD_OPD_OUT,    0 },
+    { "out_bf16", RAD_OPD_OUT,    1 },   /* layers with a bf16 consumer of the post-norm tensor */
+};
 
 static const RadOpSchema kSchemas[] = {
     { "rmsnorm", pRmsNorm, (int)(sizeof(pRmsNorm)/sizeof(pRmsNorm[0])),
@@ -485,6 +502,11 @@ static const RadOpSchema kSchemas[] = {
         "column reported so a rank's slice reports global ids, and `pairs` is the [M, R, 2] "
         "(int32 id, float value) plane an all_gather moves; a slot the row could not fill "
         "reports id -1 there and column 0 in `idx`, which is the unsharded contract unchanged." },
+      { "rmsnorm_quant_fp8", pRmsNormQuantFp8,
+        (int)(sizeof(pRmsNormQuantFp8)/sizeof(pRmsNormQuantFp8[0])),
+        oRmsNormQuantFp8, (int)(sizeof(oRmsNormQuantFp8)/sizeof(oRmsNormQuantFp8[0])),
+        "RMS norm and the fp8 activation quantiser in one pass over the row. The bf16 norm "
+        "output the unfused pair wrote is still written, and the codes are taken over it." },
       };
 
 /* The rmsnorm row. Field order is RadKernelInfo's positional form (rad_abi.h): after the prose,
@@ -591,6 +613,7 @@ extern "C" int r3d_rad_gather_rows(const RadArgs*, RadStream);
 extern "C" int r3d_rad_silu_mul(const RadArgs*, RadStream);
 extern "C" int r3d_rad_quant_act_i8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_row_topk(const RadArgs*, RadStream);
+extern "C" int r3d_rad_rmsnorm_quant_fp8(const RadArgs*, RadStream);
 
 /* Constraints for the r3d_more rows, in libr4d's shape so a query that resolves there
  * resolves here identically: silu_mul is the plain bf16 row; quant_act_i8 walks the
@@ -604,6 +627,11 @@ static const RadConstraint cRowTopK[] = {
     { "M",     RAD_C_GE,  1,    nullptr },
     { "R",     RAD_C_GE,  1,    nullptr },
     { "R",     RAD_C_LE,  32,   nullptr },
+    { "dtype", RAD_C_IN,  0,    "bf16" },
+};
+static const RadConstraint cRmsNormQuantFp8[] = {
+    { "n",     RAD_C_DIV, 4,    nullptr },
+    { "group", RAD_C_EQ,  128,  nullptr },   /* R4D_FP8_BLOCK */
     { "dtype", RAD_C_IN,  0,    "bf16" },
 };
 
@@ -893,6 +921,16 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cRowTopK, 5, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_row_topk },
+
+{ "rmsnorm_quant_fp8", "rmsnorm_quant_fp8", "quant",
+  "RMS norm and the fp8 group quantiser in one pass; the bf16 norm output is written and "
+  "the codes are taken over it, exactly as ref stores the narrowed values before reading "
+  "them; with a residual the bf16-narrowed sum is stored before the variance reads it",
+  "n a multiple of 4, group 128; one workgroup per row, the row staged in LDS (<= 30720)",
+  "bf16 in, fp8_e4m3 codes with an f32 per-group scale, optional bf16/f32 out_bf16",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cRmsNormQuantFp8, 6, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_rmsnorm_quant_fp8 },
 
 };
 
