@@ -11,10 +11,12 @@
  * flat chain. Every reassociation sits below bf16 store rounding, and the oracle contract is
  * rel_l2, not bit-exactness -- kbench adjudicates, and any drift shows there.
  *
- * This is the correctness-first tile for M > 1: 64x64 outputs per workgroup, K in 16-slice
- * LDS tiles, 256 threads at 4x4 outputs each, scalar bf16 loads, no WMMA yet. Decode (M=1)
- * dispatches to the bandwidth-shaped GEMV row below instead; the m64/WMMA variants libr4d
- * runs on RDNA4 remain the prefill speed roadmap.
+ * The tile here is the correctness-first fallback: 64x64 outputs per workgroup, K in
+ * 16-slice LDS tiles, 256 threads at 4x4 outputs each, scalar bf16 loads. Dispatch:
+ * decode (M=1) goes to the bandwidth-shaped GEMV row below; every M > 1 goes to the
+ * WMMA prefill tile in r3d_gemm_bf16_m64.hip, and this scalar tile remains the fallback
+ * for a refused/failed m64 launch (and the bit-exact twin of the oracle's k-chain for
+ * desk work).
  *
  * Operand reading mirrors ref_gemm.h exactly:
  *   * row pitch is the trailing-dimension FOLD, not stride[rank-2]: a rank-3 qkv output read
@@ -29,6 +31,7 @@
 
 #include "rad_abi.h"
 #include "rad_plugin.h"
+#include "r3d_gemm.h"
 
 namespace {
 
@@ -243,6 +246,16 @@ static int gemm_nt_launch(const RadArgs* a, RadStream s, const char* n_name, con
                            (int)N, (int)K, b_pitch);
         return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
     }
+
+    /* Prefill band: every M > 1 goes to the WMMA tile (gfx1100 native
+     * v_wmma_f32_16x16x16_bf16, ragged edges staged to zero through LDS there). The
+     * scalar tile below is the fallback for a failed m64 launch -- hipGetLastError
+     * there means "never enqueued", so falling through cannot double-write Y. */
+    int rc = r3d_gemm_nt_m64_launch(A->data, B->data, Y->data,
+                                    Y->dtype == RAD_F32 ? (float*)Y->data : nullptr,
+                                    (int)M, (int)N, (int)K, a_pitch, b_pitch, y_pitch,
+                                    stream);
+    if (rc == RAD_OK) return RAD_OK;
 
     dim3 grid((unsigned)((N + kBN - 1) / kBN), (unsigned)((M + kBM - 1) / kBM));
     hipLaunchKernelGGL((gemm_nt_bf16_kernel), grid, dim3(kThreads), 0, stream,
