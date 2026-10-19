@@ -44,8 +44,9 @@ sample_logprobs` — exact served subset to be confirmed with `--debug-graph` on
 
 **Ported and oracle-green on the card (2026-10-19):** embed_lookup, rmsnorm, kv_store,
 act_mul (all four acts), cast (bf16 copy / widen / narrow), rope (neox+gptj; multi-component
-modes and yarn/llama3 refused by constraint). Remaining Tier 1: **gemm_nt** (the big one) and
-**attn_paged**, then the sampler chain.
+modes and yarn/llama3 refused by constraint), gemm_nt (bf16, correctness-first tile).
+Remaining Tier 1: **attn_paged** (second big one; per head_dim/gqa geometry), then the
+sampler chain. WMMA speed variants of gemm_nt are a Tier-1.5 optimization, not a gate.
 
 ## Tier 2 — multi-rank and shapes
 
@@ -82,6 +83,14 @@ w4a16-style weight formats that avoid fp8 MMA. Device-only fused ops: last, with
   | act_mul_bf16       | 44 checked, 44 passed (silu/gelu families) | 0 OOB |
   | cast_bf16_* (3 rows) | replayed with act_mul: 76 passed in that run | 0 OOB |
   | rope_bf16          | 17 device-rope cases, all passed in the 221/221 sweep | 0 OOB |
+  | gemm_nt_bf16       | 269 checked, 269 passed, worst rel_l2 0.000e+00 | 28 cases, 0 OOB |
+
+  gemm_nt ran alone at 269/269 **bit-exact** against libref across every recorded geometry
+  (qkv / gate+up / down / lm_head shapes to 2^27). The zero is structural, not luck: the
+  kernel walks k ascending per output — the oracle's exact chain — and bf16 x bf16 is exact
+  in f32, so the tile-boundary reassociations the kernel *could* have made it never makes.
+  Same rule as the copy-shaped ops: a future nonzero rel_l2 here is a regression signal, not
+  rounding noise.
 
   Full sweep `--op rmsnorm --op embed_lookup --op kv_store --op rope --op act_mul --op cast
   --max-bytes 12288`: **221 checked, 221 passed, worst rel_l2 2.395e-04, 0 wrote outside a
@@ -92,7 +101,7 @@ w4a16-style weight formats that avoid fp8 MMA. Device-only fused ops: last, with
 Reproduce (on rdna3-dev, after `cmake -B build3 -S . && cmake --build build3`):
 
 ```
-docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
+docker run --rm --shm-size=4g --device /dev/kfd --device /dev/dri --group-add video \
   -v $PWD:/work -e ROCR_VISIBLE_DEVICES=0 radiance-dev:v1.8.1 bash -lc '
   mkdir -p /tmp/home/kernels /tmp/home/architectures &&
   cp /opt/radiance/share/radiance/kernels/libref.so \
@@ -101,6 +110,9 @@ docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
 ```
 
 Pitfalls this settled:
+- `rad-info --plugins` takes the home as `--home PATH`; a `RAD_HOME` environment variable is
+  silently ignored and the output lists the install's plugins only — an empty grep is not a
+  load failure.
 - A loaded kernel plugin must declare the schema of every op it implements; libref is a
   kbench oracle, not a search-path plugin, so on RDNA3 libr3d declares its ops' schemas
   itself, copied verbatim from libr4d so co-load `schema_same()` passes.
