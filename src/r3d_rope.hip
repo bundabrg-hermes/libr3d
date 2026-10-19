@@ -72,9 +72,11 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
         const uint32_t h = w / half, i = w - h * half;
         const uint32_t i0 = (mode == kGptj) ? 2u * i : i;
         const uint32_t i1 = (mode == kGptj) ? 2u * i + 1u : i + half;
-        const float ang = p * inv[i];
-        float c, s;
-        sincosf(ang, &s, &c);                    /* magnitude is 1 outside yarn, which is refused */
+        const float invf = 1.0f / (float)pow((double)theta,
+                                             (double)((float)(2u * i) / (float)rot));
+        const float ang = p * invf;
+        const float c = (float)cos((double)ang);
+        const float s = (float)sin((double)ang);
         const float x0 = r3d_bf16_to_f32(xr[i0 * ds]);
         const float x1 = r3d_bf16_to_f32(xr[i1 * ds]);
         xr[i0 * ds] = r3d_f32_to_bf16(x0 * c - x1 * s);
