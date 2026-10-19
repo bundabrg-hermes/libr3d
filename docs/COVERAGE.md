@@ -63,21 +63,28 @@ w4a16-style weight formats that avoid fp8 MMA. Device-only fused ops: last, with
 
 2026-10-19, radiance-dev:v1.8.1 (radiance v1.8.1, ROCm 10.1):
 
-- **Load gate:** `rad-info --plugins` on `--home build/radiance_home` reports
-  `libr3d 0.1.0 kernels 1 kernel(s), 1 schema(s)` against `AQL backend, 1 device(s)
-  [0:gfx1100]`, exit 0. The fat binary's gfx11-generic code objects load on gfx1100.
-- **Oracle gate:** `rmsnorm_bf16` vs libref on the card: **90 checked, 90 passed,
-  worst rel_l2 2.395e-04**, 40 cases in guarded allocations with 0 OOB writes, over the
-  741-case fixture recorded from qwen3.8-27b-fp8.
+- **Load gate:** `rad-info --plugins` on `--home build3/radiance_home` reports
+  `libr3d 0.1.0 kernels 3 kernel(s), 3 schema(s), built for gfx1100 gfx1101 gfx1102 gfx1103
+  gfx11-generic` against `AQL backend, 1 device(s) [0:gfx1100]`, exit 0. The fat binary's
+  gfx11-generic code objects load on gfx1100.
+- **Oracle gates, all vs libref on the card over the 741-case fixture recorded from
+  qwen3.8-27b-fp8:**
+  | kernel             | result | red-zone |
+  |--------------------|--------|----------|
+  | rmsnorm_bf16       | 90 checked, 90 passed, worst rel_l2 2.395e-04 | 40 cases, 0 OOB |
+  | embed_lookup_bf16  | 20 checked, 20 passed, worst rel_l2 0.000e+00 | 10 cases, 0 OOB |
+  | kv_store_bf16      | 20 checked, 20 passed, worst rel_l2 0.000e+00 | 0 cases (draw tier), 0 OOB |
+  Exact zeros are what the copy-shaped ops should give: a bf16 gather/scatter that matches the
+  oracle bit-for-bit cannot round differently. Any future nonzero there is a regression signal.
 
-Reproduce (on rdna3-dev, after `cmake --build build`):
+Reproduce (on rdna3-dev, after `cmake -B build3 -S . && cmake --build build3`):
 
 ```
 docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
   -v $PWD:/work -e ROCR_VISIBLE_DEVICES=0 radiance-dev:v1.8.1 bash -lc '
   mkdir -p /tmp/home/kernels /tmp/home/architectures &&
   cp /opt/radiance/share/radiance/kernels/libref.so \
-     /work/build/radiance_home/kernels/libr3d.so /tmp/home/kernels/ &&
+     /work/build3/radiance_home/kernels/libr3d.so /tmp/home/kernels/ &&
   rad-kbench --home /tmp/home --fixture /opt/radiance/share/radiance/kernels.rkb --op rmsnorm'
 ```
 
@@ -88,3 +95,5 @@ Pitfalls this settled:
 - The search path requires `architectures/` to exist beside `kernels/` (empty is fine).
 - On rdna3-dev the 7900 is ROCR index **0** (`[0:gfx1100 1:gfx1201 2:gfx1201]`), not DRM card1.
 - kbench needs ~3 GiB free in the container; case budget auto-shrinks and names skips.
+- `--max-bytes` is plain MiB (`12g` parses as 12 MiB). The 27B fixture's embed_lookup cases need
+  ~7.1 GiB each; `--max-bytes 12288` runs all 20 on the 24 GiB card.
