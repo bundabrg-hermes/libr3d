@@ -29,6 +29,9 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "rad_abi.h"
 #include "r3d_gemm.h"
 
@@ -70,8 +73,8 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_kernel(
     const int m0 = blockIdx.y * kMB;
     const int n0 = blockIdx.x * kNB;
     const int w = threadIdx.x / kWave;            /* wave index 0..7 */
-    const int tw = w >> 2;                        /* this wave's tile row (of 4) */
-    const int tc = (w & 3) * 2;                   /* its two tile columns (of 8 cols) */
+    const int tw = w >> 1;                        /* this wave's tile row (of 4) */
+    const int tc = (w & 1) * 2;                   /* its two tile columns (of 4) */
 
     rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, bf16, rocwmma::row_major> fa;
     rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, bf16, rocwmma::col_major> fb0, fb1;
@@ -132,13 +135,25 @@ int r3d_gemm_nt_m64_launch(const void* A, const void* B, void* Y, float* Yf,
     hipLaunchKernelGGL((gemm_nt_bf16_m64_kernel), grid, dim3(kThreads), 0, stream,
                        (const uint16_t*)A, (const uint16_t*)B, (uint16_t*)Y, Yf,
                        M, N, K, a_pitch, b_pitch, y_pitch);
-    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    const hipError_t le = hipGetLastError();
+    if (le != hipSuccess) fprintf(stderr, "libr3d: m64 launch FAILED (%s)\n",
+                                 hipGetErrorName(le));
+    else if (getenv("R3D_DEBUG_GEMM")) {
+        static bool once = false;
+        if (!once) { once = true; fprintf(stderr, "libr3d: m64 WMMA tile launched\n"); }
+    }
+    return le == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
 #else  /* gfx11-generic and every other target: refuse, scalar tile takes the op */
 
 int r3d_gemm_nt_m64_launch(const void*, const void*, void*, float*,
                            int, int, int, int64_t, int64_t, int64_t, hipStream_t) {
+    static bool once = false;
+    if (!once && getenv("R3D_DEBUG_GEMM")) {
+        once = true;
+        fprintf(stderr, "libr3d: m64 refusal stub ran (generic code object selected)\n");
+    }
     return RAD_E_DEVICE;
 }
 
