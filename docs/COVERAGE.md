@@ -58,3 +58,33 @@ w4a16-style weight formats that avoid fp8 MMA. Device-only fused ops: last, with
 2. Host-tier tests (`ctest -LE 'gpu|oot'` upstream patterns; kbench fixture tier).
 3. On rdna3-dev with the RDNA3 card: `rad-kbench` vs libref over recorded geometries, red-zone OOB;
    then `rad-info --plugins`; then serve MiniCPM5-2B bf16.
+
+## Verified state on hardware (gfx1100, RX 7900 XTX class, rdna3-dev ROCR index 0)
+
+2026-10-19, radiance-dev:v1.8.1 (radiance v1.8.1, ROCm 10.1):
+
+- **Load gate:** `rad-info --plugins` on `--home build/radiance_home` reports
+  `libr3d 0.1.0 kernels 1 kernel(s), 1 schema(s)` against `AQL backend, 1 device(s)
+  [0:gfx1100]`, exit 0. The fat binary's gfx11-generic code objects load on gfx1100.
+- **Oracle gate:** `rmsnorm_bf16` vs libref on the card: **90 checked, 90 passed,
+  worst rel_l2 2.395e-04**, 40 cases in guarded allocations with 0 OOB writes, over the
+  741-case fixture recorded from qwen3.8-27b-fp8.
+
+Reproduce (on rdna3-dev, after `cmake --build build`):
+
+```
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
+  -v $PWD:/work -e ROCR_VISIBLE_DEVICES=0 radiance-dev:v1.8.1 bash -lc '
+  mkdir -p /tmp/home/kernels /tmp/home/architectures &&
+  cp /opt/radiance/share/radiance/kernels/libref.so \
+     /work/build/radiance_home/kernels/libr3d.so /tmp/home/kernels/ &&
+  rad-kbench --home /tmp/home --fixture /opt/radiance/share/radiance/kernels.rkb --op rmsnorm'
+```
+
+Pitfalls this settled:
+- A loaded kernel plugin must declare the schema of every op it implements; libref is a
+  kbench oracle, not a search-path plugin, so on RDNA3 libr3d declares its ops' schemas
+  itself, copied verbatim from libr4d so co-load `schema_same()` passes.
+- The search path requires `architectures/` to exist beside `kernels/` (empty is fine).
+- On rdna3-dev the 7900 is ROCR index **0** (`[0:gfx1100 1:gfx1201 2:gfx1201]`), not DRM card1.
+- kbench needs ~3 GiB free in the container; case budget auto-shrinks and names skips.
