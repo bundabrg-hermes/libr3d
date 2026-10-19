@@ -107,7 +107,10 @@ extern "C" int r3d_rad_act_mul(const RadArgs* a, RadStream s) {
     if (rows <= 0 || rad_tensor_numel(A) < rows * n || rad_tensor_numel(B) < rows * n)
         return RAD_E_SHAPE;
 
-    /* Unit element stride required; each tensor keeps its own row pitch. */
+    /* Unit element stride required; each tensor keeps its own row pitch. Rank > 2 is refused:
+     * ref's rowoff walks every leading dimension with its own stride, and a single pitch
+     * cannot express that -- a refusal is honest, a wrong walk is not. */
+    if (A->rank > 2 || B->rank > 2 || Y->rank > 2) return RAD_E_UNSUPPORTED;
     if (Y->rank >= 2 && Y->stride[Y->rank - 1] != 1) return RAD_E_STRIDE;
     if ((A->rank >= 2 && A->stride[A->rank - 1] != 1) ||
         (B->rank >= 2 && B->stride[B->rank - 1] != 1)) return RAD_E_STRIDE;

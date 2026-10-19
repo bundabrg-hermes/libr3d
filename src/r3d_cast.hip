@@ -65,6 +65,9 @@ extern "C" int r3d_rad_cast(const RadArgs* a, RadStream s) {
 
     const int64_t nel = rad_tensor_numel(Y);
     if (nel <= 0 || rad_tensor_numel(X) < nel) return RAD_E_SHAPE;
+    /* Rank > 2 is refused for the same reason as in act_mul: ref's offlin decomposes the
+     * linear index over every dimension's own stride; one pitch per tensor cannot express it. */
+    if (X->rank > 2 || Y->rank > 2) return RAD_E_UNSUPPORTED;
     if (Y->rank >= 2 && Y->stride[Y->rank - 1] != 1) return RAD_E_STRIDE;
     if (X->rank >= 2 && X->stride[X->rank - 1] != 1) return RAD_E_STRIDE;
 

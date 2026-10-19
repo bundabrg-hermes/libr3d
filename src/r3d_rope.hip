@@ -121,7 +121,26 @@ extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
     if (M <= 0 || M > 0x7fffffffLL) return RAD_E_SHAPE;
     if (rad_tensor_numel(qkv) < M * stride_row) return RAD_E_SHAPE;
     if (qkv->rank >= 2 && qkv->stride[qkv->rank - 1] != 1) return RAD_E_STRIDE;
-    const int64_t row_pitch = qkv->rank >= 2 ? qkv->stride[qkv->rank - 2] : stride_row;
+
+    /* The token pitch, mirroring ref_gemm.h's row_stride(qkv, stride_row) exactly: fold the
+     * trailing dimensions until they span the row, and the stride one axis out carries it.
+     * For a rank-3 [M, heads, head_dim] qkv -- what the q-only (n_head_kv=0) geometries
+     * present -- that is stride[0]; a bare stride[rank-2] there would read every token at
+     * the head stride. */
+    int64_t row_pitch;
+    if (qkv->rank < 2) {
+        row_pitch = stride_row;
+    } else {
+        int64_t span = 1;
+        int hit = -1;
+        for (int i = (int)qkv->rank - 1; i >= 0; --i) {
+            span *= qkv->shape[i];
+            if (span == stride_row) { hit = i; break; }
+            if (span > stride_row) break;
+        }
+        row_pitch = hit >= 0 ? (hit > 0 ? qkv->stride[hit - 1] : stride_row)
+                             : qkv->stride[qkv->rank - 2];   /* shapes disagree: ref's fallback */
+    }
     const int64_t ds = 1;   /* element stride, enforced unit above; ref reads laststride(qkv) */
 
     const uint32_t half = (uint32_t)(rot / 2);
