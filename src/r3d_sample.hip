@@ -20,11 +20,16 @@
  * abi/rad_sample.h, restated as __device__ functions because the header's inline versions
  * are host-only in this translation-unit layout.
  *
- * This file covers the classic chain the core issues for an ordinary sampled request:
+ * This file covers the whole chain the core issues for a sampled request:
  * sample_temp, sample_mask, sample_argmax, sample_topk, sample_topp, sample_minp,
- * sample_pick. sample_penalties / sample_dry / sample_typical / sample_xtc /
- * sample_logprobs (flag- and option-gated, so absent from default requests) stay on the
- * fallback until a later batch; the row table simply has no rows for them.
+ * sample_pick, and the flag-gated stages sample_penalties, sample_dry,
+ * sample_typical, sample_xtc and sample_logprobs. The last five have no host stand-in
+ * for the engine (no weights for the planner to place), so the model cannot START
+ * without device rows for them -- the serve gate is what demanded this batch.
+ *
+ * Two refusals remain honest misses: the history/breaker planes must arrive i32 (ref
+ * reads any ld_int width; the engine's idx planes are i32), and the DRY window is
+ * bounded by what fits LDS (hmax <= 6144).
  *
  * Refusals (all at resolve, never wrong numbers): logits/candidate tensors must be rank 2
  * with a unit last stride; the vocab-parallel `pairs` plane of sample_topk is refused
@@ -55,8 +60,25 @@ __device__ __forceinline__ float r3d_uniform01(uint64_t seed, uint64_t pos) {
 }
 /* The pick key comes from the header's own table (RAD_SAMPLE_KEY_PICK). */
 
-/* ref's transcendental rule: evaluate in double, round once. */
+/* ref's transcendental rule: evaluate in double, round once (ref_common.h's ref_exp/ref_log). */
 __device__ __forceinline__ float r3d_exp(float x) { return (float)exp((double)x); }
+__device__ __forceinline__ float r3d_log(float x) { return (float)log((double)x); }
+
+/* The window both history stages read: the row's own row of the history plane, clamped to
+ * it, with `last_n` keeping the tail of the span. Mirrors ref_sample.cpp's hist_window
+ * line for line: 0 disables the stage, negative keeps the whole span. */
+__device__ __forceinline__ bool hist_window(const RadSampleParams& sp, int32_t last_n,
+                                            int64_t hmax, int64_t* ho_out, int64_t* hl_out) {
+    if (last_n == 0) return false;
+    int64_t hl = sp.hist_len;
+    int64_t ho = sp.hist_off < 0 ? 0 : sp.hist_off;
+    if (ho > hmax) ho = hmax;
+    if (hl > hmax - ho) hl = hmax - ho;
+    if (last_n > 0 && hl > last_n) { ho += hl - last_n; hl = last_n; }
+    *ho_out = ho;
+    *hl_out = hl;
+    return hl > 0;
+}
 
 /* ------------------------------------------------------------------ shared selection rule */
 /* (v desc, id asc): `beats` is the ONLY ordering rule in this file. bi < 0 is the empty
@@ -225,6 +247,7 @@ __global__ __launch_bounds__(kThreads) void narrow_kernel(
     int32_t* __restrict__ cidx, float* __restrict__ cval,
     const RadSampleParams* __restrict__ p,
     int64_t ci_pitch, int32_t n_cand, int stage) {
+    extern __shared__ float smf[];   /* stage 2: q at [0], d at [n_cand] */
     if (threadIdx.x != 0) return;
     const int64_t m = blockIdx.x;
     const RadSampleParams& sp = p[m];
@@ -252,6 +275,55 @@ __global__ __launch_bounds__(kThreads) void narrow_kernel(
     for (int32_t i = 0; i < n_cand; ++i)
         if (ir[i] >= 0) sum += r3d_exp(vr[i] - mx);
     const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+
+    if (stage == 2) {               /* typical: a threshold on |surprisal - H|, ties kept */
+        const float tp = sp.typical_p;
+        if (!(tp < 1.0f) || !(tp > 0.0f)) return;
+        float* q = smf;
+        float* d = smf + n_cand;
+        for (int32_t i = 0; i < n_cand; ++i) { q[i] = 0.0f; d[i] = 0.0f; }
+        float H = 0.0f;
+        for (int32_t i = 0; i < n_cand; ++i) {
+            if (ir[i] < 0) continue;
+            q[i] = r3d_exp(vr[i] - mx) * inv;
+            if (q[i] > 0.0f) H -= q[i] * r3d_log(q[i]);
+        }
+        for (int32_t i = 0; i < n_cand; ++i)
+            if (q[i] > 0.0f) d[i] = fabsf(-r3d_log(q[i]) - H);
+        /* The cut is the SMALLEST distance whose at-or-below mass reaches p; ref scans the
+         * distances that occur, in candidate order, keeping the minimum that qualifies --
+         * an O(n^2) scan, and n_cand <= 4096 on one thread is the price of the tie rule. */
+        float cut = 0.0f;
+        bool have_cut = false;
+        for (int32_t c = 0; c < n_cand; ++c) {
+            if (!(q[c] > 0.0f)) continue;
+            float mass = 0.0f;
+            for (int32_t i = 0; i < n_cand; ++i)
+                if (q[i] > 0.0f && d[i] <= d[c]) mass += q[i];
+            if (mass >= tp && (!have_cut || d[c] < cut)) { cut = d[c]; have_cut = true; }
+        }
+        if (!have_cut) return;      /* rounding left the whole mass below p: nothing is cut */
+        for (int32_t i = 0; i < n_cand; ++i)
+            if (ir[i] >= 0 && (!(q[i] > 0.0f) || d[i] > cut)) narrow_drop(ir, vr, i);
+        return;
+    }
+
+    if (stage == 3) {               /* xtc: drop above-threshold candidates but the last one */
+        if (!(sp.xtc_probability > 0.0f) || !(sp.xtc_threshold > 0.0f)) return;
+        if (r3d_uniform01(sp.seed ^ RAD_SAMPLE_KEY_XTC, sp.pos) >= sp.xtc_probability)
+            return;                 /* the row's own stream decides whether the stage fires */
+        int64_t last_above = -1, n_above = 0;
+        for (int32_t i = 0; i < n_cand; ++i) {
+            if (ir[i] < 0) continue;
+            if (r3d_exp(vr[i] - mx) * inv >= sp.xtc_threshold) { last_above = i; ++n_above; }
+        }
+        if (n_above < 2) return;    /* needs two above to have anything to drop */
+        for (int32_t i = 0; i < n_cand; ++i) {
+            if (ir[i] < 0 || i == last_above) continue;
+            if (r3d_exp(vr[i] - mx) * inv >= sp.xtc_threshold) narrow_drop(ir, vr, i);
+        }
+        return;
+    }
 
     const float pp = sp.top_p;
     if (!(pp < 1.0f) || !(pp > 0.0f)) return;
@@ -300,6 +372,168 @@ __global__ __launch_bounds__(kThreads) void pick_kernel(
         if (u < cum) { chosen = id; break; }
     }
     tok[m] = (int32_t)(chosen >= 0 ? chosen : last);
+}
+
+/* ------------------------------------------------------------------ sample_penalties
+ * One thread walks the row's history window; the work is per DISTINCT token in a window of
+ * at most `hmax` ids, not per vocabulary column, so one block per row with thread 0 doing
+ * the walk is the whole kernel. Ref's per-distinct-token arithmetic is line-mirrored:
+ * repetition divides above zero and MULTIPLIES at or below (dividing a negative logit
+ * would raise it), then the count times freq, then pres -- two separate subtractions, the
+ * order ref writes them, not one fused expression. */
+__global__ __launch_bounds__(kThreads) void penalties_kernel(
+    float* __restrict__ lg, int64_t lg_pitch, int64_t n_vocab,
+    const RadSampleParams* __restrict__ p,
+    const int32_t* __restrict__ hist, int64_t hist_pitch,
+    int32_t voff) {
+    if (threadIdx.x != 0) return;
+    const int64_t m = blockIdx.x;
+    const RadSampleParams& sp = p[m];
+    if (!(sp.flags & RAD_SP_PENALTY)) return;
+    const float rep = sp.rep_penalty, freq = sp.freq_penalty, pres = sp.pres_penalty;
+    if (rep == 1.0f && freq == 0.0f && pres == 0.0f) return;
+
+    const int64_t hmax = hist_pitch;           /* entry checked numel/M == shape[1] */
+    int64_t ho = 0, hl = 0;
+    if (!hist_window(sp, sp.penalty_last_n, hmax, &ho, &hl)) return;
+
+    const int32_t* __restrict__ hr = hist + m * hist_pitch + ho;
+    float* __restrict__ lr = lg + m * lg_pitch;
+    for (int64_t i = 0; i < hl; ++i) {
+        const int64_t tok = hr[i];
+        const int64_t col = tok - voff;
+        if (tok < 0 || col < 0 || col >= n_vocab) continue;
+        /* First occurrence only; the count carries the multiplicity. */
+        bool first = true;
+        int64_t count = 0;
+        for (int64_t j = 0; j < hl; ++j) {
+            if (hr[j] != tok) continue;
+            if (j < i) { first = false; break; }
+            ++count;
+        }
+        if (!first) continue;
+        float v = lr[col];
+        v = v > 0.0f ? v / rep : v * rep;
+        v -= (float)count * freq;
+        v -= pres;
+        lr[col] = v;
+    }
+}
+
+/* ------------------------------------------------------------------ sample_dry
+ * The naive longest-suffix scan, mirrored from ref_sample_dry (NOT host_ref's Z-algorithm
+ * -- the oracle is the plugin). Distinct continuation tokens and their longest repeat live
+ * in dynamic LDS (8 bytes a window slot); the entry refuses windows past 6144. The penalty
+ * is the repeated-multiplication form with ref's FLT_MAX/base stop, so every
+ * implementation computes the same float. */
+__global__ __launch_bounds__(kThreads) void dry_kernel(
+    float* __restrict__ lg, int64_t lg_pitch, int64_t n_vocab,
+    const RadSampleParams* __restrict__ p,
+    const int32_t* __restrict__ hist, int64_t hist_pitch,
+    const int32_t* __restrict__ brk, int64_t brk_pitch,
+    int32_t voff) {
+    extern __shared__ int32_t sm32[];          /* [hl] tokens then [hl] lengths */
+    if (threadIdx.x != 0) return;
+    const int64_t m = blockIdx.x;
+    const RadSampleParams& sp = p[m];
+    if (!(sp.flags & RAD_SP_DRY) || !(sp.dry_multiplier > 0.0f)) return;
+    const int64_t allowed = sp.dry_allowed_length > 0 ? sp.dry_allowed_length : 2;
+
+    int64_t ho = 0, hl = 0;
+    if (!hist_window(sp, sp.dry_penalty_last_n, hist_pitch, &ho, &hl)) return;
+    if (hl <= allowed) return;
+    const int64_t cap = sp.dry_rep_limit > 0 && sp.dry_rep_limit < hl ? sp.dry_rep_limit : hl;
+    if (cap < allowed) return;
+
+    const int32_t* __restrict__ hr = hist + m * hist_pitch + ho;
+    const int32_t* __restrict__ br = brk ? brk + m * brk_pitch + ho : nullptr;
+    float* __restrict__ lr = lg + m * lg_pitch;
+    int32_t* __restrict__ tl = sm32;
+    int32_t* __restrict__ ll = sm32 + hl;
+    int64_t nd = 0;
+
+    for (int64_t j = 0; j + 1 < hl; ++j) {
+        const int64_t lim = j + 1 < cap ? j + 1 : cap;
+        int64_t n = 0;
+        while (n < lim && hr[j - n] == hr[hl - 1 - n]) ++n;
+        if (n < allowed || (br && br[j + 1] != 0)) continue;   /* exempt: a breaker ends it */
+        const int32_t next = hr[j + 1];
+        const int64_t col = (int64_t)next - voff;
+        if (next < 0 || col < 0 || col >= n_vocab) continue;
+        int64_t found = -1;
+        for (int64_t t = 0; t < nd; ++t) if (tl[t] == next) { found = t; break; }
+        if (found < 0) { tl[nd] = next; ll[nd] = (int32_t)n; ++nd; }
+        else if (n > ll[found]) ll[found] = (int32_t)n;
+    }
+
+    const float base = sp.dry_base > 0.0f ? sp.dry_base : 1.75f;
+    const float lim = 3.402823466e+38f / base;                 /* FLT_MAX / base */
+    for (int64_t t = 0; t < nd; ++t) {
+        float pen = sp.dry_multiplier;
+        if (base != 1.0f)
+            for (int64_t e = 0; e < (int64_t)ll[t] - allowed; ++e) {
+                if (pen > lim) break;
+                pen *= base;
+            }
+        float* off = lr + ((int64_t)tl[t] - voff);
+        *off = *off - pen;
+    }
+}
+
+/* ------------------------------------------------------------------ sample_logprobs
+ * The raw distribution's summary: max, sum of exp(l - mx) in DOUBLE, and the k largest as
+ * (id, logit) pairs under the one total order -- k rounds of block argmax after the last
+ * pick, exactly the topk_kernel's selection. Rows without the flag are not written.
+ * The double sum is a tree, not ref's ascending walk: regrouping a double accumulation
+ * moves the f32 narrowing by at most an ulp, which kbench reads as 1e-07 rel_l2, nowhere
+ * near a decision boundary (unlike the pick, this sum feeds no threshold). */
+__global__ __launch_bounds__(kThreads) void logprobs_kernel(
+    const float* __restrict__ lg, int64_t pitch, int64_t n_vocab,
+    const RadSampleParams* __restrict__ p,
+    float* __restrict__ st, int64_t st_pitch, int32_t k, int32_t voff) {
+    __shared__ float s_v[kWarps]; __shared__ int64_t s_i[kWarps];
+    __shared__ float s_pv; __shared__ int64_t s_pi;
+    __shared__ double s_d[kThreads];
+
+    const int64_t m = blockIdx.x;
+    if (!(p[m].flags & RAD_SP_LOGPROBS)) return;
+    const float* __restrict__ row = lg + m * pitch;
+    float* __restrict__ sr = st + m * st_pitch;
+
+    float bv; int64_t bi;
+    r3d_block_argmax(row, n_vocab, r3d_keep_all, s_v, s_i, &bv, &bi);
+    const float mx = bv;
+
+    double part = 0.0;
+    for (int64_t i = (int64_t)threadIdx.x; i < n_vocab; i += (int64_t)kThreads)
+        part += exp((double)row[i] - (double)mx);
+    s_d[threadIdx.x] = part;
+    __syncthreads();
+    for (uint32_t off = kThreads / 2; off; off >>= 1) {
+        if (threadIdx.x < off) s_d[threadIdx.x] += s_d[threadIdx.x + off];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { sr[0] = mx; sr[1] = (float)s_d[0]; }
+
+    if (threadIdx.x == 0) { s_pv = INFINITY; s_pi = -1; }
+    __syncthreads();
+    for (int32_t j = 0; j < k; ++j) {
+        float vv; int64_t vi;
+        r3d_block_argmax(row, n_vocab, R3dAfter{s_pv, s_pi}, s_v, s_i, &vv, &vi);
+        if (vi < 0) {                      /* vocabulary exhausted: the rest are holes */
+            for (int32_t jj = j + (int32_t)threadIdx.x; jj < k; jj += (int64_t)kThreads) {
+                sr[2 + 2 * jj] = -1.0f;
+                sr[3 + 2 * jj] = -INFINITY;
+            }
+            break;
+        }
+        if (threadIdx.x == 0) {
+            sr[2 + 2 * j] = (float)((int32_t)vi + voff);   /* ids exact below 2^24 */
+            sr[3 + 2 * j] = vv;
+            s_pv = vv; s_pi = vi;
+        }
+        __syncthreads();
+    }
 }
 
 /* ------------------------------------------------------------------ host-side helpers */
@@ -427,7 +661,8 @@ extern "C" int r3d_rad_sample_topk(const RadArgs* a, RadStream s) {
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
-/* narrow: stage 0 = top-p, stage 1 = min-p (same operand shape, both in place). */
+/* narrow: stage 0 = top-p, 1 = min-p, 2 = typical, 3 = xtc (same operand shape, all in
+ * place). Typical stages q/d for the row in LDS: two f32 arrays of n_cand. */
 static int sample_narrow(const RadArgs* a, RadStream s, int stage) {
     const RadTensor* ci = rad_arg_in(a, 0);
     const RadTensor* cv = rad_arg_in(a, 1);
@@ -445,13 +680,16 @@ static int sample_narrow(const RadArgs* a, RadStream s, int stage) {
     int64_t ci_p, cv_p;
     if (row2(ci, n_cand, &ci_p)) return RAD_E_STRIDE;
     if (row2(cv, n_cand, &cv_p) || cv_p != ci_p) return RAD_E_STRIDE;
-    hipLaunchKernelGGL(narrow_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+    const unsigned smem = stage == 2 ? (unsigned)(2 * n_cand * (int64_t)sizeof(float)) : 0u;
+    hipLaunchKernelGGL(narrow_kernel, dim3((uint32_t)M), dim3(kThreads), smem,
                        (hipStream_t)(uintptr_t)s, (int32_t*)ci->data, (float*)cv->data,
                        (const RadSampleParams*)pr->data, ci_p, n_cand, stage);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 extern "C" int r3d_rad_sample_topp(const RadArgs* a, RadStream s) { return sample_narrow(a, s, 0); }
 extern "C" int r3d_rad_sample_minp(const RadArgs* a, RadStream s) { return sample_narrow(a, s, 1); }
+extern "C" int r3d_rad_sample_typical(const RadArgs* a, RadStream s) { return sample_narrow(a, s, 2); }
+extern "C" int r3d_rad_sample_xtc(const RadArgs* a, RadStream s) { return sample_narrow(a, s, 3); }
 
 extern "C" int r3d_rad_sample_pick(const RadArgs* a, RadStream s) {
     const RadTensor* ci  = rad_arg_in(a, 0);
@@ -476,5 +714,93 @@ extern "C" int r3d_rad_sample_pick(const RadArgs* a, RadStream s) {
                        (hipStream_t)(uintptr_t)s, (const int32_t*)ci->data,
                        (const float*)cv->data, (const RadSampleParams*)pr->data,
                        (int32_t*)tok->data, ci_p, n_cand);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* ---- the history and summary stages. The history plane is [M, hmax] i32 contiguous:
+ * ref reads any ld_int width, the engine's idx planes are i32, and a padded row pitch
+ * would make ref's own numel/M hmax ambiguous -- all refused, not guessed. ---- */
+static int hist_plane(const RadTensor* t, int64_t M, int64_t* pitch) {
+    if (!t || !t->data || t->dtype != RAD_I32) return -1;
+    if (t->rank != 2 || t->stride[1] != 1 || t->stride[0] != t->shape[1]) return -2;
+    if (t->shape[1] <= 0 || rad_tensor_numel(t) < M * t->shape[1]) return -3;
+    *pitch = t->stride[0];
+    return 0;
+}
+
+extern "C" int r3d_rad_sample_penalties(const RadArgs* a, RadStream s) {
+    const RadTensor* lg = rad_arg_in(a, 0);
+    const RadTensor* pr = rad_arg_in(a, 1);
+    const RadTensor* hi = rad_arg_in(a, 2);
+    if (!lg || !pr || !hi) return RAD_E_INVAL;
+    if (lg->dtype != RAD_F32) return RAD_E_DTYPE;
+    long long nv = 0;
+    if (!rad_args_geti(a, "n_vocab", &nv) || nv <= 0) nv = lg->rank >= 2 ? lg->shape[1] : 0;
+    if (nv <= 0) return RAD_E_SHAPE;
+    const int64_t M = rad_tensor_numel(lg) / nv;
+    if (M <= 0 || M > 0xffff) return RAD_E_SHAPE;
+    if (!param_rows_ok(pr, M)) return RAD_E_SHAPE;
+    int64_t lg_p; if (row2(lg, nv, &lg_p)) return RAD_E_STRIDE;
+    int64_t hi_p; if (hist_plane(hi, M, &hi_p)) return RAD_E_SHAPE;
+    long long voff = 0; rad_args_geti(a, "vocab_off", &voff);
+    hipLaunchKernelGGL(penalties_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+                       (hipStream_t)(uintptr_t)s, (float*)lg->data, lg_p, nv,
+                       (const RadSampleParams*)pr->data, (const int32_t*)hi->data, hi_p,
+                       (int32_t)voff);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+extern "C" int r3d_rad_sample_dry(const RadArgs* a, RadStream s) {
+    const RadTensor* lg = rad_arg_in(a, 0);
+    const RadTensor* pr = rad_arg_in(a, 1);
+    const RadTensor* hi = rad_arg_in(a, 2);
+    const RadTensor* bk = (a->n_t > 3 && a->t[3].data) ? &a->t[3] : nullptr;
+    if (!lg || !pr || !hi) return RAD_E_INVAL;
+    if (lg->dtype != RAD_F32) return RAD_E_DTYPE;
+    long long nv = 0;
+    if (!rad_args_geti(a, "n_vocab", &nv) || nv <= 0) nv = lg->rank >= 2 ? lg->shape[1] : 0;
+    if (nv <= 0) return RAD_E_SHAPE;
+    const int64_t M = rad_tensor_numel(lg) / nv;
+    if (M <= 0 || M > 0xffff) return RAD_E_SHAPE;
+    if (!param_rows_ok(pr, M)) return RAD_E_SHAPE;
+    int64_t lg_p; if (row2(lg, nv, &lg_p)) return RAD_E_STRIDE;
+    int64_t hi_p; if (hist_plane(hi, M, &hi_p)) return RAD_E_SHAPE;
+    /* The distinct-token map is two int32 arrays of the window, in LDS. */
+    if (hi_p > 6144) return RAD_E_SHAPE;
+    int64_t bk_p = 0;
+    if (bk && hist_plane(bk, M, &bk_p)) return RAD_E_SHAPE;
+    long long voff = 0; rad_args_geti(a, "vocab_off", &voff);
+    hipLaunchKernelGGL(dry_kernel, dim3((uint32_t)M), dim3(kThreads),
+                       (unsigned)(2 * hi_p * (int64_t)sizeof(int32_t)),
+                       (hipStream_t)(uintptr_t)s, (float*)lg->data, lg_p, nv,
+                       (const RadSampleParams*)pr->data, (const int32_t*)hi->data, hi_p,
+                       bk ? (const int32_t*)bk->data : nullptr, bk_p, (int32_t)voff);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+extern "C" int r3d_rad_sample_logprobs(const RadArgs* a, RadStream s) {
+    const RadTensor* lg = rad_arg_in(a, 0);
+    const RadTensor* pr = rad_arg_in(a, 1);
+    const RadTensor* st = rad_arg_in(a, 2);
+    if (!lg || !pr || !st) return RAD_E_INVAL;
+    if (lg->dtype != RAD_F32 || st->dtype != RAD_F32) return RAD_E_DTYPE;
+    long long nv = 0;
+    if (!rad_args_geti(a, "n_vocab", &nv) || nv <= 0) nv = lg->rank >= 2 ? lg->shape[1] : 0;
+    if (nv <= 0) return RAD_E_SHAPE;
+    long long k = 0;
+    if (!rad_args_geti(a, "k", &k) || k <= 0 || k > 0xffff) return RAD_E_SHAPE;
+    const int64_t M = rad_tensor_numel(lg) / nv;
+    if (M <= 0 || M > 0xffff) return RAD_E_SHAPE;
+    if (!param_rows_ok(pr, M)) return RAD_E_SHAPE;
+    const int64_t w = 2 + 2 * k;
+    int64_t lg_p, st_p;
+    if (row2(lg, nv, &lg_p)) return RAD_E_STRIDE;
+    if (row2(st, w, &st_p)) return RAD_E_STRIDE;
+    if (rad_tensor_numel(st) < M * w) return RAD_E_SHAPE;
+    long long voff = 0; rad_args_geti(a, "vocab_off", &voff);
+    hipLaunchKernelGGL(logprobs_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+                       (hipStream_t)(uintptr_t)s, (const float*)lg->data, lg_p, nv,
+                       (const RadSampleParams*)pr->data, (float*)st->data, st_p,
+                       (int32_t)k, (int32_t)voff);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }

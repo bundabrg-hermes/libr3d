@@ -204,6 +204,36 @@ static const RadParamSpec pMCand[] = {
     { "M",      RAD_P_INT, RAD_REQUIRED },
     { "n_cand", RAD_P_INT, RAD_REQUIRED },
 };
+/* ---- the history/summary stages (verbatim from libr4d: pPenal/oPenalties/oDry and
+ * pLogprobs/oLogprobs). typical and xtc reuse pMCand/oNarrow -- same three operands,
+ * narrowed in place. ---- */
+static const RadParamSpec pPenal[] = {
+    { "M",         RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab",   RAD_P_INT, RAD_REQUIRED },
+    { "vocab_off", RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oPenalties[] = {
+    { "logits",  RAD_OPD_INOUT, 0 },
+    { "params",  RAD_OPD_IN,    0 },
+    { "history", RAD_OPD_IN,    0 },
+};
+static const RadOperandSpec oDry[] = {
+    { "logits",   RAD_OPD_INOUT, 0 },
+    { "params",   RAD_OPD_IN,    0 },
+    { "history",  RAD_OPD_IN,    0 },
+    { "breakers", RAD_OPD_IN,    1 },
+};
+static const RadParamSpec pLogprobs[] = {
+    { "M",         RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab",   RAD_P_INT, RAD_REQUIRED },
+    { "k",         RAD_P_INT, RAD_REQUIRED },
+    { "vocab_off", RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oLogprobs[] = {
+    { "logits", RAD_OPD_IN,  0 },
+    { "params", RAD_OPD_IN,  0 },
+    { "stats",  RAD_OPD_OUT, 0 },
+};
 /* ---- band-op specs (verbatim from libr4d, the plugin that fixes these schemas). ---- */
 static const RadParamSpec pAdd[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
@@ -350,6 +380,29 @@ static const RadOpSchema kSchemas[] = {
       { "sample_pick", pMCand, (int)(sizeof(pMCand)/sizeof(pMCand[0])),
         oPick,   (int)(sizeof(oPick)/sizeof(oPick[0])),
         "the inverse-CDF draw over the candidate set, from the specified splitmix64 stream." },
+      { "sample_penalties", pPenal, (int)(sizeof(pPenal)/sizeof(pPenal[0])),
+        oPenalties, (int)(sizeof(oPenalties)/sizeof(oPenalties[0])),
+        "repetition, frequency and presence penalties over the logits row, from the row's "
+        "history window: distinct tokens only, the repetition divides above zero and "
+        "multiplies at or below." },
+      { "sample_dry", pPenal, (int)(sizeof(pPenal)/sizeof(pPenal[0])),
+        oDry, (int)(sizeof(oDry)/sizeof(oDry[0])),
+        "the DRY repetition-suffix penalty: the longest suffix of the window that repeats "
+        "before each continuation, multiplier times base^(length - allowed), capped at the "
+        "float overflow boundary. An optional breaker plane exempts positions." },
+      { "sample_typical", pMCand, (int)(sizeof(pMCand)/sizeof(pMCand[0])),
+        oNarrow, (int)(sizeof(oNarrow)/sizeof(oNarrow[0])),
+        "locally typical narrowing: keep the candidates whose |surprisal - entropy| mass "
+        "at-or-below their distance reaches typical_p; every candidate tied at the cut "
+        "survives together." },
+      { "sample_xtc", pMCand, (int)(sizeof(pMCand)/sizeof(pMCand[0])),
+        oNarrow, (int)(sizeof(oNarrow)/sizeof(oNarrow[0])),
+        "exclude-top-changes: with the row's own coin, drop every candidate at or above "
+        "xtc_threshold except the last one; fires only when two or more are above." },
+      { "sample_logprobs", pLogprobs, (int)(sizeof(pLogprobs)/sizeof(pLogprobs[0])),
+        oLogprobs, (int)(sizeof(oLogprobs)/sizeof(oLogprobs[0])),
+        "the raw distribution's summary: max, sum of exp, and the k largest (id, logit) "
+        "pairs over the UNSOFTMAXED row; reads nothing the other stages wrote." },
 
       /* ---- the band ops that gate the quantising bf16 trunk (see r3d_band.hip). ---- */
       { "add", pAdd, (int)(sizeof(pAdd)/sizeof(pAdd[0])),
@@ -457,6 +510,11 @@ extern "C" int r3d_rad_sample_topk(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_topp(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_minp(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_pick(const RadArgs*, RadStream);
+extern "C" int r3d_rad_sample_penalties(const RadArgs*, RadStream);
+extern "C" int r3d_rad_sample_dry(const RadArgs*, RadStream);
+extern "C" int r3d_rad_sample_typical(const RadArgs*, RadStream);
+extern "C" int r3d_rad_sample_xtc(const RadArgs*, RadStream);
+extern "C" int r3d_rad_sample_logprobs(const RadArgs*, RadStream);
 extern "C" int r3d_rad_quant_act_fp8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gated_quant_fp8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_add(const RadArgs*, RadStream);
@@ -619,6 +677,54 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cSampleCand, 2, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_sample_pick },
+
+{ "sample_penalties_f32", "sample_penalties", "sample",
+  "repetition / frequency / presence penalties from the row's history window",
+  "any vocabulary; the walk is per DISTINCT token of the window, so the cost is the "
+  "window, not the vocabulary; the i32 history plane must be contiguous",
+  "f32 logits in place, i32 history plane, per-row params",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cSampleVoc, 1, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_sample_penalties },
+
+{ "sample_dry_f32", "sample_dry", "sample",
+  "the DRY repetition-suffix penalty, the naive longest-suffix scan of the oracle",
+  "the window is bounded by what fits LDS (hmax <= 6144); the penalty is the "
+  "repeated-multiplication form with the FLT_MAX/base stop, computed identically by every "
+  "implementation",
+  "f32 logits in place, i32 history plane, optional i32 breaker plane, per-row params",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cSampleVoc, 1, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_sample_dry },
+
+{ "sample_typical_f32", "sample_typical", "sample",
+  "locally typical narrowing in place",
+  "n_cand <= 4096; the entropy and the cut scan are SEQUENTIAL in candidate order on one "
+  "thread -- the entropy sum and the mass scan are order-sensitive sums, and the tie rule "
+  "(everything at the cut survives) is the llama.cpp one the oracle documents",
+  "i32 candidate ids and f32 candidate logits, both in place",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cSampleCand, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_sample_typical },
+
+{ "sample_xtc_f32", "sample_xtc", "sample",
+  "exclude-top-changes narrowing in place, from the row's own XTC coin",
+  "n_cand <= 4096; the coin is the spec stream at RAD_SAMPLE_KEY_XTC, so the firing "
+  "decision is reproducible; ref fires on `>=` and a draw exactly on the boundary fires",
+  "i32 candidate ids and f32 candidate logits, both in place",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cSampleCand, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_sample_xtc },
+
+{ "sample_logprobs_f32", "sample_logprobs", "sample",
+  "the raw distribution's summary: max, double sum of exp, and the k largest pairs",
+  "any vocabulary; k rounds of the block argmax under the one total order reproduce the "
+  "reference's insertion-sorted top-k; a vocabulary narrower than k leaves the remaining "
+  "slots as (-1, -inf) holes",
+  "f32 logits (read, not written), f32 stats row [M, 2 + 2k]",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cSampleVoc, 1, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_sample_logprobs },
 
 /* ---- the band ops. Until these exist, a bf16 trunk that quantises its MLP activations
  * cannot START on this card at all: quant_act_fp8 / gated_quant_fp8 / add / gather_rows
