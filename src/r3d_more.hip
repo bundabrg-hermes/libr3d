@@ -314,7 +314,16 @@ extern "C" int r3d_rad_row_topk(const RadArgs* a, RadStream s) {
     if (row2_pitch(x, N, &xp)) return RAD_E_STRIDE;
     if (row2_pitch(idx, R, &ip)) return RAD_E_STRIDE;
     if (row2_pitch(val, R, &vp)) return RAD_E_STRIDE;
-    if (pairs && row2_pitch(pairs, 2 * R, &pp)) return RAD_E_STRIDE;
+    /* The fixture's pairs plane is rank 3 [M, R, 2] (the shape the schema describes); a
+     * flat rank-2 [M, 2R] is the same memory and is accepted too. Any other stride
+     * layout is refused rather than read at the wrong offsets. */
+    if (pairs) {
+        if (pairs->rank == 3) {
+            if (pairs->stride[2] != 1 || pairs->stride[1] != 2 ||
+                pairs->stride[0] != 2 * R) return RAD_E_STRIDE;
+            pp = 2 * R;
+        } else if (row2_pitch(pairs, 2 * R, &pp)) return RAD_E_STRIDE;
+    }
     row_topk_kernel<<<dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)(uintptr_t)s>>>(
         (const uint8_t*)x->data, x->dtype, rad_dtype_bytes(x->dtype, xp),
         (int32_t*)idx->data, ip, (float*)val->data, vp,
