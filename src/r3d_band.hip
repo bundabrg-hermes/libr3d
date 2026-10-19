@@ -147,11 +147,11 @@ __global__ __launch_bounds__(kThreads) void quant_act_fp8_kernel(
 /* ------------------------------------------------------------------ gated_quant_fp8
  * One block per row; per group: recompute the gated bf16 value for the amax pass, then
  * again for the encode pass (deterministic -- identical bits, so no row-sized staging). */
-__device__ __forceinline__ float gated_h(const uint8_t* __restrict__ gu, uint32_t dt,
-                                         int64_t base, int64_t gs, int64_t n, int64_t i,
+__device__ __forceinline__ float gated_h(const uint8_t* __restrict__ gub, uint32_t dt,
+                                         int64_t gs, int64_t n, int64_t i,
                                          int silu) {
-    const float gt = ldt2(gu, dt, base + i * gs);
-    const float up = ldt2(gu, dt, base + (n + i) * gs);
+    const float gt = ldt2(gub, dt, i * gs);
+    const float up = ldt2(gub, dt, (n + i) * gs);
     const float sg = r3d_sigmoid(gt);
     return r3d_bf16_to_f32(r3d_f32_to_bf16((silu ? gt * sg : sg) * up));
 }
@@ -172,7 +172,7 @@ __global__ __launch_bounds__(kThreads) void gated_quant_fp8_kernel(
         const int64_t k0 = gi * g, k1 = (k0 + g < n) ? k0 + g : n;
         float amax = 0.0f;
         for (int64_t i = (int64_t)threadIdx.x; i < k1 - k0; i += (int64_t)kThreads) {
-            const float m = fabsf(gated_h(gu, dt, gub - gu, gs, n, k0 + i, silu));
+            const float m = fabsf(gated_h(gub, dt, gs, n, k0 + i, silu));
             if (m > amax) amax = m;
         }
         amax = block_max(amax, s_part);
@@ -184,7 +184,7 @@ __global__ __launch_bounds__(kThreads) void gated_quant_fp8_kernel(
         __syncthreads();
         const float inv = 1.0f / s_sc;
         for (int64_t i = (int64_t)threadIdx.x; i < k1 - k0; i += (int64_t)kThreads) {
-            const float h = gated_h(gu, dt, gub - gu, gs, n, k0 + i, silu);
+            const float h = gated_h(gub, dt, gs, n, k0 + i, silu);
             if (yr) stt2(yr, ob_dt, k0 + i, h);
             float c = h * inv;
             if (c >  448.0f) c =  448.0f;
