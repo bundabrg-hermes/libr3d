@@ -111,6 +111,31 @@ w4a16-style weight formats that avoid fp8 MMA. Device-only fused ops: last, with
   164 red-zone cases, 0 violations.** The 24 skips are the 7-14 GiB embed/logits_gemm cases
   that did not fit -- see the RAM pitfall below. `rad-info --plugins`: 9 kernels / 7 schemas.
 
+- **Sampler chain + band ops (2026-10-19, same fixture/card).** `sample_temp/mask/argmax/topk/
+  topp/minp/pick` and `add/gather_rows/quant_act_fp8/gated_quant_fp8` joined after the 881
+  sweep. The quantisers are unavoidable even for a bf16 trunk: the model quantises MLP
+  activations per 128-group and those ops are weightless, so the planner cannot push them to
+  the host and refuses the graph at startup. fp8 here is *storage*, not arithmetic -- only the
+  e4m3 encoder is touched, which RDNA3 does not need hardware for. Per-op runs: 20 + 16 + 88
+  + 20 + 28 + 14 x 6, **all passed, all worst rel_l2 0.000e+00, 0 red-zone violations.**
+  Full-fixture regression after the fixes: **1009 checked, 1009 passed, 24 skipped (same
+  big-shape RAM skips), 0 violations.** `rad-info`: 21 kernels / 19 schemas on `[0:gfx1100]`.
+- **Pitch pitfall (the one that ate a session):** `RadTensor::stride[0]` is in ELEMENTS. Any
+  kernel that walks a `uint8_t*` row base as `base + row * pitch` must be handed a BYTE pitch;
+  `row2_pitch` stays element-unit and each launch converts with `rad_dtype_bytes`. f32/f8
+  (1 elt == 1 B) and M==1 (row 0, offset 0) are immune to the mix, which is why the failure
+  signature -- "bf16 with rows>1" -- is the tell. A write overrun trips the red zone loudly;
+  a pure READ overrun (gated_h taking `gub - gu` as an element base) only shows as a fatal
+  queue fault mid-sweep. Pass row bases as pointers so the mix is unrepresentable.
+- **Not yet done:** no full-model serve has run on this card. An interrupted session's closing
+  report claimed MiniCPM5-2B was serving on the 7900 with embed fixes at commit `0949f0f` --
+  that hash exists in no repo, the weights were never downloaded, and no serve artifact exists
+  on either machine: the wrap-up was hallucinated at interruption. Treat that claim as the
+  lesson it is (reconcile closing reports against git and the filesystem before believing
+  them), and the gate below as genuinely open. The first run of MiniCPM5-2B bf16
+  (weights are on neither box yet) is the remaining Tier-1 exit test; op coverage says the
+  graph should resolve end to end.
+
 - **RAM pitfall (rdna3-dev):** co-tenant serve's host-resident model holds ~25 GB of rdna3-dev's 31 GB, so the
   kbench auto budget drops to ~1.7 GiB and big embed/logits cases skip. Forcing them with
   `--max-bytes 12288` while co-tenant serve runs OOM-kills the container (exit 137, no dmesg line --
