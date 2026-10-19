@@ -8,13 +8,14 @@
 #   docker build -t radiance-dev docker/
 #   docker run --device /dev/kfd --device /dev/dri -v $PWD:/work radiance-dev <cmd>   # on a GPU host
 #
-# RAM note: a device-kernel TU takes 2-3 GB under hipcc; the -j below suits an 8 GB VM.
+# RAM note: a device-kernel TU takes 2-3 GB under hipcc (radiance's own Dockerfile says so).
+# JOBS=2 fits a 7-8 GB VM; raise it on bigger hosts with --build-arg JOBS=N.
 
 FROM rocm/dev-ubuntu-24.04:10.1.0-full
 
 ARG RAD_REF=v1.8.1
 ARG GPU_TARGETS=gfx1101;gfx11-generic
-ARG JOBS=4
+ARG JOBS=2
 
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
