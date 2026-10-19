@@ -11,10 +11,10 @@
  * flat chain. Every reassociation sits below bf16 store rounding, and the oracle contract is
  * rel_l2, not bit-exactness -- kbench adjudicates, and any drift shows there.
  *
- * This is the correctness-first tile: 64x64 outputs per workgroup, K in 16-slice LDS tiles,
- * 256 threads at 4x4 outputs each, scalar bf16 loads, no WMMA yet. Decode (M=1) therefore
- * wastes 63/64 of every A tile; the m64/WMMA variants libr4d runs on RDNA4 are the speed
- * roadmap. What matters at this commit is that every recorded geometry comes out RIGHT.
+ * This is the correctness-first tile for M > 1: 64x64 outputs per workgroup, K in 16-slice
+ * LDS tiles, 256 threads at 4x4 outputs each, scalar bf16 loads, no WMMA yet. Decode (M=1)
+ * dispatches to the bandwidth-shaped GEMV row below instead; the m64/WMMA variants libr4d
+ * runs on RDNA4 remain the prefill speed roadmap.
  *
  * Operand reading mirrors ref_gemm.h exactly:
  *   * row pitch is the trailing-dimension FOLD, not stride[rank-2]: a rank-3 qkv output read
@@ -108,6 +108,66 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_kernel(
     }
 }
 
+/* Decode GEMV (M == 1): Y[n] = dot(A, B[n]). The tile kernel reads every weight element
+ * once per 64-row block, which at M=1 means 63/64 of each A tile's workgroup budget is
+ * spent on zero rows; at a measured ~1.45 GB/s it caps decode at 0.4 tok/s on the XTX.
+ * This row is bandwidth-shaped instead: one 64-lane wavefront per output row, each lane
+ * striding K in 16-byte (8 x bf16) vectors, so a wavefront's loads are a contiguous
+ * 1024-byte run and every weight element is touched exactly once.
+ *
+ * Arithmetic contract, same grounds as the tile above: each lane accumulates f32 over its
+ * own ascending k subsequence; the wavefront then reassociates the 64 partials through a
+ * shfl_xor butterfly tree. That reassociation sits entirely above f32 partials and below
+ * the single bf16 store rounding -- exactly the class of reassociation the tiling note at
+ * the top of this file already sanctions, and kbench rel_l2 adjudicates. -ffp-contract=off
+ * keeps mul and add separate roundings as in libref.
+ */
+constexpr int kGemvThreads = 256;   /* 4 wavefronts = 4 rows per workgroup */
+constexpr int kGemvRows    = 4;
+constexpr int kWave        = 64;    /* RDNA wave64; the ABI pin lives in CMakeLists */
+
+__device__ __forceinline__ float r3d_dot8_bf16(const uint4& av, const uint4& bv, float acc) {
+    const uint32_t* au = reinterpret_cast<const uint32_t*>(&av);
+    const uint32_t* bu = reinterpret_cast<const uint32_t*>(&bv);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float a0 = r3d_bf16_to_f32((uint16_t)(au[i] & 0xffffu));
+        const float a1 = r3d_bf16_to_f32((uint16_t)(au[i] >> 16));
+        const float b0 = r3d_bf16_to_f32((uint16_t)(bu[i] & 0xffffu));
+        const float b1 = r3d_bf16_to_f32((uint16_t)(bu[i] >> 16));
+        acc += a0 * b0;
+        acc += a1 * b1;
+    }
+    return acc;
+}
+
+__global__ __launch_bounds__(kGemvThreads) void gemv_nt_bf16_kernel(
+    const uint16_t* __restrict__ A, const uint16_t* __restrict__ B,
+    uint16_t* __restrict__ Y, float* __restrict__ Yf,
+    int N, int K, int64_t b_pitch, int64_t y_pitch) {
+
+    const int lane = threadIdx.x & (kWave - 1);
+    const int row  = blockIdx.x * kGemvRows + (threadIdx.x / kWave);
+
+    float acc = 0.f;
+    if (row < N) {
+        const uint4* __restrict__ av = reinterpret_cast<const uint4*>(A);
+        const uint4* __restrict__ bp = reinterpret_cast<const uint4*>(B + (int64_t)row * b_pitch);
+        const int kvec = K / 8;                       /* entry point guarantees K % 8 == 0 */
+        for (int v = lane; v < kvec; v += kWave)
+            acc = r3d_dot8_bf16(av[v], bp[v], acc);   /* A is one row: same vector index */
+    }
+
+    #pragma unroll
+    for (int o = kWave / 2; o > 0; o >>= 1)
+        acc += __shfl_xor_sync(0xffffffffffffffffull, acc, o);  /* ROCm 10.1: mask must be 64-bit */
+
+    if (row < N && lane == 0) {
+        if (Yf) Yf[(int64_t)row * y_pitch] = acc;
+        else    Y[(int64_t)row * y_pitch]  = r3d_f32_to_bf16(acc);
+    }
+}
+
 /* ref_gemm.h row_stride: fold trailing dims until they span `cols`; the next axis out is the
  * row. Ported so a rank-3 operand reads exactly as the oracle reads it. */
 int64_t row_stride(const RadTensor* t, int64_t cols) {
@@ -152,6 +212,23 @@ static int gemm_nt_launch(const RadArgs* a, RadStream s, const char* n_name, con
     if (rad_tensor_numel(B) < N * K) return RAD_E_SHAPE;
 
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
+
+    /* Decode band: M == 1 goes to the GEMV row when vectors can be trusted -- K and the
+     * weight row pitch divisible by 8 (a uint4 walk stays inside the row and stays
+     * aligned) and both bases 16-byte aligned. Every shape the engine records for
+     * MiniCPM5 satisfies this; anything else keeps the tile kernel, which is correct
+     * for all shapes, merely slow at M = 1. */
+    if (M == 1 && (K % 8) == 0 && (b_pitch % 8) == 0 &&
+        ((uintptr_t)A->data & 15u) == 0 && ((uintptr_t)B->data & 15u) == 0) {
+        hipLaunchKernelGGL((gemv_nt_bf16_kernel), dim3((unsigned)((N + kGemvRows - 1) / kGemvRows)),
+                           dim3(kGemvThreads), 0, stream,
+                           (const uint16_t*)A->data, (const uint16_t*)B->data,
+                           (uint16_t*)Y->data,
+                           Y->dtype == RAD_F32 ? (float*)Y->data : nullptr,
+                           (int)N, (int)K, b_pitch, y_pitch);
+        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    }
+
     dim3 grid((unsigned)((N + kBN - 1) / kBN), (unsigned)((M + kBM - 1) / kBM));
     hipLaunchKernelGGL((gemm_nt_bf16_kernel), grid, dim3(kThreads), 0, stream,
                        (const uint16_t*)A->data, (const uint16_t*)B->data,
