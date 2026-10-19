@@ -80,9 +80,9 @@ w4a16-style weight formats that avoid fp8 MMA. Device-only fused ops: last, with
   |--------------------|--------|----------|
   | rmsnorm_bf16       | 90 checked, 90 passed, worst rel_l2 2.395e-04 | 40 cases, 0 OOB |
   | embed_lookup_bf16  | 20 checked, 20 passed, worst rel_l2 0.000e+00 | 10 cases, 0 OOB |
-  | kv_store_bf16      | 20 checked, 20 passed, worst rel_l2 0.000e+00 | 0 cases (draw tier), 0 OOB |
-  | act_mul_bf16       | 44 checked, 44 passed (silu/gelu families) | 0 OOB |
-  | cast_bf16_* (3 rows) | replayed with act_mul: 76 passed in that run | 0 OOB |
+  | kv_store_bf16      | NOT DEVICE-VERIFIED (see correction below: fixture is fp8-KV only) | - |
+  | act_mul_bf16       | NOT DEVICE-VERIFIED (see correction below: fixture has no act_mul cases) | - |
+  | cast_bf16_bf16     | reached in per-op runs (10 device cases); bf16→f32 / f32→bf16 pairs have no fixture cases | 0 OOB |
   | rope_bf16          | 17 device-rope cases, all passed in the 221/221 sweep | 0 OOB |
   | gemm_nt_bf16       | 269 checked, 269 passed, worst rel_l2 0.000e+00 | 28 cases, 0 OOB |
   | attn_paged_bf16    | 138 checked, 138 passed, worst rel_l2 0.000e+00 | 69 cases, 0 OOB |
@@ -180,3 +180,48 @@ trailing-dimension walk, kept: rank-3 `[M, heads, head_dim]` qkv is expressible)
 position-stride read (ref's `offlin`, kept) was implicated; the fixture descriptors were plain
 rank-2 stride-1. The decisive tools were the standalone repro and a direct compile of the
 kernel outside the plugin .so, which together split "plumbing vs code" in one step.
+
+## The coverage correction (2026-10-19, second round)
+
+`logits_gemm_bf16` joined (the lm_head edge: gemm_nt's tile under the `n_vocab`/`n_embd`
+spelling; the tile's Y gate already admitted the f32 logits plane). Adding it and reading the
+full-sweep report exposed what the earlier per-op "passes" had hidden. The fixture records
+`op -> rows run`, not just pass counts, and per-op runs had been read as "our row ran" without
+checking that line. It had not, for four rows:
+
+| row | fixture reality | status |
+|---|---|---|
+| `kv_store_bf16` | every case is `kv_dtype=fp8_e4m3` (qwen3.8-27b-fp8 serves fp8 KV) | compiled + loads; never device-verified |
+| `act_mul_bf16` | no `act_mul` cases at all (this deployment fuses act+quant into the bands) | compiled + loads; never device-verified |
+| `cast_bf16_f32` / `cast_f32_bf16` | only `from=bf16 to=bf16` recorded | bf16→bf16 pair IS verified; the f32 pairs are not |
+| `logits_gemm_bf16` | `lm_head` recorded as affine E4M3: 2 planes (codes:f8e4m3 + scale:f32) | compiled + loads; never device-verified |
+
+Earlier claims of "kv_store 20/20 bit-exact, act_mul 44/44 passed" were libref replaying its
+own recorded answers: our rows had been declined, and the "0.000e+00" was libref-vs-itself.
+The decline mechanism, from `core/plugin/select.cpp`:
+
+- A DEVICE row with no `layout` hook **"reads the weight as stored"**: `weight_refusal()`
+  declines it whenever the case's weight encoding spans >1 plane. The engine would otherwise
+  hand an fp8 codes plane to a kernel reading bf16 — plausible-magnitude garbage. libref's
+  host shim dequantises, so the cases still check, vacuously for us.
+- Constraint declines are honest geometry: fp8 KV and fp8 heads are not this row's contract.
+- Probe that settled it (kept in `tools/kf_probe.cpp`): loads the fixture via
+  `rad::Kfixture::load` and dumps each operand's encoding. Link it against
+  `tools/kfixture.cpp` with `-Wl,--unresolved-symbols=ignore-all` (the draw helpers it
+  drags in are never called by `load`).
+
+Consequence, stated plainly: the qwen3.8-27b-fp8 fixture CANNOT gate a bf16-head or bf16-KV
+row. Those four rows graduate on the serve milestone — record a fixture from the bf16
+container (`rad-kbench -m minicpm5-2b... --record FILE`) and they resolve against plain bf16
+planes for the first time.
+
+Hygiene adopted from this:
+- Read the report's "not reached: libr3d N" line in EVERY sweep; a pass count says nothing
+  about which library ran. Coverage ratchet: `--coverage DIR --coverage-write` locks the
+  reached set (22 libr3d rows live in `~/projects/libr3d/logs/coverage/` on rdna3-dev); a later
+  `--coverage DIR` run fails if any locked row silently drops out.
+- Big sweeps while co-tenant serve runs (25 GB host RSS of 31 GB): a temporary swapfile works —
+  `sudo fallocate -l 20G /swap-kbench && sudo chmod 600 /swap-kbench && sudo mkswap
+  /swap-kbench && sudo swapon /swap-kbench`, run with `--max-bytes 12288`, then `swapoff`
+  and delete. Verified: all 7 logits cases passed as libref self-checks that way at ~50 s
+  wall without OOM.
