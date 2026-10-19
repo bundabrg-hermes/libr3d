@@ -29,10 +29,14 @@ endif()
 set_source_files_properties(src/r3d_rmsnorm.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
 set_source_files_properties(src/r3d_embed.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
 set_source_files_properties(src/r3d_kvstore.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
+set_source_files_properties(src/r3d_actmul.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
+set_source_files_properties(src/r3d_cast.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
+set_source_files_properties(src/r3d_rope.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
 
 rad_add_plugin(libr3d kernels
   SOURCES     src/r3d_rows.cpp
   HIP_SOURCES src/r3d_rmsnorm.hip src/r3d_embed.hip src/r3d_kvstore.hip
+              src/r3d_actmul.hip src/r3d_cast.hip src/r3d_rope.hip
   GPU_TARGETS ${R3D_GPU_TARGETS}
   INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR}/src)
 

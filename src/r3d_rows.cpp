@@ -86,6 +86,62 @@ static const RadOperandSpec oKvStore[] = {
     { "kv_cache",     RAD_OPD_INOUT, 0 },
 };
 
+/* act_mul: verbatim libr4d (r4d_rows.cpp pActMul/oBinary). The gated MLP pair: act applied to
+ * the gate operand, rounded to y's dtype, times the up operand. */
+static const RadParamSpec pActMul[] = {
+    { "M",    RAD_P_INT, RAD_REQUIRED },
+    { "n",    RAD_P_INT, RAD_REQUIRED },
+    { "act",  RAD_P_STR, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oBinary[] = {
+    { "a", RAD_OPD_IN,  0 },
+    { "b", RAD_OPD_IN,  0 },
+    { "y", RAD_OPD_OUT, 0 },
+};
+
+/* cast: verbatim libr4d (r4d_rows.cpp pCast/oUnary). from/to are for the selector; the
+ * tensors' own dtypes are what the kernel reads. */
+static const RadParamSpec pCast[] = {
+    { "M",    RAD_P_INT, RAD_REQUIRED },
+    { "n",    RAD_P_INT, RAD_REQUIRED },
+    { "from", RAD_P_STR, RAD_REQUIRED },
+    { "to",   RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oUnary[] = {
+    { "x", RAD_OPD_IN,  0 },
+    { "y", RAD_OPD_OUT, 0 },
+};
+
+/* rope: verbatim libr4d (r4d_rows.cpp pRope/oRope). The yarn and llama3 frequency-scaling
+ * parameters are declared (the schema must match libr4d's wherever both plugins load) but
+ * this plugin's row refuses them; the bf16 text models that are libr3d's scope do not use them. */
+static const RadParamSpec pRope[] = {
+    { "M",          RAD_P_INT, RAD_REQUIRED },
+    { "head_dim",   RAD_P_INT, RAD_REQUIRED },
+    { "n_head",     RAD_P_INT, RAD_REQUIRED },
+    { "n_head_kv",  RAD_P_INT, RAD_REQUIRED },
+    { "theta",      RAD_P_F64, RAD_REQUIRED },
+    { "scale",      RAD_P_F64, RAD_REQUIRED },
+    { "mode",       RAD_P_STR, RAD_REQUIRED },
+    { "rotary_dim", RAD_P_INT, RAD_OPTIONAL },
+    { "sections",   RAD_P_STR, RAD_OPTIONAL },
+    { "yarn_factor", RAD_P_F64, RAD_OPTIONAL },
+    { "yarn_low", RAD_P_F64, RAD_OPTIONAL },
+    { "yarn_high", RAD_P_F64, RAD_OPTIONAL },
+    { "yarn_magnitude", RAD_P_F64, RAD_OPTIONAL },
+    { "ladder",     RAD_P_STR, RAD_OPTIONAL },   /* the base ladder's width: rotary|head */
+    /* Llama 3's frequency scaling (abi/rad_yarn.h, RadLlama3). */
+    { "llama3_factor", RAD_P_F64, RAD_OPTIONAL },
+    { "llama3_low",    RAD_P_F64, RAD_OPTIONAL },
+    { "llama3_high",   RAD_P_F64, RAD_OPTIONAL },
+    { "llama3_orig",   RAD_P_F64, RAD_OPTIONAL },
+};
+static const RadOperandSpec oRope[] = {
+    { "qkv",       RAD_OPD_INOUT, 0 },
+    { "positions", RAD_OPD_IN,    0 },
+};
+
 static const RadOpSchema kSchemas[] = {
     { "rmsnorm", pRmsNorm, (int)(sizeof(pRmsNorm)/sizeof(pRmsNorm[0])),
       oRmsNorm,  (int)(sizeof(oRmsNorm)/sizeof(oRmsNorm[0])),
@@ -101,6 +157,20 @@ static const RadOpSchema kSchemas[] = {
       oKvStore,  (int)(sizeof(oKvStore)/sizeof(oKvStore[0])),
       "scatter k and v into kv_cache[n_blocks, kv_heads, block_size, 2*head_dim] -- K at "
       "[.., d] and V at [.., head_dim + d]. A negative slot stores nothing." },
+    { "act_mul", pActMul, (int)(sizeof(pActMul)/sizeof(pActMul[0])),
+      oBinary, (int)(sizeof(oBinary)/sizeof(oBinary[0])),
+      "y = act(a) * b, the activation (silu, gelu, gelu_tanh) rounded to y's dtype before "
+      "the product: silu_mul with its two halves in two operands." },
+    { "cast", pCast, (int)(sizeof(pCast)/sizeof(pCast[0])),
+      oUnary, (int)(sizeof(oUnary)/sizeof(oUnary[0])),
+      "y = x, converted. `from` and `to` are for the selector; the bytes are described by the "
+      "tensors' own dtypes and those are what the kernel reads." },
+    { "rope", pRope, (int)(sizeof(pRope)/sizeof(pRope[0])),
+      oRope, (int)(sizeof(oRope)/sizeof(oRope[0])),
+      "rotary embedding in place over the Q and K heads of a fused projection; the V heads "
+      "that follow are untouched. The multi-component modes (`mrope`, `imrope`, `axial`) "
+      "take [C, M] component-major positions and `sections`; with [M] positions every "
+      "component is that one, so mrope and imrope over a text batch are neox exactly." },
 };
 
 /* The rmsnorm row. Field order is RadKernelInfo's positional form (rad_abi.h): after the prose,
@@ -123,9 +193,38 @@ static const RadConstraint cKvStore[] = {
  * needs to sit above a future fallback row. */
 enum { R3D_PRIO_ONLY = 1000 };
 
+/* act_mul: the bf16 gated MLP, all four oracle activations this kernel ports. */
+static const RadConstraint cActMul[] = {
+    { "dtype", RAD_C_IN, 0, "bf16" },
+    { "act",   RAD_C_IN, 0, "silu gelu gelu_tanh sigmoid" },
+};
+
+/* The cast pairs this plugin serves, one row each (libr4d spells the same four; the f16
+ * narrowing is not yet ported and its pair simply has no row here). */
+static const RadConstraint cCastBf16[] = {
+    { "from", RAD_C_IN, 0, "bf16" }, { "to", RAD_C_IN, 0, "bf16" },
+};
+static const RadConstraint cCastWiden[] = {
+    { "from", RAD_C_IN, 0, "bf16" }, { "to", RAD_C_IN, 0, "f32" },
+};
+static const RadConstraint cCastNarrow[] = {
+    { "from", RAD_C_IN, 0, "f32" }, { "to", RAD_C_IN, 0, "bf16" },
+};
+
+/* rope: neox and gptj over [M] positions -- a subset of libr4d's five modes. A query for
+ * mrope/imrope/axial resolves to no device row on this card, which is an honest failure at
+ * issue, not an approximation. */
+static const RadConstraint cRopeRow[] = {
+    { "head_dim", RAD_C_GE, 1, nullptr },
+    { "mode",     RAD_C_IN, 0, "neox gptj" },
+};
+
 extern "C" int r3d_rad_rmsnorm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_embed_lookup(const RadArgs*, RadStream);
 extern "C" int r3d_rad_kv_store(const RadArgs*, RadStream);
+extern "C" int r3d_rad_act_mul(const RadArgs*, RadStream);
+extern "C" int r3d_rad_cast(const RadArgs*, RadStream);
+extern "C" int r3d_rad_rope(const RadArgs*, RadStream);
 
 static const RadKernelInfo kRows[] = {
 
@@ -153,6 +252,48 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cKvStore, 2, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_kv_store },
+
+{ "act_mul_bf16", "act_mul", "elem",
+  "gated activation over two operands: act(a) rounded, times b",
+  "any n; a, b and y each at their own row pitch, so both may be column slices of one buffer",
+  "bf16 in and out, f32 arithmetic, double-width silu / erf / tanh like the oracle",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cActMul, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_act_mul },
+
+{ "cast_bf16_bf16", "cast", "elem",
+  "y = x, bf16 to bf16 -- a strided row copy",
+  "any M and n; both row pitches are read off the operands, so a column slice of a wider "
+  "buffer is expressible",
+  "bf16 in, bf16 out, byte-for-byte",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cCastBf16, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_cast },
+
+{ "cast_bf16_f32", "cast", "elem",
+  "y = x, bf16 widened to f32",
+  "any M and n; both row pitches are read off the operands",
+  "bf16 in, f32 out, exact",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cCastWiden, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_cast },
+
+{ "cast_f32_bf16", "cast", "elem",
+  "y = x, f32 narrowed to bf16",
+  "any M and n; both row pitches are read off the operands",
+  "f32 in, bf16 out, rounded to nearest even",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cCastNarrow, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_cast },
+
+{ "rope_bf16", "rope", "attn",
+  "rotary embedding in place, one thread a rotated pair, the ladder built once per token",
+  "any head_dim; rotary_dim even and no wider than head_dim; neox and gptj pairings over "
+  "[M] positions (the multi-component modes and yarn/llama3 scaling have no row here)",
+  "bf16 qkv, i32 positions, fp32 angles through the accurate sincosf",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cRopeRow, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_rope },
 
 };
 
