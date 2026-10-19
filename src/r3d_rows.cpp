@@ -319,8 +319,37 @@ static const RadOperandSpec oNarrow[] = {
 static const RadOperandSpec oPick[] = {
     { "cand_idx", RAD_OPD_IN,  0 },
     { "cand_val", RAD_OPD_IN,  0 },
-    { "params",   RAD_OPD_IN,  0 },
+    { "params",   RAD_OPD_IN,    0 },
     { "token",    RAD_OPD_OUT, 0 },
+};
+
+/* silu_mul: pMnDtype is the same table gather_rows declares (verbatim from libr4d's, as
+ * is oGateUp) -- the loader's schema check compares the fixed grammar, not pointers. */
+static const RadOperandSpec oGateUp[] = {
+    { "gate_up", RAD_OPD_IN,  0 },
+    { "y",       RAD_OPD_OUT, 0 },
+};
+/* quant_act_i8: params identical to quant_act_fp8's; the optional fourth output selects
+ * the _asum form (verbatim libr4d oQuantAct). */
+static const RadOperandSpec oQuantAct[] = {
+    { "x",     RAD_OPD_IN,  0 },
+    { "q",     RAD_OPD_OUT, 0 },
+    { "scale", RAD_OPD_OUT, 0 },
+    { "asum",  RAD_OPD_OUT, 1 },
+};
+/* row_topk (verbatim libr4d pRowTopk / oRowTopk). */
+static const RadParamSpec pRowTopk[] = {
+    { "M",         RAD_P_INT, RAD_REQUIRED },
+    { "N",         RAD_P_INT, RAD_REQUIRED },
+    { "R",         RAD_P_INT, RAD_REQUIRED },
+    { "vocab_off", RAD_P_INT, RAD_OPTIONAL },
+    { "dtype",     RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oRowTopk[] = {
+    { "x",     RAD_OPD_IN,  0 },
+    { "idx",   RAD_OPD_OUT, 0 },
+    { "val",   RAD_OPD_OUT, 0 },
+    { "pairs", RAD_OPD_OUT, 1 },
 };
 
 static const RadOpSchema kSchemas[] = {
@@ -441,6 +470,21 @@ static const RadOpSchema kSchemas[] = {
         "PLAIN ROW-MAJOR order rather than quant_act_i8's fragment order. The scale is "
         "amax/448 -- a DEQUANT multiplier, the same sense as the checkpoint's "
         "weight_scale_inv, so the fp8 GEMMs multiply both scales and never divide." },
+      { "silu_mul", pMnDtype, (int)(sizeof(pMnDtype)/sizeof(pMnDtype[0])),
+        oGateUp, (int)(sizeof(oGateUp)/sizeof(oGateUp[0])),
+        "y[.., i] = silu(gate_up[.., i]) * gate_up[.., n + i]. The GATE IS THE FIRST HALF, "
+        "which is the order rad-convert fuses gate_proj and up_proj in." },
+      { "quant_act_i8", pQuantActFp8, (int)(sizeof(pQuantActFp8)/sizeof(pQuantActFp8[0])),
+        oQuantAct, (int)(sizeof(oQuantAct)/sizeof(oQuantAct[0])),
+        "per-row symmetric int8 quantisation, written in the byte order the r4d GEMMs' A "
+        "fragment reads. A third output selects the form that also emits the per-group row "
+        "sums an asymmetric weight grid needs." },
+      { "row_topk", pRowTopk, (int)(sizeof(pRowTopk)/sizeof(pRowTopk[0])),
+        oRowTopk, (int)(sizeof(oRowTopk)/sizeof(oRowTopk[0])),
+        "exact per-row top-R, descending, ties to the lower column. `vocab_off` shifts every "
+        "column reported so a rank's slice reports global ids, and `pairs` is the [M, R, 2] "
+        "(int32 id, float value) plane an all_gather moves; a slot the row could not fill "
+        "reports id -1 there and column 0 in `idx`, which is the unsharded contract unchanged." },
       };
 
 /* The rmsnorm row. Field order is RadKernelInfo's positional form (rad_abi.h): after the prose,
@@ -544,6 +588,24 @@ extern "C" int r3d_rad_quant_act_fp8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gated_quant_fp8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_add(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gather_rows(const RadArgs*, RadStream);
+extern "C" int r3d_rad_silu_mul(const RadArgs*, RadStream);
+extern "C" int r3d_rad_quant_act_i8(const RadArgs*, RadStream);
+extern "C" int r3d_rad_row_topk(const RadArgs*, RadStream);
+
+/* Constraints for the r3d_more rows, in libr4d's shape so a query that resolves there
+ * resolves here identically: silu_mul is the plain bf16 row; quant_act_i8 walks the
+ * sixteen-byte WMMA step so `n DIV 16`; row_topk admits N a multiple of 8 and R <= 32. */
+static const RadConstraint cQuantActI8[] = {
+    { "n",     RAD_C_DIV, 16,   nullptr },
+    { "dtype", RAD_C_IN,  0,    "bf16" },
+};
+static const RadConstraint cRowTopK[] = {
+    { "N",     RAD_C_DIV, 8,    nullptr },
+    { "M",     RAD_C_GE,  1,    nullptr },
+    { "R",     RAD_C_GE,  1,    nullptr },
+    { "R",     RAD_C_LE,  32,   nullptr },
+    { "dtype", RAD_C_IN,  0,    "bf16" },
+};
 
 static const RadKernelInfo kRows[] = {
 
@@ -801,6 +863,36 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cBandMn, 2, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gather_rows },
+
+/* ---- the three bands MiniCPM5-2B's graph names at resolve (see r3d_more.hip). The
+ * engine refused to START without them: weightless device bands have no host stand-in. */
+
+{ "silu_mul_bf16", "silu_mul", "elem",
+  "silu-gated product over a fused [M, 2n] gate_up, one f32 expression chain per element",
+  "any n; the gate is the first half",
+  "bf16 in and out, fp32 arithmetic, double-width sigmoid like the oracle",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cBf16Row, 1, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_silu_mul },
+
+{ "quant_act_i8", "quant_act_i8", "quant",
+  "per-row symmetric int8 quantisation of a bf16 activation, written in the byte order "
+  "the r4d GEMMs' A fragment reads; a third output selects the form that also emits the "
+  "per-group row sums",
+  "n a multiple of 16; one workgroup per row",
+  "bf16 in, int8 out with an f32 per-row scale",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cQuantActI8, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_quant_act_i8 },
+
+{ "rowtopk_bf16", "row_topk", "select",
+  "exact per-row top-R of a bf16 matrix, descending, ties to the lower column; R rounds "
+  "of the (value desc, id asc) block argmax reproduce topk_next's window exactly",
+  "any M, N a multiple of 8, R <= 32",
+  "bf16 in, f32 values + i32 columns out, optional f32 pairs plane",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cRowTopK, 5, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_row_topk },
 
 };
 
