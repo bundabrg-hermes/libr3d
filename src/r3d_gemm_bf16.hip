@@ -111,20 +111,21 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_kernel(
 /* Decode GEMV (M == 1): Y[n] = dot(A, B[n]). The tile kernel reads every weight element
  * once per 64-row block, which at M=1 means 63/64 of each A tile's workgroup budget is
  * spent on zero rows; at a measured ~1.45 GB/s it caps decode at 0.4 tok/s on the XTX.
- * This row is bandwidth-shaped instead: one 64-lane wavefront per output row, each lane
- * striding K in 16-byte (8 x bf16) vectors, so a wavefront's loads are a contiguous
- * 1024-byte run and every weight element is touched exactly once.
+ * This row is bandwidth-shaped instead: one 32-lane wavefront per output row (the project
+ * pins the wave32 ABI per TU -- see CMakeLists -mno-wavefrontsize64), each lane striding K
+ * in 16-byte (8 x bf16) vectors, so a wavefront's loads are a contiguous 512-byte run and
+ * every weight element is touched exactly once.
  *
  * Arithmetic contract, same grounds as the tile above: each lane accumulates f32 over its
- * own ascending k subsequence; the wavefront then reassociates the 64 partials through a
+ * own ascending k subsequence; the wavefront then reassociates the 32 partials through a
  * shfl_xor butterfly tree. That reassociation sits entirely above f32 partials and below
  * the single bf16 store rounding -- exactly the class of reassociation the tiling note at
  * the top of this file already sanctions, and kbench rel_l2 adjudicates. -ffp-contract=off
  * keeps mul and add separate roundings as in libref.
  */
-constexpr int kGemvThreads = 256;   /* 4 wavefronts = 4 rows per workgroup */
-constexpr int kGemvRows    = 4;
-constexpr int kWave        = 64;    /* RDNA wave64; the ABI pin lives in CMakeLists */
+constexpr int kGemvThreads = 256;   /* 8 wavefronts = 8 rows per workgroup */
+constexpr int kGemvRows    = 8;
+constexpr int kWave        = 32;    /* wave32 ABI: pinned by -mno-wavefrontsize64 in CMake */
 
 __device__ __forceinline__ float r3d_dot8_bf16(const uint4& av, const uint4& bv, float acc) {
     const uint32_t* au = reinterpret_cast<const uint32_t*>(&av);
