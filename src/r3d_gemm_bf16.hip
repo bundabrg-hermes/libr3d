@@ -124,7 +124,10 @@ int64_t row_stride(const RadTensor* t, int64_t cols) {
 } /* anonymous namespace */
 
 /* Launch entry; operands positional in the gemm_nt schema: a, b, y. */
-extern "C" int r3d_rad_gemm_nt(const RadArgs* a, RadStream s) {
+/* Shared launch for gemm_nt and logits_gemm: ref_logits_gemm IS gemm_nt_impl with the
+ * dimensions spelled n_vocab/n_embd (libref says so in one line), the operands are the
+ * same three in the same order, and the arithmetic is the same tile. */
+static int gemm_nt_launch(const RadArgs* a, RadStream s, const char* n_name, const char* k_name) {
     const RadTensor* A = rad_arg_in(a, 0);
     const RadTensor* B = rad_arg_in(a, 1);
     const RadTensor* Y = rad_arg_in(a, 2);
@@ -133,7 +136,7 @@ extern "C" int r3d_rad_gemm_nt(const RadArgs* a, RadStream s) {
     if (Y->dtype != RAD_BF16 && Y->dtype != RAD_F32) return RAD_E_DTYPE;
 
     long long M = 0, N = 0, K = 0;
-    if (!rad_args_geti(a, "M", &M) || !rad_args_geti(a, "N", &N) || !rad_args_geti(a, "K", &K))
+    if (!rad_args_geti(a, "M", &M) || !rad_args_geti(a, n_name, &N) || !rad_args_geti(a, k_name, &K))
         return RAD_E_SHAPE;
     if (M <= 0 || N <= 0 || K <= 0) return RAD_E_SHAPE;
     if (M > 0x7ffffffLL || N > 0x7ffffffLL || K > 0x7ffffffLL) return RAD_E_SHAPE;
@@ -156,4 +159,12 @@ extern "C" int r3d_rad_gemm_nt(const RadArgs* a, RadStream s) {
                        Y->dtype == RAD_F32 ? (float*)Y->data : nullptr,
                        (int)M, (int)N, (int)K, a_pitch, b_pitch, y_pitch);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+extern "C" int r3d_rad_gemm_nt(const RadArgs* a, RadStream s) {
+    return gemm_nt_launch(a, s, "N", "K");
+}
+
+extern "C" int r3d_rad_logits_gemm(const RadArgs* a, RadStream s) {
+    return gemm_nt_launch(a, s, "n_vocab", "n_embd");
 }

@@ -157,6 +157,20 @@ static const RadOperandSpec oGemmNt[] = {
     { "y", RAD_OPD_OUT,    0 },
 };
 
+/* logits_gemm: verbatim libr4d (r4d_rows.cpp pLogits/oLogits). Same three operands in the
+ * same order as gemm_nt, the extents spelled n_vocab / n_embd. */
+static const RadParamSpec pLogits[] = {
+    { "M",       RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab", RAD_P_INT, RAD_REQUIRED },
+    { "n_embd",  RAD_P_INT, RAD_REQUIRED },
+    { "dtype",   RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oLogits[] = {
+    { "x",       RAD_OPD_IN,     0 },
+    { "lm_head", RAD_OPD_WEIGHT, 0 },
+    { "logits",  RAD_OPD_OUT,    0 },
+};
+
 /* attn_paged, the parameter and operand lists copied verbatim from libr4d's pAttnPaged /
  * oAttnPaged (r4d_rows.cpp) so co-load schema_same() passes. block_size is RAD_DERIVED --
  * read off the cache tensor, its constraint admits any value -- and the trailing
@@ -343,6 +357,10 @@ static const RadOpSchema kSchemas[] = {
       "Y[M,N] = A[M,K] @ B[N,K]^T. B is stored transposed (the layout transformer weights "
       "already have), so both operands are k-contiguous and the inner loop is a dot product "
       "over k." },
+    { "logits_gemm", pLogits, (int)(sizeof(pLogits)/sizeof(pLogits[0])),
+      oLogits, (int)(sizeof(oLogits)/sizeof(oLogits[0])),
+      "the lm_head projection. gemm_nt's arithmetic under the vocabulary edge's parameter "
+      "spelling; M is one row per SAMPLED position, `gather_rows` having run first." },
     { "attn_paged", pAttnPaged, (int)(sizeof(pAttnPaged)/sizeof(pAttnPaged[0])),
       oAttnPaged, (int)(sizeof(oAttnPaged)/sizeof(oAttnPaged[0])),
       "Paged attention over kv_cache[num_blocks, kv_heads, block_size, 2*head_dim] (K then "
@@ -434,6 +452,12 @@ static const RadConstraint cBf16Row[] = {
     { "dtype", RAD_C_IN, 0, "bf16" },
 };
 
+/* logits_gemm bf16: verbatim libr4d cLogitsGemm = { C_DIV("n_embd", 8), C_IN("dtype", "bf16") }. */
+static const RadConstraint cLogitsGemm[] = {
+    { "n_embd", RAD_C_DIV, 8,    nullptr },
+    { "dtype",  RAD_C_IN,  0,    "bf16" },
+};
+
 /* kv_store constraints, the positional form of libr4d's cKvStore = { C_GE("block_size", 1),
  * C_IN("kv_dtype", "bf16") }. */
 static const RadConstraint cKvStore[] = {
@@ -502,6 +526,7 @@ extern "C" int r3d_rad_act_mul(const RadArgs*, RadStream);
 extern "C" int r3d_rad_cast(const RadArgs*, RadStream);
 extern "C" int r3d_rad_rope(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt(const RadArgs*, RadStream);
+extern "C" int r3d_rad_logits_gemm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_attn_paged(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_temp(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_mask(const RadArgs*, RadStream);
@@ -597,6 +622,15 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cBf16Row, 1, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gemm_nt },
+
+{ "logits_gemm_bf16", "logits_gemm", "vocab",
+  "the lm_head projection: same tile as gemm_nt_bf16, the vocabulary edge's parameter "
+  "spelling; logits go out F32",
+  "any M and any vocabulary; n_embd a multiple of 8",
+  "bf16 x and lm_head, F32 LOGITS OUT, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cLogitsGemm, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_logits_gemm },
 
 { "attn_paged_bf16", "attn_paged", "attn",
   "paged causal / sliding-window attention, one workgroup per (query row, head), any "
