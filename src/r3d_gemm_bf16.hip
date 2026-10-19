@@ -29,6 +29,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstdlib>
+
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r3d_gemm.h"
@@ -250,11 +252,14 @@ static int gemm_nt_launch(const RadArgs* a, RadStream s, const char* n_name, con
     /* Prefill band: every M > 1 goes to the WMMA tile (gfx1100 native
      * v_wmma_f32_16x16x16_bf16, ragged edges staged to zero through LDS there). The
      * scalar tile below is the fallback for a failed m64 launch -- hipGetLastError
-     * there means "never enqueued", so falling through cannot double-write Y. */
-    int rc = r3d_gemm_nt_m64_launch(A->data, B->data, Y->data,
-                                    Y->dtype == RAD_F32 ? (float*)Y->data : nullptr,
-                                    (int)M, (int)N, (int)K, a_pitch, b_pitch, y_pitch,
-                                    stream);
+     * there means "never enqueued", so falling through cannot double-write Y.
+     * R3D_NO_WMMA=1 opts out to the scalar tile for A/B measurement against serve. */
+    static const bool no_wmma = getenv("R3D_NO_WMMA") != nullptr;
+    int rc = no_wmma ? RAD_E_DEVICE
+                     : r3d_gemm_nt_m64_launch(A->data, B->data, Y->data,
+                                              Y->dtype == RAD_F32 ? (float*)Y->data : nullptr,
+                                              (int)M, (int)N, (int)K, a_pitch, b_pitch, y_pitch,
+                                              stream);
     if (rc == RAD_OK) return RAD_OK;
 
     dim3 grid((unsigned)((N + kBN - 1) / kBN), (unsigned)((M + kBM - 1) / kBM));
