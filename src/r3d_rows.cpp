@@ -142,6 +142,21 @@ static const RadOperandSpec oRope[] = {
     { "positions", RAD_OPD_IN,    0 },
 };
 
+/* gemm_nt: verbatim libr4d (r4d_rows.cpp pGemmNt/oGemmNt). The quantised variants
+ * (gemm_nt_q, _bias, gated) have no rows here: RDNA3 has no fp8 hardware and the int
+ * grids are later tiers. */
+static const RadParamSpec pGemmNt[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "N",     RAD_P_INT, RAD_REQUIRED },
+    { "K",     RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oGemmNt[] = {
+    { "a", RAD_OPD_IN,     0 },
+    { "b", RAD_OPD_WEIGHT, 0 },
+    { "y", RAD_OPD_OUT,    0 },
+};
+
 static const RadOpSchema kSchemas[] = {
     { "rmsnorm", pRmsNorm, (int)(sizeof(pRmsNorm)/sizeof(pRmsNorm[0])),
       oRmsNorm,  (int)(sizeof(oRmsNorm)/sizeof(oRmsNorm[0])),
@@ -166,11 +181,16 @@ static const RadOpSchema kSchemas[] = {
       "y = x, converted. `from` and `to` are for the selector; the bytes are described by the "
       "tensors' own dtypes and those are what the kernel reads." },
     { "rope", pRope, (int)(sizeof(pRope)/sizeof(pRope[0])),
-      oRope, (int)(sizeof(oRope)/sizeof(oRope[0])),
+      oRope,  (int)(sizeof(oRope)/sizeof(oRope[0])),
       "rotary embedding in place over the Q and K heads of a fused projection; the V heads "
       "that follow are untouched. The multi-component modes (`mrope`, `imrope`, `axial`) "
       "take [C, M] component-major positions and `sections`; with [M] positions every "
       "component is that one, so mrope and imrope over a text batch are neox exactly." },
+    { "gemm_nt", pGemmNt, (int)(sizeof(pGemmNt)/sizeof(pGemmNt[0])),
+      oGemmNt, (int)(sizeof(oGemmNt)/sizeof(oGemmNt[0])),
+      "Y[M,N] = A[M,K] @ B[N,K]^T. B is stored transposed (the layout transformer weights "
+      "already have), so both operands are k-contiguous and the inner loop is a dot product "
+      "over k." },
 };
 
 /* The rmsnorm row. Field order is RadKernelInfo's positional form (rad_abi.h): after the prose,
@@ -225,6 +245,7 @@ extern "C" int r3d_rad_kv_store(const RadArgs*, RadStream);
 extern "C" int r3d_rad_act_mul(const RadArgs*, RadStream);
 extern "C" int r3d_rad_cast(const RadArgs*, RadStream);
 extern "C" int r3d_rad_rope(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gemm_nt(const RadArgs*, RadStream);
 
 static const RadKernelInfo kRows[] = {
 
@@ -294,6 +315,15 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cRopeRow, 2, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_rope },
+
+{ "gemm_nt_bf16", "gemm_nt", "gemm",
+  "dense bf16 GEMM, 64x64 output tile per workgroup, K in 16-wide LDS slices",
+  "any M, N and K (to 2^27); ragged tiles load as zero and are never stored; operand row "
+  "pitches follow the trailing-dimension fold, so a rank-3 qkv output is writable",
+  "bf16 A and B, bf16 or f32 Y, f32 accumulation",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cBf16Row, 1, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gemm_nt },
 
 };
 
