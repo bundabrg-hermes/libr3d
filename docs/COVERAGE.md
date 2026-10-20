@@ -1019,3 +1019,56 @@ Lessons, permanent:
 
 GDN holes left for the 27B trunk: `gdn_chunk_scan`, `gdn_recurrent_update` (three encoded
 planes, needs the layout hook), plus the two unrecorded ops.
+
+## gdn_chunk_scan_bf16 -- the fourth GDN row, the serial scan with the state in registers (2026-10-20)
+
+The chunked delta-rule scan `W = beta(V - e^g K S^T)`, `V' = A W`, `O = scale e^g Q S^T + sA V'`,
+`S = e^{g_last} S + V'^T K'`. Geometry pinned by `kf_probe_ops` before code: head_k=head_v=128,
+chunk 64 recorded (again) only via A's shape `[M,48,64]`; q/k bf16 `[T,16,128]`, v/o bf16
+`[T,48,128]`, g/beta f32 `[T,48]`, h0/ht f32 `[1,48,128,128]`, cu i32, state_idx i32; 10 digests
+M=1..512 in BOTH packs. This is the first r3d GDN row whose `scale` parameter is live: every
+recorded case carries 0.0883883 = 1/sqrt(head_k), read as ref does (f64 param, f32 use).
+
+Design calls worth keeping:
+
+* **The chunk recurrence is serial by nature** -- W reads the state the previous chunk left --
+  so unlike kkt_solve there is NO free chunk grid axis. The block is ref's own `REF_PAR_FOR`
+  unit: one per (sequence, v head).
+* **The transposed f32 state lives in registers**: one thread owns one value column e of
+  St[d][e], a 128-float `#pragma unroll`ed array (launch_bounds(128,1) opens the full
+  256-VGPR budget). Whole-column ownership is also what keeps bit-exactness cheap: every
+  ascending-d chain stays a scalar walk of ref's order; splitting columns across lanes would
+  hand chains between lanes just to stay serial.
+* `V' = A W` runs **descending i in place** over the W buffer: row i consumes only j <= i, so
+  each write lands after its slot's last read. One LDS buffer, not two.
+* The sA row and staged g/beta are LDS broadcasts with **barriers outside every predicate**
+  (threads owning no column still march through them), and the sA loop carries TWO barriers
+  per row: row-ready-before-reads and reads-done-before-the-next-row-overwrites.
+* **A negative `state_idx` slot skips the whole (n, h) row -- the o writes included**, exactly
+  ref's `continue`; the row pitch may be wider than one slot (`stride[0]`, column 0 is the
+  slot); h0/ht strides are READ off the tensor at rank >= 4 (ref's page-padding comment).
+* Launcher derived T from `q->shape[rank-3]` from day one -- the kkt lesson applied before
+  the card could re-teach it, and this row's FIRST card run was green, launcher included.
+
+Gates (all on the real packs, serve and co-tenant serve untouched throughout):
+
+| sweep | result |
+|---|---|
+| nodraft 27B pack, `--op gdn_chunk_scan` | **80/80**, worst 0.000e+00; all 10 digests attributed `gdn_chunk_scan_bf16 \| libr3d \| device`; 0 OOB |
+| stock kernels.rkb, all libraries | **1897/1897** (was 1887 -- the stock pack carries its 10 chunk_scan digests too, now device-side AND bit-exact), worst rel_l2 unchanged at 3.135e-03, libr3d 41 rows |
+| full mxfp4 pack (drafter + vision) | **4633/4633** (was 4593, +40 from the chunk_scan rows), worst 2.859e-03 unchanged, 1255 guarded-allocation cases 0 OOB |
+
+The graph ratchet for the nodraft 27B skeleton moves 29 -> **30 of 31**: the last device hole
+is `gdn_recurrent_update` (the decode path, with the three encoded weight planes -- the
+layout-hook row).
+
+Lessons, permanent:
+
+* **`tools/gate.sh` now IS the gate** (`op <name>`, `stock`, `full` on rdna3-dev): the exact kbench
+  command lines, the two staged homes (attribution = oracle+libr3d only; regression adds
+  libavx), persistent ref caches under /scratch. No more reconstructing gate lines from
+  report headers.
+
+GDN holes left for the 27B trunk: `gdn_recurrent_update` (the last graph hole), plus the two
+unrecorded ops (`gdn_conv_recurrent_update` and the conv-prep sibling) and the two fixtures
+declined by the ssm-dt dtype quirk.
