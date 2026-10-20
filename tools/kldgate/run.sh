@@ -20,14 +20,20 @@ mkdir -p "$OUT"
 
 stop_serve() {
   docker rm -f "$NAME" >/dev/null 2>&1 || true
-  # a GPU container's removal can lag its kill (device teardown) — measured
-  # over 60 s once. Wait until the name is actually free or the next docker
-  # run conflicts with a confusing daemon error.
-  for i in $(seq 1 120); do
+  # a GPU container's removal can lag its kill by MINUTES (driver queue
+  # teardown after SIGKILL; measured >120 s once, container sits Exited 137
+  # while the name is held). Wait long, say something, then fail loudly —
+  # the alternative is a confusing docker run Conflict.
+  for i in $(seq 1 300); do
     docker inspect "$NAME" >/dev/null 2>&1 || return 0
+    if [ "$i" = "60" ]; then
+      # an Exited container often releases on a second plain rm immediately
+      docker rm -f "$NAME" >/dev/null 2>&1 || true
+    fi
+    [ $((i % 30)) -eq 0 ] && echo "waiting for $NAME teardown (${i}s) ..." >&2
     sleep 1
   done
-  echo "FATAL: $NAME still present 120 s after rm -f; refusing to run" >&2
+  echo "FATAL: $NAME still present 300 s after rm -f; refusing to run" >&2
   return 1
 }
 
