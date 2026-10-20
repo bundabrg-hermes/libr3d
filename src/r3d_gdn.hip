@@ -38,6 +38,14 @@
  * means no chunk grid axis, so one block per (sequence, v head) carries the transposed f32
  * state in one-column-per-thread register arrays and walks every ref chain (ascending d and j,
  * literal bracketings) unrolled; bit-exact by construction the same way, see the section.
+ *
+ * gdn_conv_prep (sixth member) and gdn_conv_recurrent_update (seventh, the pair fusion): the
+ * last two members of the family, and the unlock for the 27B serve -- their host-only
+ * resolution pinned every block's whole weight group to the mapped tier, where the widened
+ * f32 norms are illegal (COVERAGE "27B serve placement chain"). Like the recurrent row, the
+ * phantom "needs a three-plane layout hook" note dissolved at first probe: every weight the
+ * two ops read (conv w/b, A_log, dt_bias, norm_w) is plain single-plane in this container,
+ * read AS STORED -- libr4d's own conv rows declare no hook either. See the section comments.
  */
 #include <cstring>
 
@@ -471,11 +479,15 @@ __global__ __launch_bounds__(kConvThreads) void gdn_conv_update_kernel(
 
     /* Window rewrite, in place: the shifted tail, then this step's tokens at
      * t + width - 2. ref re-reads x for the commit (same value); we mirror it rather
-     * than cache slen tokens in registers -- the read comes back from L1/L2. */
-    for (int64_t i = threadIdx.x; i + 1 < width - 1; i += kConvThreads)
-        stt2(csrow, dtCS, i, s_hist[i + 1]);
-    for (int64_t t = threadIdx.x; t < slen; t += kConvThreads)
-        stt2(csrow, dtCS, t + width - 2, ldt2(x + (bos + t) * x_pb, dtX, c));
+     * than cache slen tokens in registers -- the read comes back from L1/L2. width == 1
+     * has no state at all: the second loop would index -1, so the whole rewrite is gated
+     * on a non-empty window. */
+    if (width > 1) {
+        for (int64_t i = threadIdx.x; i + 1 < width - 1; i += kConvThreads)
+            stt2(csrow, dtCS, i, s_hist[i + 1]);
+        for (int64_t t = threadIdx.x; t < slen; t += kConvThreads)
+            stt2(csrow, dtCS, t + width - 2, ldt2(x + (bos + t) * x_pb, dtX, c));
+    }
 }
 
 /* ------------------------------------------------------------------ gdn_recurrent_update
@@ -653,6 +665,373 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_recurrent_update_kernel(
             }
         }
         __syncthreads();                                       /* next token rewrites s_q/s_orow */
+    }
+}
+
+/* ------------------------------------------------------------------ gdn_conv_prep
+ * The prefill-side counterpart of conv_update (ref_gdn.cpp): the same depthwise conv with
+ * silu writing q/k/v over the sequence window (the conv state read as RAW history, and
+ * rewritten from the sequence's last width-1 tokens once the conv has consumed it), the q/k
+ * per-head l2 norms, and the gate cumsum with beta. Ref's four phases are three launches
+ * here: the state commit folds into the conv kernel (each block stages its channel's history
+ * in LDS before any write lands), and the norm and the gate get their own grids.
+ *
+ * Every chain walks ref's order: the conv is the width-tap f32 chain conv_update proved
+ * bit-exact against the same window reads; the l2 sum walks the staged conv output -- which
+ * made the round trip through the output dtype, exactly what ref's re-read of the stored
+ * bf16 sees -- serially in ascending d at thread 0, tree sums would reassociate it; and the
+ * cumsum resets at every chunk boundary, so one (head, sequence, chunk) block walks ref's
+ * serial chain over at most chunk tokens while the chunk itself is a free grid axis.
+ * exp/softplus/sigmoid are the band's double-rounded r3d_* helpers.
+ */
+constexpr uint32_t kPrepThreads = 64;         /* conv grid: threads per channel */
+constexpr uint32_t kPrepNormThreads = 256;    /* l2 grid: threads over one head row */
+
+__global__ __launch_bounds__(kPrepThreads) void gdn_conv_prep_conv_kernel(
+    const uint8_t* __restrict__ x, uint32_t dtX, int64_t x_pb,
+    const uint8_t* __restrict__ w, uint32_t dtW, int64_t w_pb,
+    const uint8_t* __restrict__ b, uint32_t dtB,
+    uint8_t* __restrict__ cs, uint32_t dtCS, int64_t cs_s0b, int64_t cs_s1b,
+    const void* __restrict__ sidx, uint32_t dtS,
+    const void* __restrict__ hini, uint32_t dtI,
+    const void* __restrict__ cu, uint32_t dtC,
+    uint8_t* __restrict__ q, uint32_t dtQ, int64_t q_s0b, int64_t q_s1b,
+    uint8_t* __restrict__ k, uint32_t dtK, int64_t k_s0b, int64_t k_s1b,
+    uint8_t* __restrict__ v, uint32_t dtV, int64_t v_s0b, int64_t v_s1b,
+    int64_t HgK, int64_t Kd, int64_t K2, int64_t Vd,
+    int32_t width, int64_t cs_slots)
+{
+    const int64_t c = blockIdx.x, n = blockIdx.y;
+    const int64_t bos  = ldi_g(dtC, cu, n);
+    const int64_t slen = ldi_g(dtC, cu, n + 1) - bos;
+    if (slen <= 0) return;
+    const int64_t slot = sidx ? ldi_g(dtS, sidx, n) : n;
+    const bool warm = !hini || ldi_g(dtI, hini, n) != 0;
+    const bool cs_on = cs && slot >= 0 && slot < cs_slots;
+    uint8_t* __restrict__ csrow = cs_on ? cs + slot * cs_s0b + c * cs_s1b : nullptr;
+
+    __shared__ float s_hist[kConvHistMax];
+    __shared__ float s_w[kConvHistMax];
+    __shared__ float s_b;
+    for (int32_t j = (int32_t)threadIdx.x; j < width - 1; j += (int32_t)kPrepThreads)
+        s_hist[j] = csrow ? ldt2(csrow, dtCS, j) : 0.0f;      /* raw history, not the rolled window */
+    for (int32_t j = (int32_t)threadIdx.x; j < width; j += (int32_t)kPrepThreads)
+        s_w[j] = ldt2(w + c * w_pb, dtW, j);
+    if (threadIdx.x == 0) s_b = b ? ldt2(b, dtB, c) : 0.0f;
+    __syncthreads();
+
+    const int32_t w1 = width - 1;
+    uint8_t* ob; uint32_t dtO; int64_t s0b, s1b;
+    if (c < HgK)       { ob = q; dtO = dtQ; s0b = q_s0b; s1b = q_s1b; }
+    else if (c < K2)   { ob = k; dtO = dtK; s0b = k_s0b; s1b = k_s1b; }
+    else               { ob = v; dtO = dtV; s0b = v_s0b; s1b = v_s1b; }
+    const int64_t h = (c < HgK) ? c / Kd : (c < K2) ? (c - HgK) / Kd : (c - K2) / Vd;
+    const int64_t d = (c < K2) ? c % Kd : (c - K2) % Vd;
+    uint8_t* __restrict__ orow = ob + h * s1b;
+
+    for (int64_t t = threadIdx.x; t < slen; t += kPrepThreads) {
+        float acc = s_b;
+        for (int32_t j = 0; j < width; ++j) {
+            const int32_t src = (int32_t)t - w1 + j;
+            const float xv = src >= 0 ? ldt2(x + (bos + src) * x_pb, dtX, c) : s_hist[src + w1];
+            acc += xv * s_w[j];
+        }
+        stt2(orow + (bos + t) * s0b, dtO, d, acc * r3d_sigmoid(acc));
+    }
+
+    /* Ref's phase 4: the state holds the sequence's last width-1 tokens; a shorter sequence
+     * keeps the old state's head (zeros when cold). The keeps stage through s_hist (dead
+     * after the conv) before ANY write, because a shift's reads and writes overlap the row. */
+    if (csrow && width > 1) {
+        for (int32_t i = (int32_t)threadIdx.x; i < width - 1; i += (int32_t)kPrepThreads) {
+            const int64_t src = slen - w1 + i;
+            s_hist[i] = src >= 0 ? ldt2(x + (bos + src) * x_pb, dtX, c)
+                                 : (warm ? ldt2(csrow, dtCS, src + w1) : 0.0f);
+        }
+        __syncthreads();
+        for (int32_t i = (int32_t)threadIdx.x; i < width - 1; i += (int32_t)kPrepThreads)
+            stt2(csrow, dtCS, i, s_hist[i]);
+    }
+}
+
+__global__ __launch_bounds__(kPrepNormThreads) void gdn_conv_prep_norm_kernel(
+    uint8_t* __restrict__ q, uint32_t dtQ, int64_t q_s0b, int64_t q_s1b,
+    uint8_t* __restrict__ k, uint32_t dtK, int64_t k_s0b, int64_t k_s1b,
+    int64_t Kd, float l2eps)
+{
+    extern __shared__ float s_row[];                          /* one head row: Kd floats */
+    const int64_t t = blockIdx.x, h = blockIdx.y;
+    const bool is_k = blockIdx.z != 0;
+    uint8_t* __restrict__ row = is_k ? k + t * k_s0b + h * k_s1b
+                                     : q + t * q_s0b + h * q_s1b;
+    const uint32_t dt = is_k ? dtK : dtQ;
+    for (int64_t i = threadIdx.x; i < Kd; i += blockDim.x) s_row[i] = ldt2(row, dt, i);
+    __syncthreads();
+    __shared__ float s_inv;
+    if (threadIdx.x == 0) {                                   /* ref's serial d chain */
+        float ss = 0.0f;
+        for (int64_t d = 0; d < Kd; ++d) ss += s_row[d] * s_row[d];
+        s_inv = 1.0f / sqrtf(ss + l2eps);
+    }
+    __syncthreads();
+    for (int64_t i = threadIdx.x; i < Kd; i += blockDim.x)
+        stt2(row, dt, i, s_row[i] * s_inv);                   /* one store rounding, as ref's stt */
+}
+
+__global__ __launch_bounds__(32) void gdn_conv_prep_gate_kernel(
+    const uint8_t* __restrict__ x, uint32_t dtX, int64_t x_pb,
+    const uint8_t* __restrict__ ta, uint32_t dtA, int64_t a_s0b,
+    const uint8_t* __restrict__ tb, uint32_t dtBt, int64_t b_s0b,
+    const uint8_t* __restrict__ alog_t, uint32_t dtAL,
+    const uint8_t* __restrict__ dtb_t, uint32_t dtDB,
+    uint8_t* __restrict__ g, uint32_t dtG, int64_t g_s0b,
+    uint8_t* __restrict__ bt, uint32_t dtBt2, int64_t bt_s0b,
+    const void* __restrict__ cu, uint32_t dtC,
+    int64_t conv_dim, int64_t H, int32_t chunk, float spthr)
+{
+    const int64_t h = blockIdx.x, n = blockIdx.y;
+    const int64_t c0 = (int64_t)blockIdx.z * chunk;
+    const int64_t bos  = ldi_g(dtC, cu, n);
+    const int64_t slen = ldi_g(dtC, cu, n + 1) - bos;
+    if (slen <= 0 || c0 >= slen) return;
+    if (threadIdx.x) return;                    /* the cumsum is serial; warp idle, no barriers */
+    const float alog = alog_t ? ldt2(alog_t, dtAL, h) : 0.0f;
+    const float dtb  = dtb_t  ? ldt2(dtb_t, dtDB, h) : 0.0f;
+    const float neg_exp = -r3d_exp_f(alog);     /* ref's -ref_exp(alog), the negation after rounding */
+    const int64_t tend = (slen - c0 < chunk) ? slen : c0 + chunk;
+    float run = 0.0f;                           /* every chunk starts cold: ref's t % chunk == 0 reset */
+    for (int64_t t = c0; t < tend; ++t) {
+        const float av_ = ta ? ldt2(ta + (bos + t) * a_s0b, dtA, h)
+                             : ldt2(x + (bos + t) * x_pb, dtX, conv_dim + h);
+        const float bvl = tb ? ldt2(tb + (bos + t) * b_s0b, dtBt, h)
+                             : ldt2(x + (bos + t) * x_pb, dtX, conv_dim + H + h);
+        run += neg_exp * r3d_softplus(av_ + dtb, spthr);
+        stt2(g  + (bos + t) * g_s0b,  dtG,   h, run);
+        stt2(bt + (bos + t) * bt_s0b, dtBt2, h, r3d_sigmoid(bvl));
+    }
+}
+
+/* ------------------------------------------------------------------ gdn_conv_recurrent_update
+ * The decode-band pair fusion (ref_gdn.cpp: conv_update into a staging buffer, then
+ * recurrent_update over it) in ONE launch, libr4d's shape: the per-(sequence, v head) block
+ * convolves its group's q/k heads and its own v head into LDS -- rounded through x's dtype
+ * by stt2/ldt2, so the staging round trip the two-op path pays through global memory happens
+ * identically here -- commits the conv window, then walks the shipped recurrent chain with
+ * the staged rows in place of the staging tensors. Bit-exact against ref's fused op by the
+ * same construction as the two rows it replaces, because it IS the two rows' code paths,
+ * fused.
+ *
+ * The conv commit lands BEFORE the state_idx skip check, in ref's order: the pair writes the
+ * conv state even when the recurrent leg then skips the row. Group-sibling blocks re-commit
+ * the same q/k channels with byte-identical values -- a benign identical-value race that
+ * libr4d solves with an arrival counter; here the redundancy costs one small store loop.
+ * CONV_WIDTH up to 4 (the window lives in registers; the 27B band is width 4 -- ref's CONV_
+ * HIST_MAX is 16 and the conv_update row still carries it). The conv guard failures that
+ * conv_update skips per sequence skip the fused row whole, commit included: ref's composite
+ * would fail the OP at that point (it propagates conv_update's error), and the library's
+ * documented per-sequence skip stands for the fused form too -- no recorded case has one.
+ */
+constexpr uint32_t kFusWidthMax = 4;
+
+__global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kernel(
+    const uint8_t* __restrict__ x, uint32_t dtX, int64_t x_pb,
+    const uint8_t* __restrict__ w, uint32_t dtW, int64_t w_pb,
+    const uint8_t* __restrict__ cb, uint32_t dtCB,
+    uint8_t* __restrict__ cs, uint32_t dtCS, int64_t cs_s0b, int64_t cs_s1b,
+    int64_t cs_slots, int64_t state_len,
+    const void* __restrict__ cidx, uint32_t dtCI,
+    const uint8_t* __restrict__ av, uint32_t dtA, int64_t a_s0b,
+    const uint8_t* __restrict__ bv, uint32_t dtB, int64_t b_s0b,
+    const uint8_t* __restrict__ alog_t, uint32_t dtAL, int64_t al_s1b,
+    const uint8_t* __restrict__ dtb_t,  uint32_t dtDB, int64_t db_s1b,
+    uint8_t* __restrict__ st8, uint32_t dtST, int64_t st_s0b, int64_t st_s1b, int64_t st_s2b,
+    const void* __restrict__ sidx, uint32_t dtS, int64_t si_s0b, int64_t si_s1b, int64_t sw,
+    const void* __restrict__ nacc, uint32_t dtN,
+    const void* __restrict__ cu, uint32_t dtC,
+    const uint8_t* __restrict__ z, uint32_t dtZ, int64_t z_s0b, int64_t z_s1b,
+    const uint8_t* __restrict__ nw, uint32_t dtNW, int64_t w_s1b,
+    uint8_t* __restrict__ o,        uint32_t dtO, int64_t o_s0b, int64_t o_s1b,
+    int64_t HgK, int64_t K2, int64_t V, int64_t grp, int32_t width,
+    float scale, float l2eps, float neps, float spthr, int sigm) {
+    const int64_t h = blockIdx.x, n = blockIdx.y, e = threadIdx.x;
+    const int64_t bos  = ldi_g(dtC, cu, n);
+    const int64_t slen = ldi_g(dtC, cu, n + 1) - bos;
+    if (slen <= 0) return;
+    const int64_t na = nacc ? ldi_g(dtN, nacc, n) : 1;
+    const int64_t rd = na > 0 ? na - 1 : 0;
+    const int64_t cslot = ldi_g(dtCI, cidx, n);
+    if (cslot < 0 || cslot >= cs_slots) return;               /* conv_update's skip, fused */
+    if (rd < 0 || rd + width - 1 > state_len) return;
+    if (width > 1 && width - 2 + slen > state_len) return;
+
+    const int64_t hk = h / grp;
+    const int64_t cq = hk * kRecK + e, ck = HgK + cq;         /* e < head_k == 128 always */
+    const bool own_v = e < V;
+    const int64_t cv = 2 * HgK + h * V + e;
+    uint8_t* __restrict__ csq = cs + cslot * cs_s0b + cq * cs_s1b;
+    uint8_t* __restrict__ csk = cs + cslot * cs_s0b + ck * cs_s1b;
+    uint8_t* __restrict__ csv = own_v ? cs + cslot * cs_s0b + cv * cs_s1b : nullptr;
+
+    const uint32_t eb = (dtX == RAD_F32) ? 4u : 2u;
+    extern __shared__ uint8_t s_stg[];   /* slen*(2*head_k + V) elements of x's dtype */
+    uint8_t* __restrict__ stq = s_stg;
+    uint8_t* __restrict__ stk = stq + slen * kRecK * eb;
+    uint8_t* __restrict__ stv = stk + slen * kRecK * eb;
+
+    float hq[kFusWidthMax], hkk[kFusWidthMax], hv[kFusWidthMax];
+    float wq[kFusWidthMax], wk[kFusWidthMax], wvv[kFusWidthMax];
+    const float bq = cb ? ldt2(cb, dtCB, cq) : 0.0f;
+    const float bk = cb ? ldt2(cb, dtCB, ck) : 0.0f;
+    const float bvv = cb ? ldt2(cb, dtCB, cv) : 0.0f;
+    for (int32_t j = 0; j < width - 1; ++j) {
+        hq[j] = ldt2(csq, dtCS, rd + j);
+        hkk[j] = ldt2(csk, dtCS, rd + j);
+        if (own_v) hv[j] = ldt2(csv, dtCS, rd + j);
+    }
+    for (int32_t j = 0; j < width; ++j) {
+        wq[j] = ldt2(w + cq * w_pb, dtW, j);
+        wk[j] = ldt2(w + ck * w_pb, dtW, j);
+        if (own_v) wvv[j] = ldt2(w + cv * w_pb, dtW, j);
+    }
+    __syncthreads();                       /* every history read before any window commit */
+
+    const int32_t w1 = width - 1;
+    for (int64_t t = 0; t < slen; ++t) {    /* the conv chain, ascending j, ref's bracketing */
+        float acc = bq, acck = bk, accv = bvv;
+        for (int32_t j = 0; j < width; ++j) {
+            const int32_t src = (int32_t)t - w1 + j;
+            if (src >= 0) {
+                const uint8_t* __restrict__ xr = x + (bos + src) * x_pb;
+                acc  += ldt2(xr, dtX, cq) * wq[j];
+                acck += ldt2(xr, dtX, ck) * wk[j];
+                if (own_v) accv += ldt2(xr, dtX, cv) * wvv[j];
+            } else {
+                acc  += hq[src + w1] * wq[j];
+                acck += hkk[src + w1] * wk[j];
+                if (own_v) accv += hv[src + w1] * wvv[j];
+            }
+        }
+        stt2(stq + t * kRecK * eb, dtX, e, acc * r3d_sigmoid(acc));    /* staging as x's dtype */
+        stt2(stk + t * kRecK * eb, dtX, e, acck * r3d_sigmoid(acck));
+        if (own_v) stt2(stv + t * V * eb, dtX, e, accv * r3d_sigmoid(accv));
+    }
+
+    if (width > 1) {                       /* window commit: shifted tail, then this step */
+        for (int32_t i = 0; i < w1 - 1; ++i) {
+            stt2(csq, dtCS, i, hq[i + 1]);
+            stt2(csk, dtCS, i, hkk[i + 1]);
+            if (own_v) stt2(csv, dtCS, i, hv[i + 1]);
+        }
+        for (int64_t t = 0; t < slen; ++t) {
+            const int64_t idx = t + width - 2;
+            const uint8_t* __restrict__ xr = x + (bos + t) * x_pb;
+            stt2(csq, dtCS, idx, ldt2(xr, dtX, cq));
+            stt2(csk, dtCS, idx, ldt2(xr, dtX, ck));
+            if (own_v) stt2(csv, dtCS, idx, ldt2(xr, dtX, cv));
+        }
+    }
+
+    /* ---- the recurrent leg, verbatim the shipped kernel with the staged rows ---- */
+    const int64_t slot_in = ldi_g(dtS, (const uint8_t*)sidx + n * si_s0b +
+                            (rd < sw ? rd : sw - 1) * si_s1b, 0);
+    if (slot_in < 0) return;               /* ref's continue -- AFTER the conv commit above */
+    uint8_t* __restrict__ stb = st8 + h * st_s1b;
+    uint8_t* __restrict__ ob  = o + h * o_s1b;
+    const uint8_t* __restrict__ zb = z ? z + h * z_s1b : nullptr;
+    const bool own = e < V;
+
+    __shared__ float s_q[kRecK], s_kn[kRecK];
+    __shared__ float s_orow[kRecThreads];
+    __shared__ float s_bc[4], s_sc;
+
+    float st[kRecK];
+    if (own) {
+        const uint8_t* __restrict__ sb = stb + slot_in * st_s0b + e * st_s2b;
+        if (dtST == RAD_F32 && ((uintptr_t)sb & 15u) == 0) {
+            const float4* __restrict__ s4 = (const float4*)sb;
+            #pragma unroll
+            for (int d = 0; d < kRecK / 4; ++d) {
+                const float4 f = s4[d];
+                st[4*d] = f.x; st[4*d+1] = f.y; st[4*d+2] = f.z; st[4*d+3] = f.w;
+            }
+        } else {
+            #pragma unroll
+            for (int d = 0; d < kRecK; ++d) st[d] = ldt2(sb, dtST, d);
+        }
+    }
+
+    const float nwv = nw ? ldt2(nw + (own ? e : 0) * w_s1b, dtNW, 0) : 1.0f;
+
+    for (int64_t t = 0; t < slen; ++t) {
+        const int64_t tok = bos + t;
+        s_q[e]  = ldt2(stq + t * kRecK * eb, dtX, e);
+        s_kn[e] = ldt2(stk + t * kRecK * eb, dtX, e);
+        const float vreg = ldt2(stv + t * V * eb, dtX, own ? e : 0);
+        __syncthreads();
+        if (e == 0) {
+            float sq = 0.0f, sk = 0.0f;
+            for (int d = 0; d < kRecK; ++d) {
+                sq += s_q[d] * s_q[d];
+                sk += s_kn[d] * s_kn[d];
+            }
+            s_bc[0] = 1.0f / sqrtf(sq + l2eps) * scale;
+            s_bc[1] = 1.0f / sqrtf(sk + l2eps);
+            const float a = ldt2(av + tok * a_s0b, dtA, h);
+            s_bc[2] = -r3d_exp_f(alog_t ? ldt2(alog_t + h * al_s1b, dtAL, 0) : 0.0f)
+                      * r3d_softplus(a + (dtb_t ? ldt2(dtb_t + h * db_s1b, dtDB, 0) : 0.0f), spthr);
+            s_bc[3] = r3d_sigmoid(ldt2(bv + tok * b_s0b, dtB, h));
+        }
+        __syncthreads();
+        const float qs = s_bc[0], ks = s_bc[1], gv = s_bc[2], bt = s_bc[3];
+        s_q[e]  *= qs;
+        s_kn[e] *= ks;
+        __syncthreads();
+
+        if (own) {
+            const float dec = r3d_exp_f(gv);
+            float sk2 = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < kRecK; ++d) { st[d] *= dec; sk2 += st[d] * s_kn[d]; }
+            const float uu = bt * (vreg - sk2);
+            #pragma unroll
+            for (int d = 0; d < kRecK; ++d) st[d] += uu * s_kn[d];
+
+            float orow = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < kRecK; ++d) orow += st[d] * s_q[d];
+
+            s_orow[e] = orow * orow;
+            float sq2 = 0.0f;
+            __syncthreads();
+            if (e == 0) { sq2 = s_orow[0]; for (int64_t i = 1; i < V; ++i) sq2 += s_orow[i];
+                          s_sc = 1.0f / sqrtf(sq2 / (float)V + neps); }
+            __syncthreads();
+            float r = orow * s_sc;
+            r *= nwv;
+            if (z) {
+                const float zz = ldt2(zb + tok * z_s0b, dtZ, e);
+                r *= sigm ? r3d_sigmoid(zz) : zz * r3d_sigmoid(zz);
+            }
+            stt2(ob + tok * o_s0b, dtO, e, r);
+        } else {
+            __syncthreads(); __syncthreads();
+        }
+
+        const int64_t so = ldi_g(dtS, (const uint8_t*)sidx + n * si_s0b +
+                             (t < sw ? t : sw - 1) * si_s1b, 0);
+        if (own && so >= 0) {
+            uint8_t* __restrict__ srow = stb + so * st_s0b + e * st_s2b;
+            if (dtST == RAD_F32 && ((uintptr_t)srow & 15u) == 0) {
+                float4* __restrict__ s4 = (float4*)srow;
+                #pragma unroll
+                for (int d = 0; d < kRecK / 4; ++d)
+                    s4[d] = make_float4(st[4*d], st[4*d+1], st[4*d+2], st[4*d+3]);
+            } else {
+                #pragma unroll
+                for (int d = 0; d < kRecK; ++d) stt2(srow, dtST, d, st[d]);
+            }
+        }
+        __syncthreads();
     }
 }
 
@@ -1188,5 +1567,350 @@ extern "C" int r3d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
         nw_on ? rad_dtype_bytes(nw->dtype, w_s1) : 0,
         (uint8_t*)o->data, o->dtype, rad_dtype_bytes(o->dtype, o_s0), rad_dtype_bytes(o->dtype, o_s1),
         Vd, Hv / Hg, (float)scale_d, (float)l2_d, (float)eps_d, (float)thr_d, sigm);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* gdn_conv_prep: verbatim libref operand list (x, w, b?, A_log?, dt_bias?, conv_state INOUT,
+ * cu, a?, b_gate?, cache_idx?, has_init?, q, k, v, g, beta). Derivations are ref's (Hg =
+ * numel(q)/(T*head_k), H = numel(v)/(T*head_v), conv_dim = 2*Hg*K + H*V). T is the row count x
+ * carries: ref reads cu's last entry, device data a launcher cannot see -- the conv_update
+ * precedent, same number for every valid call. chunk drives the gate cumsum reset and the
+ * chunked grid; the row refuses anything but the pack's 64. Absent a/b_gate, ref slices the
+ * last 2*H columns of the fused x row. Every weight is read AS STORED through dtype-driven
+ * ldt2 reads -- plain single-plane in this container, no layout hook, same discovery that
+ * unblocked the recurrent row. The three launches (conv+commit, l2 norms, gate) preserve ref's
+ * phase order: norm reads what the conv stored, exactly as ref's re-read does. */
+extern "C" int r3d_rad_gdn_conv_prep(const RadArgs* a, RadStream s) {
+    const RadTensor* x    = rad_arg_in(a, 0);
+    const RadTensor* w    = rad_arg_in(a, 1);
+    const RadTensor* b    = rad_arg_in(a, 2);        /* optional */
+    const RadTensor* alog = rad_arg_in(a, 3);        /* optional data */
+    const RadTensor* dtb  = rad_arg_in(a, 4);        /* optional data */
+    const RadTensor* cs   = rad_arg_in(a, 5);        /* INOUT; null data = cold, no commit */
+    const RadTensor* cu   = rad_arg_in(a, 6);
+    const RadTensor* ta   = rad_arg_in(a, 7);        /* optional, all-or-nothing with tb */
+    const RadTensor* tb   = rad_arg_in(a, 8);
+    const RadTensor* sidx = rad_arg_in(a, 9);        /* optional: cache_idx */
+    const RadTensor* hini = rad_arg_in(a, 10);       /* optional: has_init */
+    const RadTensor* q    = rad_arg_in(a, 11);
+    const RadTensor* k    = rad_arg_in(a, 12);
+    const RadTensor* v    = rad_arg_in(a, 13);
+    const RadTensor* g    = rad_arg_in(a, 14);
+    const RadTensor* bt   = rad_arg_in(a, 15);
+    if (!x || !w || !cu || !q || !k || !v || !g || !bt) return RAD_E_INVAL;
+    if ((ta && !tb) || (!ta && tb)) return RAD_E_INVAL;         /* ref's own refusal */
+
+    const auto dt2_ok = [](uint32_t d) { return d == RAD_F32 || d == RAD_BF16; };
+    const bool b_on = b && b->data, alog_on = alog && alog->data, dtb_on = dtb && dtb->data;
+    const bool cs_on = cs && cs->data, sidx_on = sidx && sidx->data, hini_on = hini && hini->data;
+    if (!dt2_ok(x->dtype) || !dt2_ok(w->dtype) || !dt2_ok(q->dtype) || !dt2_ok(k->dtype) ||
+        !dt2_ok(v->dtype) || !dt2_ok(g->dtype) || !dt2_ok(bt->dtype) ||
+        (b_on && !dt2_ok(b->dtype)) || (alog_on && !dt2_ok(alog->dtype)) ||
+        (dtb_on && !dt2_ok(dtb->dtype)) || (cs_on && !dt2_ok(cs->dtype)) ||
+        (ta && ta->data && !dt2_ok(ta->dtype)) || (tb && tb->data && !dt2_ok(tb->dtype)))
+        return RAD_E_DTYPE;
+    if (!idx_dt_ok(cu->dtype) || !idx_dense(cu)) return RAD_E_STRIDE;
+    if (sidx_on && (!idx_dt_ok(sidx->dtype) || !idx_dense(sidx))) return RAD_E_STRIDE;
+    if (hini_on && (!idx_dt_ok(hini->dtype) || !idx_dense(hini))) return RAD_E_STRIDE;
+
+    long long K_ll = 0, V_ll = 0, W_ll = 0, ch_ll = 0;
+    if (!rad_args_geti(a, "head_k", &K_ll) || !rad_args_geti(a, "head_v", &V_ll) ||
+        !rad_args_geti(a, "conv_width", &W_ll) || !rad_args_geti(a, "chunk", &ch_ll))
+        return RAD_E_SHAPE;
+    const int64_t Kd = K_ll, Vd = V_ll, width = W_ll, chunk = ch_ll;
+    if (Kd <= 0 || Vd <= 0 || width <= 0 || chunk <= 0) return RAD_E_SHAPE;
+    if (width - 1 > kConvHistMax || chunk != 64) return RAD_E_UNSUPPORTED;
+    if (Kd > 4096) return RAD_E_UNSUPPORTED;          /* the l2 row stages one head into LDS */
+
+    const float l2eps = (float)rad_args_getf_or(a, "l2_eps", 1e-6);
+    const float spthr = (float)rad_args_getf_or(a, "softplus_thr", 20.0);
+
+    const int64_t N = rad_tensor_numel(cu) - 1;
+    if (N <= 0 || N > 0xffff) return RAD_E_SHAPE;
+    const int64_t T = x->rank >= 2 ? x->shape[x->rank - 2] : 1;   /* rank-2 x: the token axis */
+    if (T <= 0 || T > 0x100000) return RAD_E_SHAPE;
+    const int64_t Hg = rad_tensor_numel(q) / (T * Kd);
+    const int64_t H  = rad_tensor_numel(v) / (T * Vd);
+    if (Hg <= 0 || H <= 0 || H % Hg != 0) return RAD_E_SHAPE;
+    if (Hg > 0xffff || H > 0xffff) return RAD_E_SHAPE;
+    const int64_t conv_dim = 2 * Hg * Kd + H * Vd;
+    if (rad_tensor_numel(w) < conv_dim * width) return RAD_E_SHAPE;
+
+    /* x: [T, conv_dim], or ref's fused [T, conv_dim + 2H] when the gates ride along. */
+    const bool ta_on = ta && ta->data, tb_on = tb && tb->data;
+    if (ta_on != tb_on) return RAD_E_INVAL;
+    const int64_t xneed = conv_dim + (ta_on ? 0 : 2 * H);
+    const int64_t xrow = x->rank >= 2 ? x->stride[x->rank - 2] : xneed;
+    if (x->rank >= 2) {
+        if (x->stride[x->rank - 1] != 1) return RAD_E_STRIDE;
+        if (x->shape[x->rank - 1] < xneed) return RAD_E_SHAPE;
+    } else if (x->stride[0] != 1) return RAD_E_STRIDE;
+    if (rad_tensor_numel(x) < (T - 1) * xrow + xneed) return RAD_E_SHAPE;
+
+    /* w: v2(w, width); b: element c of a dense row. */
+    const int64_t w_s0 = w->rank >= 2 ? w->stride[w->rank - 2] : width;
+    if (w->rank >= 2 && w->stride[w->rank - 1] != 1) return RAD_E_STRIDE;
+    if (b_on && (b->rank == 0 || b->stride[b->rank - 1] != 1)) return RAD_E_STRIDE;
+    if (b_on && rad_tensor_numel(b) < conv_dim) return RAD_E_SHAPE;
+
+    /* gate sources: separate v2(a/b, H) rows, or the fused x columns; g/beta are v2 rows. */
+    const int64_t a_s0 = ta_on ? (ta->rank >= 2 ? ta->stride[ta->rank - 2] : H) : H;
+    if (ta_on && ta->rank >= 2 && ta->stride[ta->rank - 1] != 1) return RAD_E_STRIDE;
+    const int64_t b_s0 = tb_on ? (tb->rank >= 2 ? tb->stride[tb->rank - 2] : H) : H;
+    if (tb_on && tb->rank >= 2 && tb->stride[tb->rank - 1] != 1) return RAD_E_STRIDE;
+    if (ta_on && rad_tensor_numel(ta) < T * H) return RAD_E_SHAPE;
+    if (tb_on && rad_tensor_numel(tb) < T * H) return RAD_E_SHAPE;
+    const int64_t g_s0 = g->rank >= 2 ? g->stride[g->rank - 2] : H;
+    if (g->rank >= 2 && g->stride[g->rank - 1] != 1) return RAD_E_STRIDE;
+    const int64_t bt_s0 = bt->rank >= 2 ? bt->stride[bt->rank - 2] : H;
+    if (bt->rank >= 2 && bt->stride[bt->rank - 1] != 1) return RAD_E_STRIDE;
+    if (rad_tensor_numel(g) < T * H || rad_tensor_numel(bt) < T * H) return RAD_E_SHAPE;
+    if (alog_on && (alog->rank == 0 || alog->stride[alog->rank - 1] != 1)) return RAD_E_STRIDE;
+    if (alog_on && rad_tensor_numel(alog) < H) return RAD_E_SHAPE;
+    if (dtb_on && (dtb->rank == 0 || dtb->stride[dtb->rank - 1] != 1)) return RAD_E_STRIDE;
+    if (dtb_on && rad_tensor_numel(dtb) < H) return RAD_E_SHAPE;
+
+    /* conv state: ref's conv_state_view -- [slots, conv_dim, state_len] with the tensor's
+     * strides, or tight-flat below; the RAW history layout, so no window-depth contract. */
+    const int64_t state_len = cs_on ? (cs->rank >= 3 ? cs->shape[cs->rank - 1] : width - 1) : 0;
+    if (cs_on && state_len < width - 1) return RAD_E_SHAPE;
+    const int64_t cs_s0 = cs_on ? (cs->rank >= 3 ? cs->stride[cs->rank - 3] : conv_dim * state_len) : 0;
+    const int64_t cs_s1 = cs_on ? (cs->rank >= 3 ? cs->stride[cs->rank - 2] : state_len) : 0;
+    const int64_t cs_s2 = cs_on ? (cs->rank >= 3 ? cs->stride[cs->rank - 1] : 1) : 1;
+    if (cs_on && cs_s2 != 1) return RAD_E_STRIDE;
+    const int64_t cs_slots = cs_on
+        ? (cs->rank >= 3 ? cs->shape[cs->rank - 3] : rad_tensor_numel(cs) / (conv_dim * state_len))
+        : 0;
+    if (cs_on && cs_slots <= 0) return RAD_E_SHAPE;
+
+    /* q/k/v: ref's v3 views, tensor strides at rank >= 3, tight below, unit last stride. */
+    auto out_ok = [&](const RadTensor* t, int64_t heads, int64_t dim,
+                      int64_t* s0, int64_t* s1) -> int {
+        *s0 = t->rank >= 3 ? t->stride[t->rank - 3] : heads * dim;
+        *s1 = t->rank >= 3 ? t->stride[t->rank - 2] : dim;
+        if (t->rank >= 3 && t->stride[t->rank - 1] != 1) return RAD_E_STRIDE;
+        return rad_tensor_numel(t) < T * heads * dim ? RAD_E_SHAPE : RAD_OK;
+    };
+    int64_t q_s0, q_s1, k_s0, k_s1, v_s0, v_s1;
+    int rc = out_ok(q, Hg, Kd, &q_s0, &q_s1); if (rc) return rc;
+    rc = out_ok(k, Hg, Kd, &k_s0, &k_s1);     if (rc) return rc;
+    rc = out_ok(v, H, Vd, &v_s0, &v_s1);      if (rc) return rc;
+
+    const int32_t w32 = (int32_t)width, ch32 = (int32_t)chunk;
+    const hipStream_t hs = (hipStream_t)(uintptr_t)s;
+    gdn_conv_prep_conv_kernel<<<dim3((uint32_t)conv_dim, (uint32_t)N), dim3(kPrepThreads), 0, hs>>>(
+        (const uint8_t*)x->data, x->dtype, rad_dtype_bytes(x->dtype, xrow),
+        (const uint8_t*)w->data, w->dtype, rad_dtype_bytes(w->dtype, w_s0),
+        b_on ? (const uint8_t*)b->data : nullptr, b_on ? b->dtype : 0,
+        cs_on ? (uint8_t*)cs->data : nullptr, cs_on ? cs->dtype : 0,
+        cs_on ? rad_dtype_bytes(cs->dtype, cs_s0) : 0,
+        cs_on ? rad_dtype_bytes(cs->dtype, cs_s1) : 0,
+        sidx_on ? sidx->data : nullptr, sidx_on ? sidx->dtype : 0,
+        hini_on ? hini->data : nullptr, hini_on ? hini->dtype : 0,
+        cu->data, cu->dtype,
+        (uint8_t*)q->data, q->dtype, rad_dtype_bytes(q->dtype, q_s0), rad_dtype_bytes(q->dtype, q_s1),
+        (uint8_t*)k->data, k->dtype, rad_dtype_bytes(k->dtype, k_s0), rad_dtype_bytes(k->dtype, k_s1),
+        (uint8_t*)v->data, v->dtype, rad_dtype_bytes(v->dtype, v_s0), rad_dtype_bytes(v->dtype, v_s1),
+        Hg * Kd, Kd, 2 * Hg * Kd, Vd, w32, cs_slots);
+    if (hipGetLastError() != hipSuccess) return RAD_E_DEVICE;
+
+    const uint32_t shm = (uint32_t)(Kd * sizeof(float));
+    gdn_conv_prep_norm_kernel<<<dim3((uint32_t)T, (uint32_t)Hg, 2), dim3(kPrepNormThreads), shm, hs>>>(
+        (uint8_t*)q->data, q->dtype, rad_dtype_bytes(q->dtype, q_s0), rad_dtype_bytes(q->dtype, q_s1),
+        (uint8_t*)k->data, k->dtype, rad_dtype_bytes(k->dtype, k_s0), rad_dtype_bytes(k->dtype, k_s1),
+        Kd, l2eps);
+    if (hipGetLastError() != hipSuccess) return RAD_E_DEVICE;
+
+    const int64_t chunks = (T + chunk - 1) / chunk;
+    if (chunks > 0xffff) return RAD_E_SHAPE;
+    gdn_conv_prep_gate_kernel<<<dim3((uint32_t)H, (uint32_t)N, (uint32_t)chunks), dim3(32), 0, hs>>>(
+        (const uint8_t*)x->data, x->dtype, rad_dtype_bytes(x->dtype, xrow),
+        ta_on ? (const uint8_t*)ta->data : nullptr, ta_on ? ta->dtype : 0,
+        ta_on ? rad_dtype_bytes(ta->dtype, a_s0) : 0,
+        tb_on ? (const uint8_t*)tb->data : nullptr, tb_on ? tb->dtype : 0,
+        tb_on ? rad_dtype_bytes(tb->dtype, b_s0) : 0,
+        alog_on ? (const uint8_t*)alog->data : nullptr, alog_on ? alog->dtype : 0,
+        dtb_on ? (const uint8_t*)dtb->data : nullptr, dtb_on ? dtb->dtype : 0,
+        (uint8_t*)g->data, g->dtype, rad_dtype_bytes(g->dtype, g_s0),
+        (uint8_t*)bt->data, bt->dtype, rad_dtype_bytes(bt->dtype, bt_s0),
+        cu->data, cu->dtype, conv_dim, H, ch32, spthr);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* gdn_conv_recurrent_update: verbatim libref operand list (x, conv_w, conv_b?, conv_state,
+ * conv_idx, a, b, A_log?, dt_bias?, state INOUT, state_idx, num_accepted, cu, z?, norm_w?, o,
+ * o_q?, o_scale?) -- the pair's union, staging tensors absent by design. Derivations are ref's:
+ * T = o->shape[0], Hv = o->shape[1], conv_dim = x's column count, Hg = (conv_dim - Hv*head_v) /
+ * (2*head_k) -- no shape[rank-2] guessing anywhere. The row inherits the recurrent row's scope:
+ * head_k 128, head_v <= 128, per_candidate only, quantiser pair refused. conv_width up to 4
+ * (the fused window lives in registers). The staging smem is sized from the ONE bound a
+ * launcher can see: the conv contract caps a sequence at state_len - conv_width + 2 tokens. */
+extern "C" int r3d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) {
+    const RadTensor* x    = rad_arg_in(a, 0);
+    const RadTensor* w    = rad_arg_in(a, 1);
+    const RadTensor* cb   = rad_arg_in(a, 2);        /* optional */
+    const RadTensor* cs   = rad_arg_in(a, 3);
+    const RadTensor* cidx = rad_arg_in(a, 4);
+    const RadTensor* av   = rad_arg_in(a, 5);
+    const RadTensor* bv   = rad_arg_in(a, 6);
+    const RadTensor* alog = rad_arg_in(a, 7);        /* optional data */
+    const RadTensor* dtb  = rad_arg_in(a, 8);        /* optional data */
+    const RadTensor* st   = rad_arg_in(a, 9);
+    const RadTensor* sidx = rad_arg_in(a, 10);
+    const RadTensor* nacc = rad_arg_in(a, 11);
+    const RadTensor* cu   = rad_arg_in(a, 12);
+    const RadTensor* z    = rad_arg_in(a, 13);       /* optional */
+    const RadTensor* nw   = rad_arg_in(a, 14);       /* optional */
+    const RadTensor* o    = rad_arg_in(a, 15);
+    if (!x || !w || !cs || !cidx || !av || !bv || !st || !sidx || !nacc || !cu || !o)
+        return RAD_E_INVAL;
+    if ((rad_arg_in(a, 16) && rad_arg_in(a, 16)->data) ||
+        (rad_arg_in(a, 17) && rad_arg_in(a, 17)->data)) return RAD_E_UNSUPPORTED;
+    const char* sf = rad_args_gets(a, "state_form");
+    if (sf && std::strcmp(sf, "per_candidate") != 0) return RAD_E_UNSUPPORTED;
+
+    const auto dt2_ok = [](uint32_t d) { return d == RAD_F32 || d == RAD_BF16; };
+    const bool cb_on = cb && cb->data, alog_on = alog && alog->data, dtb_on = dtb && dtb->data;
+    const bool z_on = z && z->data, nw_on = nw && nw->data;
+    if (!dt2_ok(x->dtype) || !dt2_ok(w->dtype) || !dt2_ok(cs->dtype) || !dt2_ok(av->dtype) ||
+        !dt2_ok(bv->dtype) || !dt2_ok(st->dtype) || !dt2_ok(o->dtype) ||
+        (cb_on && !dt2_ok(cb->dtype)) || (alog_on && !dt2_ok(alog->dtype)) ||
+        (dtb_on && !dt2_ok(dtb->dtype)) || (z_on && !dt2_ok(z->dtype)) ||
+        (nw_on && !dt2_ok(nw->dtype))) return RAD_E_DTYPE;
+    if (!idx_dt_ok(cu->dtype) || !idx_dense(cu)) return RAD_E_STRIDE;
+    if (!idx_dt_ok(nacc->dtype) || !idx_dense(nacc)) return RAD_E_STRIDE;
+    if (!idx_dt_ok(cidx->dtype) || !idx_dense(cidx)) return RAD_E_STRIDE;
+    if (!idx_dt_ok(sidx->dtype)) return RAD_E_DTYPE;
+
+    long long K_ll = 0, V_ll = 0, W_ll = 0;
+    if (!rad_args_geti(a, "head_k", &K_ll) || !rad_args_geti(a, "head_v", &V_ll) ||
+        !rad_args_geti(a, "conv_width", &W_ll)) return RAD_E_SHAPE;
+    const int64_t Kd = K_ll, Vd = V_ll, width = W_ll;
+    if (Kd <= 0 || Vd <= 0 || width <= 0) return RAD_E_SHAPE;
+    if (Kd != kRecK || Vd > (int64_t)kRecThreads) return RAD_E_UNSUPPORTED;
+    if (width > kFusWidthMax) return RAD_E_UNSUPPORTED;
+
+    if (x->rank < 2 || o->rank != 3 || o->shape[2] != Vd) return RAD_E_SHAPE;   /* ref's checks */
+    const int64_t T = o->shape[0], Hv = o->shape[1];
+    const int64_t conv_dim = x->shape[x->rank - 1];
+    if (T <= 0 || Hv <= 0 || conv_dim <= Hv * Vd) return RAD_E_SHAPE;
+    if ((conv_dim - Hv * Vd) % (2 * Kd) != 0) return RAD_E_SHAPE;
+    const int64_t Hg = (conv_dim - Hv * Vd) / (2 * Kd);
+    if (Hg <= 0 || Hv % Hg != 0) return RAD_E_SHAPE;
+
+    const int64_t N = rad_tensor_numel(cu) - 1;
+    if (N <= 0 || N > 0xffff) return RAD_E_SHAPE;
+    if (rad_tensor_numel(o) < T * Hv * Vd) return RAD_E_SHAPE;
+    if (rad_tensor_numel(av) < T * Hv || rad_tensor_numel(bv) < T * Hv) return RAD_E_SHAPE;
+    if (rad_tensor_numel(nacc) < N || rad_tensor_numel(cidx) < N) return RAD_E_SHAPE;
+    if (rad_tensor_numel(w) < conv_dim * width) return RAD_E_SHAPE;
+
+    /* x: [T, conv_dim] dense-row; w: v2(w, width); conv_b: element c of a dense row. */
+    const int64_t xrow = x->stride[x->rank - 2];
+    if (x->stride[x->rank - 1] != 1) return RAD_E_STRIDE;
+    if (rad_tensor_numel(x) < (T - 1) * xrow + conv_dim) return RAD_E_SHAPE;
+    const int64_t w_s0 = w->rank >= 2 ? w->stride[w->rank - 2] : width;
+    if (w->rank >= 2 && w->stride[w->rank - 1] != 1) return RAD_E_STRIDE;
+    if (cb_on && (cb->rank == 0 || cb->stride[cb->rank - 1] != 1)) return RAD_E_STRIDE;
+    if (cb_on && rad_tensor_numel(cb) < conv_dim) return RAD_E_SHAPE;
+
+    /* conv state: ref's conv_state_view (the rolling window, same contract as conv_update). */
+    const int64_t state_len = cs->rank >= 3 ? cs->shape[cs->rank - 1] : (width > 1 ? width - 1 : 1);
+    const int64_t cs_s0 = cs->rank >= 3 ? cs->stride[cs->rank - 3] : conv_dim * state_len;
+    const int64_t cs_s1 = cs->rank >= 3 ? cs->stride[cs->rank - 2] : state_len;
+    const int64_t cs_s2 = cs->rank >= 3 ? cs->stride[cs->rank - 1] : 1;
+    if (cs_s2 != 1) return RAD_E_STRIDE;
+    const int64_t cs_slots = cs->rank >= 3
+        ? cs->shape[cs->rank - 3]
+        : rad_tensor_numel(cs) / (conv_dim * state_len);
+    if (cs_slots <= 0) return RAD_E_SHAPE;
+
+    const int64_t a_s0 = av->rank >= 2 ? av->stride[av->rank - 2] : Hv;
+    if (av->rank >= 2 && av->stride[av->rank - 1] != 1) return RAD_E_STRIDE;
+    const int64_t b_s0 = bv->rank >= 2 ? bv->stride[bv->rank - 2] : Hv;
+    if (bv->rank >= 2 && bv->stride[bv->rank - 1] != 1) return RAD_E_STRIDE;
+
+    /* state / state_idx / z / norm_w / o: the recurrent row's checks, verbatim. */
+    if (sidx->rank < 2 || sidx->stride[sidx->rank - 1] != 1) return RAD_E_STRIDE;
+    const int64_t sw    = sidx->shape[sidx->rank - 1];
+    const int64_t si_s0 = sidx->stride[sidx->rank - 2];
+    const int64_t si_s1 = sidx->stride[sidx->rank - 1];
+    if (sw <= 0 || sidx->shape[sidx->rank - 2] < N) return RAD_E_SHAPE;
+
+    const int64_t st_s0 = st->rank >= 4 ? st->stride[st->rank - 4] : Hv * Vd * Kd;
+    const int64_t st_s1 = st->rank >= 4 ? st->stride[st->rank - 3] : Vd * Kd;
+    const int64_t st_s2 = st->rank >= 4 ? st->stride[st->rank - 2] : Kd;
+    if (st->rank >= 4 && st->stride[st->rank - 1] != 1) return RAD_E_STRIDE;
+    if (rad_tensor_numel(st) < T * Hv * Vd * Kd) return RAD_E_SHAPE;
+
+    auto v3_ok = [&](const RadTensor* t, int64_t heads, int64_t dim,
+                     int64_t* s0, int64_t* s1) -> int {
+        *s0 = t->rank >= 3 ? t->stride[t->rank - 3] : heads * dim;
+        *s1 = t->rank >= 3 ? t->stride[t->rank - 2] : dim;
+        if (t->rank >= 3 && t->stride[t->rank - 1] != 1) return RAD_E_STRIDE;
+        return RAD_OK;
+    };
+    int64_t o_s0, o_s1, z_s0 = 0, z_s1 = 0;
+    int rc = v3_ok(o, Hv, Vd, &o_s0, &o_s1);  if (rc) return rc;
+    if (z_on) {
+        rc = v3_ok(z, Hv, Vd, &z_s0, &z_s1);  if (rc) return rc;
+        if (rad_tensor_numel(z) < T * Hv * Vd) return RAD_E_SHAPE;
+    }
+    auto vec_ok = [&](const RadTensor* t, int64_t n, int64_t* s1) -> int {
+        if (!t) return RAD_OK;
+        if (t->rank < 1 || t->stride[t->rank - 1] != 1) return RAD_E_STRIDE;
+        if (rad_tensor_numel(t) < n) return RAD_E_SHAPE;
+        *s1 = 1;
+        return RAD_OK;
+    };
+    int64_t al_s1 = 1, db_s1 = 1, w_s1 = 1;
+    rc = vec_ok(alog_on ? alog : nullptr, Hv, &al_s1); if (rc) return rc;
+    rc = vec_ok(dtb_on ? dtb : nullptr, Hv, &db_s1);   if (rc) return rc;
+    rc = vec_ok(nw_on ? nw : nullptr, Vd, &w_s1);      if (rc) return rc;
+
+    const double scale_d = rad_args_getf_or(a, "scale", 1.0);
+    const double eps_d   = rad_args_getf_or(a, "eps", 1e-6);
+    const double l2_d    = rad_args_getf_or(a, "l2_eps", 1e-6);
+    const double thr_d   = rad_args_getf_or(a, "softplus_thr", 20.0);
+    const char* act = rad_args_gets(a, "act");
+    const int sigm = act && !std::strcmp(act, "sigmoid");
+    if (act && !sigm && std::strcmp(act, "silu")) return RAD_E_UNSUPPORTED;
+
+    /* The staging bound the conv contract itself draws: width - 2 + slen <= state_len. */
+    const int64_t slen_max = (state_len - width + 2) < T ? (state_len - width + 2) : T;
+    if (slen_max < 0) return RAD_E_SHAPE;      /* no window can ever fit: caller bug */
+    const int64_t eb = (x->dtype == RAD_F32) ? 4 : 2;
+    const int64_t smem = slen_max * (2 * Kd + Vd) * eb;
+    if (smem > 48 * 1024) return RAD_E_UNSUPPORTED;   /* LDS budget, incl. the recurrent leg */
+
+    const int32_t w32 = (int32_t)width;
+    gdn_conv_recurrent_update_kernel<<<dim3((uint32_t)Hv, (uint32_t)N), dim3(kRecThreads),
+                                       (uint32_t)smem, (hipStream_t)(uintptr_t)s>>>(
+        (const uint8_t*)x->data, x->dtype, rad_dtype_bytes(x->dtype, xrow),
+        (const uint8_t*)w->data, w->dtype, rad_dtype_bytes(w->dtype, w_s0),
+        cb_on ? (const uint8_t*)cb->data : nullptr, cb_on ? cb->dtype : 0,
+        (uint8_t*)cs->data, cs->dtype, rad_dtype_bytes(cs->dtype, cs_s0),
+        rad_dtype_bytes(cs->dtype, cs_s1), cs_slots, state_len,
+        cidx->data, cidx->dtype,
+        (const uint8_t*)av->data, av->dtype, rad_dtype_bytes(av->dtype, a_s0),
+        (const uint8_t*)bv->data, bv->dtype, rad_dtype_bytes(bv->dtype, b_s0),
+        alog_on ? (const uint8_t*)alog->data : nullptr, alog_on ? alog->dtype : 0,
+        alog_on ? rad_dtype_bytes(alog->dtype, al_s1) : 0,
+        dtb_on ? (const uint8_t*)dtb->data : nullptr, dtb_on ? dtb->dtype : 0,
+        dtb_on ? rad_dtype_bytes(dtb->dtype, db_s1) : 0,
+        (uint8_t*)st->data, st->dtype,
+        rad_dtype_bytes(st->dtype, st_s0), rad_dtype_bytes(st->dtype, st_s1),
+        rad_dtype_bytes(st->dtype, st_s2),
+        sidx->data, sidx->dtype, rad_dtype_bytes(sidx->dtype, si_s0),
+        rad_dtype_bytes(sidx->dtype, si_s1), sw,
+        nacc->data, nacc->dtype,
+        cu->data, cu->dtype,
+        z_on ? (const uint8_t*)z->data : nullptr, z_on ? z->dtype : 0,
+        z_on ? rad_dtype_bytes(z->dtype, z_s0) : 0, z_on ? rad_dtype_bytes(z->dtype, z_s1) : 0,
+        nw_on ? (const uint8_t*)nw->data : nullptr, nw_on ? nw->dtype : 0,
+        nw_on ? rad_dtype_bytes(nw->dtype, w_s1) : 0,
+        (uint8_t*)o->data, o->dtype, rad_dtype_bytes(o->dtype, o_s0), rad_dtype_bytes(o->dtype, o_s1),
+        Hg * Kd, 2 * Hg * Kd, Vd, Hv / Hg, w32,
+        (float)scale_d, (float)l2_d, (float)eps_d, (float)thr_d, sigm);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }

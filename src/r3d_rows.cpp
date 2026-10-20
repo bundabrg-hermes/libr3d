@@ -420,6 +420,71 @@ static const RadOperandSpec oRecurrent[] = {
     { "o_q",          RAD_OPD_OUT,    1 },
     { "o_scale",      RAD_OPD_OUT,    1 },
 };
+/* gdn_conv_prep / gdn_conv_recurrent_update: the conv pair, verbatim libref (pConvPrep/
+ * oConvPrep, pConvRecurrent/oConvRecurrent). chunk is DERIVED with the seq-chunk role as on
+ * kkt_solve; z and norm_w are REQUIRED on the fused row to match the oracle's list -- the
+ * launcher stays lenient, the schema does not. */
+static const RadParamSpec pConvPrep[] = {
+    { "M",            RAD_P_INT,  RAD_REQUIRED },
+    { "head_k",       RAD_P_INT,  RAD_REQUIRED },
+    { "head_v",       RAD_P_INT,  RAD_REQUIRED },
+    { "chunk",        RAD_P_INT,  RAD_DERIVED, RAD_PROLE_SEQ_CHUNK },
+    { "conv_width",   RAD_P_INT,  RAD_REQUIRED },
+    { "l2_eps",       RAD_P_F64,  RAD_OPTIONAL },
+    { "softplus_thr", RAD_P_F64,  RAD_OPTIONAL },
+};
+static const RadOperandSpec oConvPrep[] = {
+    { "x",          RAD_OPD_IN,     0 },
+    { "w",          RAD_OPD_WEIGHT, 0 },
+    { "b",          RAD_OPD_WEIGHT, 1 },
+    { "A_log",      RAD_OPD_WEIGHT, 0 },
+    { "dt_bias",    RAD_OPD_WEIGHT, 0 },
+    { "conv_state", RAD_OPD_INOUT,  0 },
+    { "cu",         RAD_OPD_IN,     0 },
+    { "a",          RAD_OPD_IN,     1 },
+    { "b_gate",     RAD_OPD_IN,     1 },
+    { "cache_idx",  RAD_OPD_IN,     1 },
+    { "has_init",   RAD_OPD_IN,     1 },
+    { "q",          RAD_OPD_OUT,    0 },
+    { "k",          RAD_OPD_OUT,    0 },
+    { "v",          RAD_OPD_OUT,    0 },
+    { "g",          RAD_OPD_OUT,    0 },
+    { "beta",       RAD_OPD_OUT,    0 },
+};
+static const RadParamSpec pConvFused[] = {
+    { "q_len",        RAD_P_INT,  RAD_REQUIRED },
+    { "head_k",       RAD_P_INT,  RAD_REQUIRED },
+    { "head_v",       RAD_P_INT,  RAD_REQUIRED },
+    { "conv_width",   RAD_P_INT,  RAD_REQUIRED },
+    { "n_head_v",     RAD_P_INT,  RAD_OPTIONAL },
+    { "scale",        RAD_P_F64,  RAD_OPTIONAL },
+    { "eps",          RAD_P_F64,  RAD_OPTIONAL },
+    { "l2_eps",       RAD_P_F64,  RAD_OPTIONAL },
+    { "softplus_thr", RAD_P_F64,  RAD_OPTIONAL },
+    { "act",          RAD_P_STR,  RAD_OPTIONAL },
+    { "state_fp16",   RAD_P_INT,  RAD_OPTIONAL },
+    { "state_form",   RAD_P_STR,  RAD_OPTIONAL },
+};
+static const RadOperandSpec oConvFused[] = {
+    { "x",            RAD_OPD_IN,     0 },
+    { "conv_w",       RAD_OPD_WEIGHT, 0 },
+    { "conv_b",       RAD_OPD_WEIGHT, 1 },
+    { "conv_state",   RAD_OPD_INOUT,  0 },
+    { "conv_idx",     RAD_OPD_IN,     0 },
+    { "a",            RAD_OPD_IN,     0 },
+    { "b",            RAD_OPD_IN,     0 },
+    { "A_log",        RAD_OPD_WEIGHT, 0 },
+    { "dt_bias",      RAD_OPD_WEIGHT, 0 },
+    { "state",        RAD_OPD_INOUT,  0 },
+    { "state_idx",    RAD_OPD_IN,     0 },
+    { "num_accepted", RAD_OPD_IN,     0 },
+    { "cu",           RAD_OPD_IN,     0 },
+    { "z",            RAD_OPD_IN,     0 },
+    { "norm_w",       RAD_OPD_WEIGHT, 0 },
+    { "o",            RAD_OPD_OUT,    0 },
+    { "o_q",          RAD_OPD_OUT,    1 },
+    { "o_scale",      RAD_OPD_OUT,    1 },
+};
 static const RadParamSpec pQuantActFp8[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -662,6 +727,15 @@ static const RadOpSchema kSchemas[] = {
         oRecurrent, (int)(sizeof(oRecurrent)/sizeof(oRecurrent[0])),
         "The decode recurrence against the paged state cache, per-candidate form, gated RMS "
         "norm folded. Verbatim libref/libr4d so co-loaded schema_same() passes." },
+      { "gdn_conv_prep", pConvPrep, (int)(sizeof(pConvPrep)/sizeof(pConvPrep[0])),
+        oConvPrep, (int)(sizeof(oConvPrep)/sizeof(oConvPrep[0])),
+        "The prefill preamble: depthwise conv with silu and its state cache, the q/k/v split, "
+        "the l2 norm over each q and k head, the gate with its per-chunk cumsum, and beta. "
+        "Verbatim libref so co-loaded schema_same() passes." },
+      { "gdn_conv_recurrent_update", pConvFused, (int)(sizeof(pConvFused)/sizeof(pConvFused[0])),
+        oConvFused, (int)(sizeof(oConvFused)/sizeof(oConvFused[0])),
+        "gdn_conv_update followed by gdn_recurrent_update, with q, k and v never written; the "
+        "rolling-window and state contracts are the two ops' own. Verbatim libref." },
       { "gather_rows", pMnDtype, (int)(sizeof(pMnDtype)/sizeof(pMnDtype[0])),
         oGather, (int)(sizeof(oGather)/sizeof(oGather[0])),
         "y[i, :] = x[idx[i], :]. A negative index writes a zero row -- the padding convention a "
@@ -857,6 +931,25 @@ static const RadConstraint cRecurrent[] = {
     { "head_v", RAD_C_LE, 128,  nullptr },
     RAD_CIN("state_form", "per_candidate"),
 };
+/* conv_prep: chunk 64 is the shared c64 value and the cumsum's reset unit; conv_width tops
+ * at the kernel's LDS history bound; the l2 grid stages one head row, so head_k is bounded. */
+static const RadConstraint cConvPrep[] = {
+    RAD_CEQ("chunk", 64),
+    { "head_k", RAD_C_GE, 1,    nullptr },
+    { "head_k", RAD_C_LE, 4096, nullptr },
+    { "conv_width", RAD_C_GE, 1, nullptr },
+    { "conv_width", RAD_C_LE, 17, nullptr },
+};
+/* the fused pair: the recurrent row's register bounds, the window in registers (width <= 4),
+ * and the same state_form scope gate -- anchor batches stay with libr4d. */
+static const RadConstraint cConvFused[] = {
+    RAD_CEQ("head_k", 128),
+    { "head_v", RAD_C_GE, 1,    nullptr },
+    { "head_v", RAD_C_LE, 128,  nullptr },
+    { "conv_width", RAD_C_GE, 1, nullptr },
+    { "conv_width", RAD_C_LE, 4, nullptr },
+    RAD_CIN("state_form", "per_candidate"),
+};
 
 extern "C" int r3d_rad_rmsnorm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_embed_lookup(const RadArgs*, RadStream);
@@ -901,6 +994,8 @@ extern "C" int r3d_rad_gdn_conv_update(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gdn_kkt_solve(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gdn_chunk_scan(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gdn_recurrent_update(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gdn_conv_prep(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gdn_conv_recurrent_update(const RadArgs*, RadStream);
 extern "C" int r3d_rad_silu_mul(const RadArgs*, RadStream);
 extern "C" int r3d_rad_quant_act_i8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_row_topk(const RadArgs*, RadStream);
@@ -1352,6 +1447,37 @@ static const RadKernelInfo kRows[] = {
   cRecurrent, 4, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gdn_recurrent_update },
 
+{ "gdn_conv_prep_bf16", "gdn_conv_prep", "gdn",
+  "the prefill preamble: depthwise conv with silu and its state commit, the q/k/v split, the "
+  "per-head l2 norms, the gate cumsum and beta, in three launches (conv, norm, gate) that keep "
+  "the oracle's phase order -- the norms read what the conv stored, as the oracle's re-read does",
+  "chunk 64 (the derived c64, the cumsum's reset unit), head_k within the staged-row LDS "
+  "budget, conv_width up to the history bound; a (head, sequence, chunk) block walks the "
+  "oracle's serial cumsum; absent a/b_gate the gates are the last 2*head_v columns of the "
+  "fused x row, and cache_idx/has_init choose the state slot and its cold-window zeros",
+  "f32/bf16 x/q/k/v/g/beta with optional b/A_log/dt_bias read as stored (plain single-plane "
+  "weights); the conv taps, the serial l2 chains, the chunk-reset cumsum and the double-"
+  "rounded silu/sigmoid/softplus all walk the oracle's order -- bit-exact by construction, "
+  "the prefill sibling of conv_update",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cConvPrep, 5, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gdn_conv_prep },
+
+{ "gdn_conv_recurrent_update_bf16", "gdn_conv_recurrent_update", "gdn",
+  "the decode pair fused: conv_update into an LDS staging buffer, then the recurrent delta "
+  "rule over it, one launch per (sequence, v head); the conv window commits before the "
+  "state-idx skip, in the oracle's order -- the pair commits the conv state even when the "
+  "recurrent leg then skips the row",
+  "the recurrent row's scope exactly: head_k 128, head_v up to 128, per_candidate only, the "
+  "o_q/o_scale quantiser pair refused; conv_width up to 4 (the window is register-resident); "
+  "the staging smem follows the conv contract's own sequence bound, state_len - conv_width + 2",
+  "bit-exact against both oracles by the same construction as the two rows it replaces, "
+  "because it IS their code paths fused: the staging rounds through x's dtype, so the "
+  "round trip the two-op path pays through global memory happens identically here",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cConvFused, 6, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gdn_conv_recurrent_update },
+
 /* ---- the three bands MiniCPM5-2B's graph names at resolve (see r3d_more.hip). The
  * engine refused to START without them: weightless device bands have no host stand-in. */
 
@@ -1403,7 +1529,8 @@ static bool r3d_gdn_hidden(void) { static const int v = []{ return getenv("R3D_N
 static bool r3d_row_hidden(const char* op) {
     if (!r3d_gdn_hidden() || !op) return false;
     static const char* const kGdn[] = { "gdn_gated_rmsnorm", "gdn_conv_update", "gdn_kkt_solve",
-                                        "gdn_chunk_scan", "gdn_recurrent_update" };
+                                        "gdn_chunk_scan", "gdn_recurrent_update",
+                                        "gdn_conv_prep", "gdn_conv_recurrent_update" };
     for (const char* n : kGdn) if (strcmp(op, n) == 0) return true;
     return false;
 }
