@@ -829,3 +829,54 @@ every decode call); the new fold+cus+gqa8+qlen8 case passes **pre-fix too** --
 branch of `per_seq` now multiplies by gqa as its own comment always claimed,
 which is the exact bound only when gqa > 8 (27B-class, and dflash2 at qlen>1):
 insurance for the 27B track, not a live bug on this one.
+
+## 2026-10-20: gemm_nt_q mxfp4a8 shipped -- the quantised GEMM opens on RDNA3
+
+`gemm_nt_q_mxfp4` (src/r3d_gemm_mxfp4.hip) answers `gemm_nt_q` at
+`dtype=mxfp4a8` -- 58 recorded fixture cases from `qwen3.8-27b-fp8.rad`, zero
+model risk. RDNA3 has no fp8/fp4 hardware, so this is a boundary conversion on
+the m64 WMMA tile, and the two decodes involved are exact in bf16 (e4m3
+mantissa <= 3 bits, e2m1 <= 2). The scales never touch bf16 rounding either:
+
+* B fragments stage as `e2m1_bits + ((x - eref[n]) << 7)`: bf16 is a biased
+  exponent, so the add IS the multiply by 2^(x-eref), exact while normal.
+  `eref[n]` is the row's max non-NaN E8M0 (the `b_ref` role, derived in-kernel
+  at block entry; the passed `b_ref` is accepted and ignored -- both host
+  libraries ignore it too).
+* WMMA accumulates raw products for exactly one 128-of-K activation group
+  (8 slices of 16; 32 divides 128); the flush multiplies the partial by
+  `sa[m, grp]` in f32 through LDS (`Acc`), and the store multiplies once by
+  `2^(eref[n]-127)`. `(sub*2^d)*sa == (sub*sa)*2^d`: one rounding of the same
+  mantissa, the same class the mma's opaque k-tree already lives in.
+* NaN scale bytes stage their whole 32-column group as bf16 NaN. The oracle's
+  `(sub*sa)*NaN` poisons the entire output even for an all-zero-code group
+  (0*NaN is NaN); OPS.md's "treat as empty" is a permission for zero
+  activation scales, not for NaN weight scales. Padding (m>=M, n>=N, k>=K)
+  stages plain zeros -- distinguishable from NaN only because the prefetch
+  carries a liveness bit.
+
+Why `Acc` lives in LDS: this ROCm's rocwmma has no coordinate fragment (no
+`rocm_t`), so a register-side per-row multiply means hardcoding v_wmma's lane
+layout. The 42 KB carve is 1 block/CU; the GEMM is weight-bandwidth-bound
+(M=1 decode reads 64 MB of nibbles per call at N=5120 K=25600), and 80..2560
+blocks over 96 CUs leave nothing a second resident block could exploit.
+`R3D_GEMM_NO_DBUF=1` is the schedule arm, `R3D_NO_MXFP4=1` the serve kill
+switch (the row refuses, the engine answers from libref, same binary).
+
+Gates, in order: loader (`rad-info --plugins` with libref co-loaded -- the
+verbatim libr4d pGemmNtQ/oGemmNtQ dedupes clean); attributed sweep (libavx
+excluded so counts attribute): **58/58 ok, worst rel_l2 3.21e-04 vs tol 3e-2**,
+M=1 through 512, ragged M (65/129/258) included, launch proof line present,
+58 cases guarded, 0 wrote outside; full pack with libavx+libref: **1850/1850,
+0 failed**, 24 named skips all 7+ GiB embed_lookup/logits_gemm cases over the
+1.36 GiB co-tenant budget (the same named-skips class as every recent run).
+Serve build11: MiniCPM never issues gemm_nt_q -- the row is inert there; it
+ships to be the 27B's door, which the GDN family still has to open.
+
+Fixture note (tools/kf_probe_q.cpp, build inside radiance-dev):
+`g++ -std=c++20 kf_probe_q.cpp kfixture.cpp opshapes.cpp core/format/encoding.cpp
+core/util/rad_util.cpp -I/opt/radiance-src{,/tools,/core,/abi}
+-I/opt/radiance/include/radiance`. The recorded geometry spells the contract:
+a_scale [M, K/128] f32 (sigmoid-filled, so strictly positive), b_scale [N, K/32]
+e8m0, b_ref present as the full exponent plane (a [N] per-row reduction is what
+the oGemmNtQ comment means, not the recorded shape), a_sum ABSENT in every case.
