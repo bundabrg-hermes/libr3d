@@ -408,3 +408,32 @@ Two layers of silence stacked up:
 Triage tools added: `tools/probe_l401*.hip` (launch-state bisect by build axis:
 arch list / dlopen / LDS size) and `tools/probe_fa_main.cpp` (launch the real tile
 through its own launcher, standalone).
+
+## 2026-10-20: gemm m64 k-slice pipeline (DBUF) — GEMM staging retarget
+
+After the attention fix the prefit quadratic moved to the GEMM linear term's stall:
+the m64 tile serialised stage -> barrier -> WMMA -> barrier per k-slice, so every
+slice ate the full operand global-load latency. Ported the structure of
+llama-cpp-rdna-boosts block 06 (MMB, gfx1100-validated): next slice prefetched
+global->registers during this slice's WMMA, A staging double-buffered (5 KB total
+LDS, occupancy unchanged), B deliberately NOT double-buffered -- block 06 measured
+B's second buffer as a loss (extra LDS traffic exceeds the barrier it removes).
+
+Measured on the card, same binary, env switch (R3D_GEMM_NO_DBUF=1 = old schedule),
+unique uuid prefixes, fresh serve each arm:
+
+| probe          | single-buffer | DBUF pipeline | speedup |
+|----------------|---------------|---------------|---------|
+| 981 tok median | 0.356 s       | 0.289 s       | 1.23x   |
+| 1961 tok median| 0.691 s       | 0.550 s       | 1.26x   |
+
+Distributions do not overlap (dbuf max 0.300 < single min 0.327 @981). kbench
+gemm_nt 269/269 both arms, worst rel_l2 identical to 4 digits (5.164e-04): the
+schedule moves LDS write timing only, arithmetic is bit-identical, which is why no
+separate KLD run was needed. `R3D_DEBUG_GEMM=1` prints the schedule name at launch
+(the prove-the-kernel-ran line); logits_gemm fixtures stayed budget-skipped (the
+host-radiance co-tenant holds the RAM) but share gemm_nt's launch path verbatim.
+
+Side observation: today's re-measured baselines (0.36 s @981) run ~4x under the
+historical post-FA note (1.33 s) -- co-tenant and box state differ from that
+session; another reason A/B must be same-day paired runs, never historical deltas.

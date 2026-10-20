@@ -32,7 +32,7 @@
  * block 06 (MMB, gfx1100-validated) does: next slice prefetched global->registers while
  * this slice's WMMA runs, A staging double-buffered so the next stage overlaps compute,
  * B deliberately NOT (block 06 measured B's second buffer as a loss). Selected per launch
- * by R3D_GEMM_DBUF; promotion flips the default.
+ * by R3D_GEMM_NO_DBUF=1 (kill switch); the DBUF schedule is the promoted default.
  */
 
 #include <hip/hip_runtime.h>
@@ -239,10 +239,16 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_kernel(
 #endif
 
 /* Variant selection at launch, both instantiated in the same TU:
- *   R3D_GEMM_DBUF=1  -> the double-buffered k-slice pipeline (DBUF)
- *   default          -> the original single-buffer schedule (single-buffer)
- * The default stays on the shipped schedule until the DBUF path passes kbench and the
- * serve A/B; flipping the default is the promotion step, not this commit. */
+ *   default          -> the DBUF k-slice pipeline (promoted 2026-10-20 after the card
+ *                       A/B: serve TTFT 0.356 -> 0.289 s median @981 and 0.691 -> 0.550
+ *                       s @1961, ~1.25x, non-overlapping distributions; kbench gemm_nt
+ *                       269/269 with identical worst rel_l2 both arms)
+ *   R3D_GEMM_NO_DBUF=1 -> the original single-buffer schedule, kill switch for
+ *                       measurement and rollback
+ * The two schedules produce bit-identical tiles (same slice contents, same ascending-k
+ * fragment order -- only the LDS write timing moves), so the distribution gate is
+ * implied by the schedule being arithmetic-preserving; kbench's identical worst rel_l2
+ * corroborates. */
 int r3d_gemm_nt_m64_launch(const void* A, const void* B, void* Y, float* Yf,
                            int M, int N, int K, int64_t a_pitch, int64_t b_pitch,
                            int64_t y_pitch, hipStream_t stream) {
@@ -264,7 +270,7 @@ int r3d_gemm_nt_m64_launch(const void* A, const void* B, void* Y, float* Yf,
         }
         return RAD_E_DEVICE;
     }
-    static const bool dbuf = getenv("R3D_GEMM_DBUF") != nullptr;
+    static const bool dbuf = getenv("R3D_GEMM_NO_DBUF") == nullptr;
     dim3 grid((unsigned)((N + kNB - 1) / kNB), (unsigned)((M + kMB - 1) / kMB));
     if (dbuf)
         hipLaunchKernelGGL((gemm_nt_bf16_m64_kernel<true>), grid, dim3(kThreads), 0, stream,
