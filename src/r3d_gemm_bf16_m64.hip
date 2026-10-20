@@ -25,6 +25,14 @@
  * guarded global copy-out below is also where f32-vs-bf16 output and the fold's y_pitch
  * live. Staging loads stay scalar-guarded on purpose: they are correct for any element
  * pitch, and at 64x32 bf16 per slice per operand they are a fraction of the tile's traffic.
+ *
+ * Two schedules share this kernel via the DBUF template parameter. The shipped default
+ * stages slice, barriers, computes, barriers, restages -- every slice eats the full
+ * global-load latency before WMMA starts. DBUF=1 pipelines it the way llama-cpp-rdna-boosts
+ * block 06 (MMB, gfx1100-validated) does: next slice prefetched global->registers while
+ * this slice's WMMA runs, A staging double-buffered so the next stage overlaps compute,
+ * B deliberately NOT (block 06 measured B's second buffer as a loss). Selected per launch
+ * by R3D_GEMM_DBUF; promotion flips the default.
  */
 
 #include <hip/hip_runtime.h>
@@ -56,6 +64,12 @@ constexpr int kLdsPad = 4;                    /* LDS row padding */
 constexpr int kThreads = 256;                 /* 8 wave32s; 2 wmma tiles each */
 constexpr int kWave = 32;                     /* wave32 ABI pinned in CMakeLists */
 
+/* Staging per thread per slice: 64 rows x 16 cols / 256 threads = 4 elements.
+ * Thread tid covers column c = tid % 16 of rows tid/16 + 16j (j = 0..3): a warp
+ * reads 2 rows x 16 contiguous columns per instruction, same coalescing as the
+ * strided loop the single-buffer path uses. */
+constexpr int kItems = (kMB * kKB) / kThreads;
+
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
 
 #include <rocwmma/rocwmma.hpp>
@@ -70,12 +84,34 @@ __device__ __forceinline__ uint16_t r3d_f32_to_bf16_m64(float f) {
     return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 
+/* DBUF selects the k-slice pipeline (structure borrowed from llama-cpp-rdna-boosts
+ * block 06 MMB, gfx1100-validated): with DBUF the A staging buffer is doubled, so
+ * the NEXT slice's stage writes the other buffer and overlaps this slice's WMMA
+ * instead of serialising behind the stage->barrier->compute chain. Operand global
+ * loads are issued to registers one slice ahead (prefetch), so the post-barrier
+ * stage reads registers only.
+ *
+ * B stays single-buffered deliberately. Block 06 measured B's second buffer as a
+ * loss (their GLU 1225 -> 1433 ms): the extra LDS traffic costs more than the
+ * removed barrier buys. The single barrier before Bs is re-staged stays.
+ *
+ * Barrier proof for the DBUF schedule (per slice ks, buffers ab = ks&1):
+ *   prefetch(ks+1)          global -> regs; completes before the stage that reads them
+ *   stage_a(ks+1 -> !ab)    disjoint from the frag reads of ab this iteration
+ *   frag loads + mma        read As[ab] and Bs
+ *   sync                    every wave's frag reads of As[ab]/Bs are done
+ *   stage_b(ks+1 -> Bs)     now safe; Bs is dead from ks's frag loads
+ *   sync                    stage_b visible for ks+1; also orders stage_a(ks+1),
+ *                           whose write precedes this barrier in every thread's
+ *                           program order, so ks+1's frag loads of As[!ab] see it.
+ */
+template <bool DBUF>
 __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_kernel(
     const uint16_t* __restrict__ A, const uint16_t* __restrict__ B,
     uint16_t* __restrict__ Y, float* __restrict__ Yf,
     int M, int N, int K, int64_t a_pitch, int64_t b_pitch, int64_t y_pitch) {
 
-    __shared__ uint16_t As[kMB][kKB + kLdsPad];   /* [m][k] natural, row-major frag layout */
+    __shared__ uint16_t As[DBUF ? 2 : 1][kMB][kKB + kLdsPad];  /* [m][k] natural, row-major frag layout */
     __shared__ uint16_t Bs[kNB][kKB + kLdsPad];   /* [n][k]: col_major frag reads B[n][k] */
     __shared__ float    Ys[kMB][kNB + kLdsPad];   /* accumulator staging for guarded store */
 
@@ -91,30 +127,83 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_kernel(
     rocwmma::fill_fragment(fc0, 0.0f);
     rocwmma::fill_fragment(fc1, 0.0f);
 
-    for (int k0 = 0; k0 < K; k0 += kKB) {
-        __syncthreads();   /* previous slice's fragment reads are done in every wave */
-        for (int i = threadIdx.x; i < kMB * kKB; i += kThreads) {
-            const int r = i / kKB, c = i % kKB;
-            const int m = m0 + r, k = k0 + c;
-            As[r][c] = (m < M && k < K) ? A[(int64_t)m * a_pitch + k] : (uint16_t)0;
-        }
-        for (int i = threadIdx.x; i < kNB * kKB; i += kThreads) {
-            const int r = i / kKB, c = i % kKB;
-            const int n = n0 + r, k = k0 + c;
-            Bs[r][c] = (n < N && k < K) ? B[(int64_t)n * b_pitch + k] : (uint16_t)0;
-        }
-        __syncthreads();
+    /* Raw-bit staging of one slice into As[ab]: never construct a bf16 from a
+     * loaded uint16 (that CONVERTS; see the 6c7294e postmortem). */
+    const int c_col = threadIdx.x % kKB;          /* staging mapping (see kItems) */
+    const int r_row = threadIdx.x / kKB;
 
-        /* B^T's [k][n] tile is col_major at &Bs[n][0]: element (k, n) = ptr[n*ld + k],
-         * which is exactly Bs[n][k] with ld = the padded row stride. */
-        rocwmma::load_matrix_sync(fa,  reinterpret_cast<const bf16*>(&As[tw * 16][0]),
-                                  kKB + kLdsPad, rocwmma::mem_row_major);
-        rocwmma::load_matrix_sync(fb0, reinterpret_cast<const bf16*>(&Bs[tc * 16][0]),
-                                  kKB + kLdsPad);
-        rocwmma::load_matrix_sync(fb1, reinterpret_cast<const bf16*>(&Bs[(tc + 1) * 16][0]),
-                                  kKB + kLdsPad);
-        rocwmma::mma_sync(fc0, fa, fb0, fc0);
-        rocwmma::mma_sync(fc1, fa, fb1, fc1);
+    uint16_t areg[kItems], breg[kItems];
+    auto prefetch = [&](int k0) {
+        #pragma unroll
+        for (int j = 0; j < kItems; ++j) {
+            const int i = threadIdx.x + j * kThreads;
+            const int ra = i / kKB, ka = k0 + i % kKB;   /* == r_row + 16j, c_col */
+            const int ma = m0 + ra, n = n0 + i / kKB, kb = ka;
+            areg[j] = (ma < M && ka < K) ? A[(int64_t)ma * a_pitch + ka] : (uint16_t)0;
+            breg[j] = (n < N && kb < K)  ? B[(int64_t)n  * b_pitch + kb] : (uint16_t)0;
+        }
+    };
+    auto stage_a = [&](int ab) {
+        #pragma unroll
+        for (int j = 0; j < kItems; ++j)
+            As[ab][r_row + j * (kThreads / kKB)][c_col] = areg[j];
+    };
+    auto stage_b = [&]() {
+        #pragma unroll
+        for (int j = 0; j < kItems; ++j)
+            Bs[r_row + j * (kThreads / kKB)][c_col] = breg[j];
+    };
+
+    const int nks = (K + kKB - 1) / kKB;
+    if (DBUF) {
+        prefetch(0);
+        stage_a(0); stage_b();
+        __syncthreads();                          /* prologue slices visible */
+        for (int ks = 0; ks < nks; ++ks) {
+            if (ks + 1 < nks) prefetch((ks + 1) * kKB);
+            if (ks + 1 < nks) stage_a((ks + 1) & 1);   /* other A buffer: overlaps WMMA */
+
+            const bf16* ap = reinterpret_cast<const bf16*>(&As[ks & 1][tw * 16][0]);
+            const bf16* bp0 = reinterpret_cast<const bf16*>(&Bs[tc * 16][0]);
+            const bf16* bp1 = reinterpret_cast<const bf16*>(&Bs[(tc + 1) * 16][0]);
+            /* B^T's [k][n] tile is col_major at &Bs[n][0]: element (k, n) = ptr[n*ld + k],
+             * which is exactly Bs[n][k] with ld = the padded row stride. */
+            rocwmma::load_matrix_sync(fa,  ap,  kKB + kLdsPad, rocwmma::mem_row_major);
+            rocwmma::load_matrix_sync(fb0, bp0, kKB + kLdsPad);
+            rocwmma::load_matrix_sync(fb1, bp1, kKB + kLdsPad);
+            rocwmma::mma_sync(fc0, fa, fb0, fc0);
+            rocwmma::mma_sync(fc1, fa, fb1, fc1);
+
+            __syncthreads();                      /* As[ab]/Bs reads finished */
+            if (ks + 1 < nks) stage_b();          /* Bs single-buffered: after the barrier */
+            __syncthreads();                      /* next slices visible */
+        }
+    } else {
+        for (int k0 = 0; k0 < K; k0 += kKB) {
+            __syncthreads();   /* previous slice's fragment reads are done in every wave */
+            for (int i = threadIdx.x; i < kMB * kKB; i += kThreads) {
+                const int r = i / kKB, c = i % kKB;
+                const int m = m0 + r, k = k0 + c;
+                As[0][r][c] = (m < M && k < K) ? A[(int64_t)m * a_pitch + k] : (uint16_t)0;
+            }
+            for (int i = threadIdx.x; i < kNB * kKB; i += kThreads) {
+                const int r = i / kKB, c = i % kKB;
+                const int n = n0 + r, k = k0 + c;
+                Bs[r][c] = (n < N && k < K) ? B[(int64_t)n * b_pitch + k] : (uint16_t)0;
+            }
+            __syncthreads();
+
+            /* B^T's [k][n] tile is col_major at &Bs[n][0]: element (k, n) = ptr[n*ld + k],
+             * which is exactly Bs[n][k] with ld = the padded row stride. */
+            rocwmma::load_matrix_sync(fa,  reinterpret_cast<const bf16*>(&As[0][tw * 16][0]),
+                                      kKB + kLdsPad, rocwmma::mem_row_major);
+            rocwmma::load_matrix_sync(fb0, reinterpret_cast<const bf16*>(&Bs[tc * 16][0]),
+                                      kKB + kLdsPad);
+            rocwmma::load_matrix_sync(fb1, reinterpret_cast<const bf16*>(&Bs[(tc + 1) * 16][0]),
+                                      kKB + kLdsPad);
+            rocwmma::mma_sync(fc0, fa, fb0, fc0);
+            rocwmma::mma_sync(fc1, fa, fb1, fc1);
+        }
     }
 
     __syncthreads();   /* every wave's fragment LDS reads finished before Ys is written */
@@ -141,6 +230,7 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_kernel(
         * pass has the symbol to launch; the launcher below never dispatches it there. */
 
 namespace {
+template <bool DBUF>
 __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_kernel(
     const uint16_t*, const uint16_t*, uint16_t*, float*,
     int, int, int, int64_t, int64_t, int64_t) {}
@@ -148,6 +238,11 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_kernel(
 
 #endif
 
+/* Variant selection at launch, both instantiated in the same TU:
+ *   R3D_GEMM_DBUF=1  -> the double-buffered k-slice pipeline (DBUF)
+ *   default          -> the original single-buffer schedule (single-buffer)
+ * The default stays on the shipped schedule until the DBUF path passes kbench and the
+ * serve A/B; flipping the default is the promotion step, not this commit. */
 int r3d_gemm_nt_m64_launch(const void* A, const void* B, void* Y, float* Yf,
                            int M, int N, int K, int64_t a_pitch, int64_t b_pitch,
                            int64_t y_pitch, hipStream_t stream) {
@@ -169,16 +264,23 @@ int r3d_gemm_nt_m64_launch(const void* A, const void* B, void* Y, float* Yf,
         }
         return RAD_E_DEVICE;
     }
+    static const bool dbuf = getenv("R3D_GEMM_DBUF") != nullptr;
     dim3 grid((unsigned)((N + kNB - 1) / kNB), (unsigned)((M + kMB - 1) / kMB));
-    hipLaunchKernelGGL((gemm_nt_bf16_m64_kernel), grid, dim3(kThreads), 0, stream,
-                       (const uint16_t*)A, (const uint16_t*)B, (uint16_t*)Y, Yf,
-                       M, N, K, a_pitch, b_pitch, y_pitch);
+    if (dbuf)
+        hipLaunchKernelGGL((gemm_nt_bf16_m64_kernel<true>), grid, dim3(kThreads), 0, stream,
+                           (const uint16_t*)A, (const uint16_t*)B, (uint16_t*)Y, Yf,
+                           M, N, K, a_pitch, b_pitch, y_pitch);
+    else
+        hipLaunchKernelGGL((gemm_nt_bf16_m64_kernel<false>), grid, dim3(kThreads), 0, stream,
+                           (const uint16_t*)A, (const uint16_t*)B, (uint16_t*)Y, Yf,
+                           M, N, K, a_pitch, b_pitch, y_pitch);
     const hipError_t le = hipGetLastError();
     if (le != hipSuccess) fprintf(stderr, "libr3d: m64 launch FAILED (%s)\n",
                                  hipGetErrorName(le));
     else if (getenv("R3D_DEBUG_GEMM")) {
         static bool once = false;
-        if (!once) { once = true; fprintf(stderr, "libr3d: m64 WMMA tile launched\n"); }
+        if (!once) { once = true; fprintf(stderr, "libr3d: m64 WMMA tile launched (%s)\n",
+                                          dbuf ? "dbuf pipeline" : "single-buffer"); }
     }
     return le == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
