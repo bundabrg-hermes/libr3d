@@ -880,3 +880,46 @@ core/util/rad_util.cpp -I/opt/radiance-src{,/tools,/core,/abi}
 a_scale [M, K/128] f32 (sigmoid-filled, so strictly positive), b_scale [N, K/32]
 e8m0, b_ref present as the full exponent plane (a [N] per-row reduction is what
 the oGemmNtQ comment means, not the recorded shape), a_sum ABSENT in every case.
+
+## 2026-10-20: mul / sigmoid / rope_table / gdn_gated_rmsnorm -- elementwise holes closed, the GDN family opens
+
+With `gemm_nt_q` shipped, the 27B trunk's remaining holes were five recorded GDN
+ops plus three elementwise ones. A correction first: the previous session's note
+that `quant_act_fp8` (the producer of this GEMM's fp8 activations) "still has no
+device row" was wrong -- the band has shipped `quant_act_fp8_act` since MiniCPM,
+and the assessment table above never listed it as a hole. The missing producer
+never existed; today's sweep confirms the quantizer rows replay clean.
+
+Four rows, all fixture-gated against the real 27B pack (995-case nodraft):
+
+| row | op | worst rel_l2 (tol) | note |
+|---|---|---|---|
+| `mul_act` | mul | 0.00e+00 (6e-03) | bit-identical at n=6144 M=1..512 |
+| `sigmoid_act` | sigmoid | 0.00e+00 (6e-03) | the double-rounded exp pays off exactly |
+| `rope_table_f32` | rope_table | 1.9e-08 (1e-05) | first row where the sincosf-vs-double delta is *visible*: the store is f32, so the ~1 ULP difference surfaces at 1e-8 instead of hiding under a bf16 narrowing. Still 500x under the case tolerance. |
+| `gdn_gated_rmsnorm_bf16` | gdn_gated_rmsnorm | 9.9e-06 (6e-03) | tree-vs-sequential row sum, the same rounding class `rmsnorm_bf16` has always traded; 600x margin on real GDN data |
+
+Design notes that outlive this batch:
+
+* **`offlin` is a liar for linear walkers.** `ref_sigmoid` walks numel(Y) through
+  `offlin`, whose identity branch is contiguity -- a rank-2 with a pitch wider
+  than n reads *different elements* than a linear walk would. The `sigmoid` row
+  therefore refuses pitch > n even though `row2_pitch` (and the `add` row, which
+  walks per-row and agrees with offlin there) accepts it. Same class of trap as
+  the descale-pointer poisoning in the attention harnesses: matching ref means
+  matching its *index function*, not just its arithmetic.
+* **The GDN gate_rowoff is worth keeping as a first-class shape.** The 27B's
+  gated norm runs against a plain [M, 128] z today, but the engine's fused
+  [rows, heads*channels] slice walk costs one extra division in the kernel and
+  buys coverage of the fused epilogue the recurrent fold will produce.
+* **r3d_gemm_mxfp4.hip was compiled without the house `-ffp-contract=off`**
+  (CMakeLists source-property line missing). Its chains happen to contain no
+  contractible mul+add pattern, so nothing was wrong -- but the flag is a
+  per-TU promise, and one edit away from breaking silently. Line added.
+
+Next in the family, in fixture-sake order: `gdn_conv_update` (rolling [.., 3]
+conv state, one plane), `gdn_kkt_solve`, `gdn_chunk_scan` (both head_k 128, M to
+512), then `gdn_recurrent_update` last: it carries three encoded weight planes,
+which a device row cannot consume without a layout hook. The two unrecorded ops
+(`gdn_conv_prep`, `gdn_conv_recurrent_update`) wait on the dt_bias dtype fix
+upstream or on `--record-rows` once their siblings' kernels exist.

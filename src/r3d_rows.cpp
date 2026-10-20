@@ -290,6 +290,39 @@ static const RadOperandSpec oGather[] = {
     { "idx", RAD_OPD_IN,  0 },
     { "y",   RAD_OPD_OUT, 0 },
 };
+/* rope_table: verbatim libref (ref_registry.cpp pRopeTable/oRopeTable). The 27B graph
+ * issues it for its partial rotary (rot 64 of head_dim 256); libr4d declares the same
+ * table, so a mixed rig dedupes it with first-declarer-wins. */
+static const RadParamSpec pRopeTable[] = {
+    { "M",             RAD_P_INT, RAD_REQUIRED },
+    { "rot",           RAD_P_INT, RAD_REQUIRED },
+    { "theta",         RAD_P_F64, RAD_REQUIRED },
+    { "scale",         RAD_P_F64, RAD_REQUIRED },
+    { "dtype",         RAD_P_STR, RAD_REQUIRED },
+    { "yarn_factor",   RAD_P_F64, RAD_OPTIONAL },
+    { "yarn_low",      RAD_P_F64, RAD_OPTIONAL },
+    { "yarn_high",     RAD_P_F64, RAD_OPTIONAL },
+    { "yarn_magnitude",RAD_P_F64, RAD_OPTIONAL },
+    { "head_dim",      RAD_P_INT, RAD_OPTIONAL },
+    { "ladder",        RAD_P_STR, RAD_OPTIONAL },
+};
+static const RadOperandSpec oRopeTable[] = {
+    { "positions", RAD_OPD_IN,  0 },
+    { "cos_sin",   RAD_OPD_OUT, 0 },
+};
+/* gdn_gated_rmsnorm: verbatim libref (pGatedNorm/oGatedNorm). */
+static const RadParamSpec pGatedNorm[] = {
+    { "M",        RAD_P_INT, RAD_REQUIRED },
+    { "channels", RAD_P_INT, RAD_REQUIRED },
+    { "eps",      RAD_P_F64, RAD_REQUIRED },
+    { "act",      RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oGatedNorm[] = {
+    { "x", RAD_OPD_IN,     0 },
+    { "z", RAD_OPD_IN,     0 },
+    { "w", RAD_OPD_WEIGHT, 0 },
+    { "o", RAD_OPD_OUT,    0 },
+};
 static const RadParamSpec pQuantActFp8[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -503,6 +536,21 @@ static const RadOpSchema kSchemas[] = {
         "y = a + b. `b` carrying exactly n elements against an output of M rows broadcasts "
         "along rows, and nothing else broadcasts at all. With `div`, y = rd(rd(a + b) / div), "
         "rd y's dtype." },
+      { "mul", pMnDtype, (int)(sizeof(pMnDtype)/sizeof(pMnDtype[0])),
+        oBinary, (int)(sizeof(oBinary)/sizeof(oBinary[0])),
+        "y = a * b, with the same one broadcast rule as `add`." },
+      { "sigmoid", pMnDtype, (int)(sizeof(pMnDtype)/sizeof(pMnDtype[0])),
+        oUnary, (int)(sizeof(oUnary)/sizeof(oUnary[0])),
+        "y = 1 / (1 + exp(-x))." },
+      { "rope_table", pRopeTable, (int)(sizeof(pRopeTable)/sizeof(pRopeTable[0])),
+        oRopeTable, (int)(sizeof(oRopeTable)/sizeof(oRopeTable[0])),
+        "the cos/sin plane a fused prologue reads instead of theta: cos then sin of "
+        "`rope`'s ladder at each position's own row of a [max_ctx, rot] table; a negative "
+        "position writes nothing." },
+      { "gdn_gated_rmsnorm", pGatedNorm, (int)(sizeof(pGatedNorm)/sizeof(pGatedNorm[0])),
+        oGatedNorm, (int)(sizeof(oGatedNorm)/sizeof(oGatedNorm[0])),
+        "o = x * rsqrt(mean_channels(x^2) + eps) * w * act(z). `act` is \"silu\" or "
+        "\"sigmoid\"." },
       { "gather_rows", pMnDtype, (int)(sizeof(pMnDtype)/sizeof(pMnDtype[0])),
         oGather, (int)(sizeof(oGather)/sizeof(oGather[0])),
         "y[i, :] = x[idx[i], :]. A negative index writes a zero row -- the padding convention a "
@@ -650,6 +698,16 @@ static const RadConstraint cBandMn[] = {
     { "n",     RAD_C_GE, 1, nullptr },
     { "dtype", RAD_C_IN, 0, "f32 bf16" },
 };
+/* rope_table: the kernel's ladder and refusal cover every rot >= 2 even (odd refused at
+ * launch, >1024 by the shared-array bound); yarn and the `head` ladder are refused there,
+ * so nothing else is constrained here. */
+static const RadConstraint cRopeTable[] = {
+    { "rot", RAD_C_GE, 2, nullptr },
+};
+static const RadConstraint cGatedNorm[] = {
+    { "channels", RAD_C_GE, 1, nullptr },
+    { "act",      RAD_C_IN, 0, "silu sigmoid" },
+};
 
 extern "C" int r3d_rad_rmsnorm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_embed_lookup(const RadArgs*, RadStream);
@@ -657,6 +715,7 @@ extern "C" int r3d_rad_kv_store(const RadArgs*, RadStream);
 extern "C" int r3d_rad_act_mul(const RadArgs*, RadStream);
 extern "C" int r3d_rad_cast(const RadArgs*, RadStream);
 extern "C" int r3d_rad_rope(const RadArgs*, RadStream);
+extern "C" int r3d_rad_rope_table(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt(const RadArgs*, RadStream);
 extern "C" int r3d_rad_logits_gemm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q(const RadArgs*, RadStream);
@@ -678,7 +737,10 @@ extern "C" int r3d_rad_sample_logprobs(const RadArgs*, RadStream);
 extern "C" int r3d_rad_quant_act_fp8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gated_quant_fp8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_add(const RadArgs*, RadStream);
+extern "C" int r3d_rad_mul(const RadArgs*, RadStream);
+extern "C" int r3d_rad_sigmoid(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gather_rows(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gdn_gated_rmsnorm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_silu_mul(const RadArgs*, RadStream);
 extern "C" int r3d_rad_quant_act_i8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_row_topk(const RadArgs*, RadStream);
@@ -772,6 +834,17 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cRopeRow, 2, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_rope },
+
+{ "rope_table_f32", "rope_table", "attn",
+  "cos/sin of the rope ladder per position row, one block per position, the ladder "
+  "built once in shared per row",
+  "rot even in [2, 1024]; [max_ctx, rot] table with unit last stride; a position "
+  "outside the table writes its row nothing (ref skips it the same); yarn and the "
+  "`head` ladder have no row here",
+  "i32/i64 positions, f32 or bf16 table, fp32 angles through the accurate sincosf",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cRopeTable, 1, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_rope_table },
 
 { "gemm_nt_bf16", "gemm_nt", "gemm",
   "dense bf16 GEMM, 64x64 output tile per workgroup, K in 16-wide LDS slices",
@@ -985,6 +1058,24 @@ static const RadKernelInfo kRows[] = {
   cBandMn, 2, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_add },
 
+{ "mul_act", "mul", "band",
+  "elementwise product over dense [rows, n] rows, one thread a lane",
+  "f32/bf16 operands; b broadcasts along rows only at exactly n elements; holey row "
+  "pitches are refused (the kernel walks the range linearly, ref's offlin not)",
+  "f32/bf16 in and out",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cBandMn, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_mul },
+
+{ "sigmoid_act", "sigmoid", "band",
+  "the double-rounded sigmoid band, walked linearly over numel(Y)",
+  "f32/bf16; dense layouts only (see r3d_band.hip on why a pitch wider than n is "
+  "refused here and not in `add`)",
+  "f32/bf16 in and out, exp through the same double-rounded form the quantizers use",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cBandMn, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_sigmoid },
+
 { "gather_rows_act", "gather_rows", "band",
   "row gather with the zero-row padding convention",
   "f32/bf16 rows, i32 indices; a negative index writes a zero row; an index >= the "
@@ -994,6 +1085,22 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cBandMn, 2, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gather_rows },
+
+/* ---- the Gated DeltaNet family (see r3d_gdn.hip): 48 of the qwen3.5-27B trunk's 64
+ * layers run on these. Op schemas are verbatim libref, so libr4d (gfx12) and libr3d
+ * dedupe them cleanly on a mixed rig -- and once the last GDN row lands, a 27B program
+ * splits per-op between the two libraries instead of refusing to load. */
+
+{ "gdn_gated_rmsnorm_bf16", "gdn_gated_rmsnorm", "gdn",
+  "channel-RMS norm gated by silu/sigmoid of a companion plane, one block per "
+  "(token, value head) row",
+  "channels up to 65535; x and o dense-row [rows, channels] (a rank-2 pitch wider than "
+  "the row is fine, wider unit-strides are not); z may be a column slice of a fused "
+  "[rows, heads*channels] row -- the engine's own gate_rowoff walk",
+  "f32/bf16 x/z/o, f32-or-bf16 weight read as stored, f32 row sum and scale chain",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cGatedNorm, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gdn_gated_rmsnorm },
 
 /* ---- the three bands MiniCPM5-2B's graph names at resolve (see r3d_more.hip). The
  * engine refused to START without them: weightless device bands have no host stand-in. */

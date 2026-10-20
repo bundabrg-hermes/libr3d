@@ -1,5 +1,7 @@
 /* r3d_band.hip -- the four device-band ops the MiniCPM5-2B bf16 graph declares and no
- * other loadable plugin covers on RDNA3: quant_act_fp8, gated_quant_fp8, add, gather_rows.
+ * other loadable plugin covers on RDNA3: quant_act_fp8, gated_quant_fp8, add, gather_rows;
+ * plus `mul` and `sigmoid`, which the qwen35 27B graph adds (its gated norms issue sigmoid
+ * on the gate and mul at n=6144 over the trunk width).
  *
  * These are the ops the planner cannot push to a host kernel (weightless, device-band),
  * so until this file exists a bf16 trunk that quantises its MLP activations will not
@@ -195,12 +197,14 @@ __global__ __launch_bounds__(kThreads) void gated_quant_fp8_kernel(
     }
 }
 
-/* ------------------------------------------------------------------ add */
+/* ------------------------------------------------------------------ add / mul */
+/* One kernel, ref's shared elementwise2: mode 0 adds (with the double-rounded `div`
+ * form), mode 1 multiplies (ref ignores `div` for the product -- always passed off). */
 __global__ __launch_bounds__(kThreads) void add_kernel(
     const uint8_t* __restrict__ A, uint32_t dtA, int64_t a_pitch, int64_t as,
     const uint8_t* __restrict__ B, uint32_t dtB, int64_t b_pitch, int64_t bs,
     uint8_t* __restrict__ Y, uint32_t dtY, int64_t y_pitch, int64_t ys,
-    int64_t n, float div, int use_div) {
+    int64_t n, float div, int use_div, int mode) {
     const int64_t r = blockIdx.x;
     const uint8_t* __restrict__ ab = A + r * a_pitch;
     const uint8_t* __restrict__ bb = B + r * b_pitch;
@@ -208,7 +212,7 @@ __global__ __launch_bounds__(kThreads) void add_kernel(
     for (int64_t i = (int64_t)threadIdx.x; i < n; i += (int64_t)kThreads) {
         const float u = ldt2(ab, dtA, i * as);
         const float v = ldt2(bb, dtB, i * bs);
-        float s = u + v;
+        float s = mode ? u * v : u + v;
         if (use_div) {
             if (dtY == RAD_F32) s = s / div;
             else s = r3d_bf16_to_f32(r3d_f32_to_bf16(s)) / div;
@@ -234,6 +238,19 @@ __global__ __launch_bounds__(kThreads) void gather_rows_kernel(
     const uint8_t* __restrict__ xb = x + r * x_pitch;
     for (int64_t i = (int64_t)threadIdx.x; i < n; i += (int64_t)kThreads)
         stt2(yb, dtY, i * ys, ldt2(xb, dtX, i * xs));
+}
+
+/* ------------------------------------------------------------------ sigmoid */
+/* y = 1/(1+exp(-x)) over numel(Y) elements, ref's double-rounded exp (r3d_sigmoid).
+ * Walked as a dense [rows, n]: ref strides the whole tensor with offlin, whose
+ * non-identity branch only fires for layouts the entry below refuses -- so linear
+ * element indices and ref's offsets agree for everything that reaches this kernel. */
+__global__ __launch_bounds__(kThreads) void sigmoid_kernel(
+    const uint8_t* __restrict__ x, uint32_t dtX,
+    uint8_t* __restrict__ y, uint32_t dtY, int64_t nel) {
+    const int64_t stride0 = (int64_t)gridDim.x * kThreads;
+    for (int64_t i = (int64_t)blockIdx.x * kThreads + threadIdx.x; i < nel; i += stride0)
+        stt2(y, dtY, i, r3d_sigmoid(ldt2(x, dtX, i)));
 }
 
 /* ------------------------------------------------------------------ entry helpers */
@@ -347,7 +364,55 @@ extern "C" int r3d_rad_add(const RadArgs* a, RadStream s) {
         (const uint8_t*)A->data, A->dtype, rad_dtype_bytes(A->dtype, ap), 1,
         (const uint8_t*)B->data, B->dtype, rad_dtype_bytes(B->dtype, bp), 1,
         (uint8_t*)Y->data, Y->dtype, rad_dtype_bytes(Y->dtype, yp), 1,
-        n, div, use_div);
+        n, div, use_div, 0);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+extern "C" int r3d_rad_mul(const RadArgs* a, RadStream s) {
+    const RadTensor* A = rad_arg_in(a, 0);
+    const RadTensor* B = rad_arg_in(a, 1);
+    const RadTensor* Y = rad_arg_in(a, 2);
+    if (!A || !B || !Y) return RAD_E_INVAL;
+    if (!dt_act_ok(A->dtype) || !dt_act_ok(B->dtype) || !dt_act_ok(Y->dtype)) return RAD_E_DTYPE;
+    const int64_t n = param_i(a, "n", rad_tensor_numel(Y));
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rad_tensor_numel(Y) / n;
+    if (rows <= 0 || rows > 0xffff) return RAD_E_SHAPE;
+    if (rad_tensor_numel(A) < rows * n) return RAD_E_SHAPE;
+    const bool bcast = rad_tensor_numel(B) == n && rows > 1;   /* ref's one broadcast rule */
+    if (!bcast && rad_tensor_numel(B) < rows * n) return RAD_E_SHAPE;
+    int64_t ap = 0, bp = 0, yp = 0;
+    if (row2_pitch(A, n, &ap)) return RAD_E_STRIDE;
+    if (row2_pitch(Y, n, &yp)) return RAD_E_STRIDE;
+    if (bcast) { if (row2_pitch(B, n, &bp)) return RAD_E_STRIDE; bp = 0; }
+    else if (row2_pitch(B, n, &bp)) return RAD_E_STRIDE;
+    add_kernel<<<dim3((uint32_t)rows), dim3(kThreads), 0, (hipStream_t)(uintptr_t)s>>>(
+        (const uint8_t*)A->data, A->dtype, rad_dtype_bytes(A->dtype, ap), 1,
+        (const uint8_t*)B->data, B->dtype, rad_dtype_bytes(B->dtype, bp), 1,
+        (uint8_t*)Y->data, Y->dtype, rad_dtype_bytes(Y->dtype, yp), 1,
+        n, 1.0f, 0, 1);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+extern "C" int r3d_rad_sigmoid(const RadArgs* a, RadStream s) {
+    const RadTensor* X = rad_arg_in(a, 0);
+    const RadTensor* Y = rad_arg_in(a, 1);
+    if (!X || !Y) return RAD_E_INVAL;
+    if (!dt_act_ok(X->dtype) || !dt_act_ok(Y->dtype)) return RAD_E_DTYPE;
+    const int64_t nel = rad_tensor_numel(Y);
+    if (nel <= 0 || nel > 0x7fffffffLL || rad_tensor_numel(X) < nel) return RAD_E_SHAPE;
+    const int64_t n = param_i(a, "n", nel);
+    if (n <= 0) return RAD_E_SHAPE;
+    /* Dense only: the kernel walks the element range linearly, and ref's offlin agrees
+     * with that only while the [rows, n] layout is hole-free -- row2_pitch alone would
+     * accept a pitch wider than n, where offlin would read different elements. */
+    int64_t p;
+    if (row2_pitch(X, n, &p) || (X->rank == 2 && p != n)) return RAD_E_STRIDE;
+    if (row2_pitch(Y, n, &p) || (Y->rank == 2 && p != n)) return RAD_E_STRIDE;
+    const int64_t blocks = (nel + kThreads - 1) / kThreads;
+    sigmoid_kernel<<<dim3((uint32_t)(blocks < 65535 ? blocks : 65535)), dim3(kThreads), 0,
+                     (hipStream_t)(uintptr_t)s>>>(
+        (const uint8_t*)X->data, X->dtype, (uint8_t*)Y->data, Y->dtype, nel);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 

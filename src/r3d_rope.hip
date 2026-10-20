@@ -172,3 +172,97 @@ extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
                            mode, theta, div);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
+
+/* ------------------------------------------------------------------ rope_table */
+/* The cos/sin plane a fused prologue reads instead of theta: row `pos[m]` of a
+ * [rows, rot] table, cos in the first half of the row and sin in the second. Rows
+ * outside [0, rows) write nothing -- ref `continue`s on them, and a guarded-allocation
+ * sweep sees exactly that.
+ *
+ * Same ladder and the same sincosf choice as the rope kernel above, so a fused prologue
+ * reading this table and the in-place rope agree at the last operation of the ladder.
+ * The delta ref_cos(double) would make is ~1 f32-ULP: at an f32 store it surfaces as
+ * ~1e-7 rel_l2, three-plus orders under any recorded tolerance. */
+template <typename Tok>
+__global__ __launch_bounds__(kThreads) void rope_table_kernel(
+    const Tok* __restrict__ pos, uint8_t* __restrict__ cs, uint32_t dt_cs,
+    int64_t cs_pitch_bytes, int64_t pos_stride,
+    uint32_t rot, uint32_t half, int64_t table_rows, float theta, float div) {
+    __shared__ float inv[512];                    /* the row's ladder; rot <= 1024 refused at entry */
+    const int64_t pp = (int64_t)pos[blockIdx.x * pos_stride];
+    if (pp < 0 || pp >= table_rows) return;
+    for (uint32_t i = threadIdx.x; i < half; i += kThreads)
+        inv[i] = 1.0f / (float)pow((double)theta, (double)((float)(2u * i) / (float)rot));
+    __syncthreads();
+    const float p = (float)pp / div;
+    uint8_t* __restrict__ row = cs + pp * cs_pitch_bytes;
+    for (uint32_t i = threadIdx.x; i < half; i += kThreads) {
+        const float ang = p * inv[i];
+        float s, c;
+        sincosf(ang, &s, &c);
+        if (dt_cs == RAD_F32) {
+            ((float*)row)[i] = c;
+            ((float*)row)[half + i] = s;
+        } else {
+            uint16_t* h = (uint16_t*)row;
+            h[i] = r3d_f32_to_bf16(c);
+            h[half + i] = r3d_f32_to_bf16(s);
+        }
+    }
+}
+
+extern "C" int r3d_rad_rope_table(const RadArgs* a, RadStream s) {
+    const RadTensor* pos = rad_arg_in(a, 0);
+    const RadTensor* cs  = rad_arg_in(a, 1);
+    if (!pos || !cs) return RAD_E_INVAL;
+    if (pos->dtype != RAD_I32 && pos->dtype != RAD_I64) return RAD_E_DTYPE;
+    if (cs->dtype != RAD_F32 && cs->dtype != RAD_BF16) return RAD_E_DTYPE;
+
+    long long rot_ll = 0;
+    if (!rad_args_geti(a, "rot", &rot_ll)) return RAD_E_INVAL;
+    if (rot_ll < 2 || (rot_ll & 1) || rot_ll > 1024) return RAD_E_SHAPE;   /* __shared__ bound */
+    const int64_t rot = rot_ll;
+
+    /* Refusals for anything whose angles this kernel would not reproduce: YaRN blends
+     * the ladder and scales the plane, and a `head` ladder denominates by head_dim.
+     * A `rotary` ladder is the no-ladder case for ref, so it is accepted. */
+    const char* lad = rad_args_gets(a, "ladder");
+    if (lad && std::strcmp(lad, "rotary")) return RAD_E_UNSUPPORTED;
+    if (rad_args_getf_or(a, "yarn_factor", 0.0) != 0.0 ||
+        rad_args_getf_or(a, "yarn_low", 0.0) != 0.0 ||
+        rad_args_getf_or(a, "yarn_high", 0.0) != 0.0 ||
+        rad_args_getf_or(a, "yarn_magnitude", 1.0) != 1.0) return RAD_E_UNSUPPORTED;
+
+    const float theta = (float)rad_args_getf_or(a, "theta", 10000.0);
+    const float scale = (float)rad_args_getf_or(a, "scale", 1.0);
+    const float div = scale != 0.0f ? scale : 1.0f;
+
+    if (pos->rank >= 2) return RAD_E_UNSUPPORTED;    /* multi-component positions */
+    const int64_t pos_stride = pos->rank >= 1 ? pos->stride[pos->rank - 1] : 1;
+    const int64_t M = rad_tensor_numel(pos);
+    const int64_t numel_cs = rad_tensor_numel(cs);
+    if (M <= 0 || M > 0x7fffffffLL) return RAD_E_SHAPE;
+    if (numel_cs % rot) return RAD_E_SHAPE;
+    const int64_t table_rows = numel_cs / rot;
+
+    /* The table's row pitch: a [rows, rot] rank-2 with unit last stride, or a bare
+     * rank-1 walked as rows of rot (ref's offlin is the identity on it). */
+    int64_t cs_pitch;
+    if (cs->rank <= 1) cs_pitch = rot;
+    else if (cs->rank == 2 && cs->stride[1] == 1) cs_pitch = cs->stride[0];
+    else return RAD_E_STRIDE;
+
+    hipStream_t stream = (hipStream_t)(uintptr_t)s;
+    const uint32_t half = (uint32_t)(rot / 2);
+    if (pos->dtype == RAD_I32)
+        hipLaunchKernelGGL((rope_table_kernel<int32_t>), dim3((uint32_t)M), dim3(kThreads),
+                           0, stream, (const int32_t*)pos->data, (uint8_t*)cs->data, cs->dtype,
+                           rad_dtype_bytes(cs->dtype, cs_pitch), pos_stride,
+                           (uint32_t)rot, half, table_rows, theta, div);
+    else
+        hipLaunchKernelGGL((rope_table_kernel<int64_t>), dim3((uint32_t)M), dim3(kThreads),
+                           0, stream, (const int64_t*)pos->data, (uint8_t*)cs->data, cs->dtype,
+                           rad_dtype_bytes(cs->dtype, cs_pitch), pos_stride,
+                           (uint32_t)rot, half, table_rows, theta, div);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
