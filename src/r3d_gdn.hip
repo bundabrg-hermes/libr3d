@@ -54,10 +54,11 @@ constexpr uint32_t kWarps   = kThreads / 32;
 __device__ __forceinline__ float r3d_exp_f(float x) { return (float)exp((double)x); }
 __device__ __forceinline__ float r3d_log1p_f(float x) { return (float)log1p((double)x); }
 __device__ __forceinline__ float r3d_sigmoid(float x) { return 1.0f / (1.0f + r3d_exp_f(-x)); }
-/* ref_common.h act_softplus, two-sided form with the large-x cutoff, verbatim. */
+/* ref_common.h act_softplus, two-sided form with the large-x cutoff, verbatim: BOTH branches
+ * take log1p of exp(+/-x) -- the exp is the whole function, as a -inf gate exponent proved. */
 __device__ __forceinline__ float r3d_softplus(float x, float thr) {
     if (x > thr) return x;
-    return x > 0.0f ? x + r3d_log1p_f(-x) : r3d_log1p_f(x);
+    return x > 0.0f ? x + r3d_log1p_f(r3d_exp_f(-x)) : r3d_log1p_f(r3d_exp_f(x));
 }
 
 __device__ __forceinline__ float r3d_bf16_to_f32(uint16_t h) {
