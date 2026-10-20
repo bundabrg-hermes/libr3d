@@ -20,12 +20,15 @@ mkdir -p "$OUT"
 
 stop_serve() {
   docker rm -f "$NAME" >/dev/null 2>&1 || true
-  # a GPU container's removal can lag its kill (device teardown); wait until
-  # the name is actually free, or the next docker run conflicts
-  for i in $(seq 1 30); do
-    docker inspect "$NAME" >/dev/null 2>&1 || break
-    sleep 2
+  # a GPU container's removal can lag its kill (device teardown) — measured
+  # over 60 s once. Wait until the name is actually free or the next docker
+  # run conflicts with a confusing daemon error.
+  for i in $(seq 1 120); do
+    docker inspect "$NAME" >/dev/null 2>&1 || return 0
+    sleep 1
   done
+  echo "FATAL: $NAME still present 120 s after rm -f; refusing to run" >&2
+  return 1
 }
 
 start_serve() {
