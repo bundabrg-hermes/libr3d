@@ -761,12 +761,22 @@ The graph column reflects ops with recorded cases, so it also under-reports
 `{n_head_v}`. kbench then declines 40 `gdn_conv_prep` cases ("operand 'dt_bias'
 is a weight and the declaration bound none to it") and substitutes
 `ssm_norm.weight` (128) for `dt_bias` (wants 48) on `gdn_conv_recurrent_update`.
-The check that fires is in `tools/rad_kbench.cpp`, so this is a harness-side
-substitution failure -- whether the engine's loader casts bf16 planes behind
-f32-declared weights is still unverified, and a real load attempt would settle
-it. The container's recipe casts only `ssm_ab.weight` (`cast dtype=bf16`), so
-re-converting with f32 casts for those three vectors is the cheap workaround if
-the loader turns out to be strict.
+The check that fires is in `tools/rad_kbench.cpp`, so it is a harness-side
+substitution failure, and an engine load settled it: against the skeleton the
+engine accepts the container outright (`model: qwen35 arch=qwen35
+quant=fp8_e4m3 64 layers`, `declare: 1297 ops, 1600 weights, 64 buffers, 4 KV
+groups`) with no complaint about those weights. The recipe casts only
+`ssm_ab.weight`; no f32 cast for the other two is needed to load.
+
+That load also names the op list the engine declares for this trunk, which is
+the authoritative hole inventory: **seven** GDN ops, not the five the fixture
+matrix shows (`gdn_conv_prep` and `gdn_conv_recurrent_update` are in the program
+but recorded no case), plus `gemm_nt_q`, `mul`, `sigmoid`, `rope_table`. Run
+capped (`--memory 6g`, host backend, no device) it reached placement and stopped
+on arithmetic, not on the model: static weights want 12.99 GiB of the 12.99 GiB
+claimable, so KV gets nothing. Budget to remember for the real card: 12.99 GiB
+static + 2.41 GiB activation arena + ~129 MiB step staging -- i.e. the 24 GB
+gfx1100 holds it alone, not beside the fixture serve.
 
 **Feasibility, stated plainly.** On gfx1100 the trunk's shape arithmetic is not
 the problem -- 15.6 GiB of weights fit the 24 GB card and GDDR6 at ~480 GB/s
