@@ -359,6 +359,30 @@ static const RadOperandSpec oKktSolve[] = {
     { "cu",   RAD_OPD_IN,  0 },
     { "A",    RAD_OPD_OUT, 0 },
 };
+/* gdn_chunk_scan: verbatim libref (pChunkScan/oChunkScan), including the optional h0/ht/
+ * state_idx operands and the optional f64 `scale` and `state_fp16` parameters (ref reads the
+ * first, ignores the second). */
+static const RadParamSpec pChunkScan[] = {
+    { "M",          RAD_P_INT,   RAD_REQUIRED },
+    { "head_k",     RAD_P_INT,   RAD_REQUIRED },
+    { "head_v",     RAD_P_INT,   RAD_REQUIRED },
+    { "chunk",      RAD_P_INT,   RAD_DERIVED, RAD_PROLE_SEQ_CHUNK },
+    { "scale",      RAD_P_F64,   RAD_OPTIONAL },
+    { "state_fp16", RAD_P_INT,   RAD_OPTIONAL },
+};
+static const RadOperandSpec oChunkScan[] = {
+    { "q",         RAD_OPD_IN,  0 },
+    { "k",         RAD_OPD_IN,  0 },
+    { "v",         RAD_OPD_IN,  0 },
+    { "A",         RAD_OPD_IN,  0 },
+    { "g",         RAD_OPD_IN,  0 },
+    { "beta",      RAD_OPD_IN,  0 },
+    { "h0",        RAD_OPD_IN,  1 },
+    { "cu",        RAD_OPD_IN,  0 },
+    { "o",         RAD_OPD_OUT, 0 },
+    { "ht",        RAD_OPD_OUT, 1 },
+    { "state_idx", RAD_OPD_IN,  1 },
+};
 static const RadParamSpec pQuantActFp8[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -765,6 +789,14 @@ static const RadConstraint cKktSolve[] = {
     { "head_k", RAD_C_GE, 1, nullptr },
     RAD_CEQ("chunk", 64),
 };
+/* chunk_scan: head_k 128 is the register bound (the state column is a thread's register
+ * array), head_v <= 128 the one-column-per-thread block; chunk 64 is the shared c64 value. */
+static const RadConstraint cChunkScan[] = {
+    RAD_CEQ("head_k", 128),
+    { "head_v", RAD_C_GE, 1,    nullptr },
+    { "head_v", RAD_C_LE, 128,  nullptr },
+    RAD_CEQ("chunk", 64),
+};
 
 extern "C" int r3d_rad_rmsnorm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_embed_lookup(const RadArgs*, RadStream);
@@ -800,6 +832,7 @@ extern "C" int r3d_rad_gather_rows(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gdn_gated_rmsnorm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gdn_conv_update(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gdn_kkt_solve(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gdn_chunk_scan(const RadArgs*, RadStream);
 extern "C" int r3d_rad_silu_mul(const RadArgs*, RadStream);
 extern "C" int r3d_rad_quant_act_i8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_row_topk(const RadArgs*, RadStream);
@@ -1188,6 +1221,25 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cKktSolve, 2, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gdn_kkt_solve },
+
+{ "gdn_chunk_scan_bf16", "gdn_chunk_scan", "gdn",
+  "the chunked delta-rule scan W = beta(V - e^g K S^T), V' = A W, O = scale e^g Q S^T + sA V', "
+  "S = e^{g_last} S + V'^T K', one block per (sequence, v head); the chunk recurrence is "
+  "serial by nature, so the transposed f32 state lives in one-column-per-thread register "
+  "arrays and every chain walks the oracle's order",
+  "head_k 128 (register bound: the state column IS a thread's register array), head_v up to "
+  "128 (one value column per thread), chunk 64 (the pack's and the c64 family's; derived from "
+  "A's shape when the parameter is absent); q/k/v/A/o dense last stride with wider row pitch "
+  "fine; h0/ht strides read off the tensor (a paged state cache is page-padded); state_idx "
+  "rows may be wider than one slot (column 0 is the slot), a negative slot skips the row's "
+  "outputs and state exactly as the reference's continue does",
+  "f32/bf16 q/k/v/A/o, f32-or-bf16 g/beta read as stored, f32 h0/ht state planes; every "
+  "ascending-d dot, the descending-in-place V' = A W, and the state update are f32 chains in "
+  "the oracle's order over exact widening -- bit-exact by construction, the scalar sibling of "
+  "libr4d's k128_c64 row",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cChunkScan, 4, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gdn_chunk_scan },
 
 /* ---- the three bands MiniCPM5-2B's graph names at resolve (see r3d_more.hip). The
  * engine refused to START without them: weightless device bands have no host stand-in. */

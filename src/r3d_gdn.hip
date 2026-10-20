@@ -33,6 +33,11 @@
  * chain, a chain a thread-owns-column kernel can walk in ref's exact order, so this row is
  * bit-exact against the oracle without ever touching a WMMA fragment (libr4d's blocked-merge
  * sibling on gfx12 is not).
+ *
+ * gdn_chunk_scan (fourth member): the chunked delta-rule scan -- the serial-chunk recurrence
+ * means no chunk grid axis, so one block per (sequence, v head) carries the transposed f32
+ * state in one-column-per-thread register arrays and walks every ref chain (ascending d and j,
+ * literal bracketings) unrolled; bit-exact by construction the same way, see the section.
  */
 #include <cstring>
 
@@ -242,6 +247,151 @@ __global__ __launch_bounds__(kKktThreads) void gdn_kkt_solve_kernel(
      * 64-element store. */
     for (int64_t i = 0; i < L; ++i)
         stt2(A + (tb + i) * A_s0b + h * A_s1b, dtA, jj, (i >= jj) ? col[i] : 0.0f);
+}
+
+/* ---- gdn_chunk_scan -----------------------------------------------------------------------
+ * W = beta.(V - e^g K S^T), V' = A W, O = scale e^g Q S^T + sA V', S = e^{g_last} S + V'^T K' --
+ * ref_gdn.cpp's chunked delta-rule scan, the family's fourth member and the 27B's last big
+ * device-row hole (head_k=head_v=128, chunk 64, q/k/v/o/A bf16, g/beta f32, h0/ht f32 rank-4
+ * state planes, state_idx i32 with a possibly-wider row pitch, scale ~1/sqrt(head_k) per case).
+ *
+ * Unlike kkt_solve, the chunks are NOT independent: W reads the state the previous chunk left,
+ * so the chunk recurrence is serial and there is no free chunk grid axis. One block per
+ * (sequence, v head) -- ref's own REF_PAR_FOR(N*H) decomposition -- and the state lives
+ * TRANSPOSED, one thread owning one value column e of St[d][e] in registers (head_k=128 f32 =
+ * 128 VGPRs/thread at 128 threads, launch_bounds(128,1) leaves the 256-register budget).
+ *
+ * BIT-EXACT BY CONSTRUCTION, again by walking ref's chains rather than racing them: every
+ * ascending-d dot (W's acc, O's inr, the sA row products) is an unrolled f32 chain over the
+ * thread's own state registers and exact bf16-widened loads; V' = A W runs the j-ascending
+ * chain DESCENDING in i so the in-place W buffer is overwritten only after its last consumer;
+ * the state update is one el-multiply before a j-ascending += chain (per element the same
+ * order ref writes); ref's bracketings are literal: bc*(v - ge*acc), (scale*exp(dg))*row,
+ * vp*(gs*k). The sA row and the staged g/beta are block broadcasts through LDS with barriers
+ * outside every predicate -- threads that own no column (e >= head_v) still march through all
+ * barriers.
+ *
+ * LDS: the W->V' buffer (chunk x head_v f32, dynamic, up to 32 KB) + three 64-float broadcasts.
+ * A negative state_idx row skips the block exactly as ref skips the (n,h) row -- no o write,
+ * no ht write. h0 absent is a zero initial state; ht absent stores nothing; an empty sequence
+ * still replays h0 into ht, as ref's loop structure does.
+ */
+constexpr uint32_t kScanThreads = 128;   /* one value column per thread: head_v <= 128 */
+constexpr int32_t  kScanK       = 128;   /* the state column length: head_k == 128, register-bound */
+constexpr uint32_t kScanChunk   = 64;    /* the pack's chunk, kkt_solve's and libr4d's */
+
+__global__ __launch_bounds__(kScanThreads, 1) void gdn_chunk_scan_kernel(
+    const uint8_t* __restrict__ q,  uint32_t dtQ, int64_t q_s0b, int64_t q_s1b,
+    const uint8_t* __restrict__ k,  uint32_t dtK, int64_t k_s0b, int64_t k_s1b,
+    const uint8_t* __restrict__ v,  uint32_t dtV, int64_t v_s0b, int64_t v_s1b,
+    const uint8_t* __restrict__ A,  uint32_t dtA, int64_t A_s0b, int64_t A_s1b,
+    const uint8_t* __restrict__ g,  uint32_t dtG, int64_t g_s0b,
+    const uint8_t* __restrict__ bt, uint32_t dtB, int64_t b_s0b,
+    const uint8_t* __restrict__ h0, uint32_t dtH, int64_t h_s0b, int64_t h_s1b, int64_t h_s2b,
+    uint8_t* __restrict__ o,        uint32_t dtO, int64_t o_s0b, int64_t o_s1b,
+    uint8_t* __restrict__ ht,       uint32_t dtT, int64_t t_s0b, int64_t t_s1b, int64_t t_s2b,
+    const void* __restrict__ cu, uint32_t dtC,
+    const void* __restrict__ sidx, uint32_t dtS, int64_t sw,
+    int64_t V, int64_t vW, int64_t grp, float scale) {
+    extern __shared__ float s_W[];   /* [kScanChunk, vW]: W, then V' in place (descending i) */
+    __shared__ float s_gc[kScanChunk], s_bc[kScanChunk], s_row[kScanChunk];
+
+    const int64_t h = blockIdx.x, n = blockIdx.y, e = threadIdx.x;
+    const int64_t bos  = ldi_g(dtC, cu, n), slen = ldi_g(dtC, cu, n + 1) - bos;
+    const int64_t sn = sidx ? ldi_g(dtS, sidx, n * sw) : n;
+    if (sn < 0) return;                 /* a padded row owns no state; ref skips o and ht too */
+    const int64_t hk = h / grp;
+    const uint8_t* __restrict__ qb = q + hk * q_s1b;
+    const uint8_t* __restrict__ kb = k + hk * k_s1b;
+    const uint8_t* __restrict__ vb = v + h  * v_s1b;
+    const uint8_t* __restrict__ Ab = A + h  * A_s1b;
+    const bool own = e < V;
+
+    float st[kScanK];                   /* the state's column e, d-ascending; owns-guarded */
+    if (own) {
+        const uint8_t* __restrict__ hb =
+            h0 ? h0 + sn * h_s0b + h * h_s1b + e * h_s2b : nullptr;
+        #pragma unroll
+        for (int d = 0; d < kScanK; ++d) st[d] = hb ? ldt2(hb, dtH, d) : 0.0f;
+    }
+
+    for (int64_t c0 = 0; c0 < slen; c0 += kScanChunk) {
+        const int64_t L = (slen - c0 < kScanChunk) ? slen - c0 : kScanChunk;
+        const int64_t tb = bos + c0;
+        if (e < L) {
+            s_gc[e] = ldt2(g  + (tb + e) * g_s0b, dtG, h);
+            s_bc[e] = ldt2(bt + (tb + e) * b_s0b, dtB, h);
+        }
+        __syncthreads();
+
+        /* W = bc . (v - e^g K S^T): the d-ascending chain over this thread's column. */
+        if (own) {
+            for (int64_t j = 0; j < L; ++j) {
+                const uint8_t* __restrict__ kr = kb + (tb + j) * k_s0b;
+                float acc = 0.0f;
+                #pragma unroll
+                for (int d = 0; d < kScanK; ++d) acc += ldt2(kr, dtK, d) * st[d];
+                const float ge = r3d_exp_f(s_gc[j]);
+                s_W[j * vW + e] =
+                    s_bc[j] * (ldt2(vb + (tb + j) * v_s0b, dtV, e) - ge * acc);
+            }
+            /* V' = A W in place, i DESCENDING: row i consumes j <= i, so writing index i
+             * only clobbers slots no later (smaller-i) row reads. */
+            for (int64_t i = L - 1; i >= 0; --i) {
+                const uint8_t* __restrict__ ar = Ab + (tb + i) * A_s0b;
+                float acc = 0.0f;
+                for (int64_t j = 0; j <= i; ++j) acc += ldt2(ar, dtA, j) * s_W[j * vW + e];
+                s_W[i * vW + e] = acc;
+            }
+        }
+
+        /* O = (scale e^gi) Q S^T + sA V': sA row[j] = (scale e^{gi-gj}) (q_i . k_j) is one
+         * broadcast value per j -- computed by thread j, read by every column. Two barriers
+         * per row: row ready before reads, reads done before the next row overwrites. */
+        for (int64_t i = 0; i < L; ++i) {
+            if (e < L) {
+                const uint8_t* __restrict__ qr = qb + (tb + i) * q_s0b;
+                const uint8_t* __restrict__ kr = kb + (tb + e) * k_s0b;
+                float acc = 0.0f;
+                #pragma unroll
+                for (int d = 0; d < kScanK; ++d)
+                    acc += ldt2(qr, dtQ, d) * ldt2(kr, dtK, d);
+                s_row[e] = (scale * r3d_exp_f(s_gc[i] - s_gc[e])) * acc;
+            }
+            __syncthreads();
+            if (own) {
+                const uint8_t* __restrict__ qr = qb + (tb + i) * q_s0b;
+                float inr = 0.0f;
+                #pragma unroll
+                for (int d = 0; d < kScanK; ++d) inr += ldt2(qr, dtQ, d) * st[d];
+                float acc = (scale * r3d_exp_f(s_gc[i])) * inr;
+                for (int64_t j = 0; j <= i; ++j) acc += s_row[j] * s_W[j * vW + e];
+                stt2(o + (tb + i) * o_s0b + h * o_s1b, dtO, e, acc);
+            }
+            __syncthreads();
+        }
+
+        /* S = e^{g_last} S + V'^T K': the el-multiply first (all d), then one j-ascending
+         * += chain per element, vp*(gs*k) with ref's brackets. */
+        if (own) {
+            const float el = r3d_exp_f(s_gc[L - 1]);
+            #pragma unroll
+            for (int d = 0; d < kScanK; ++d) st[d] *= el;
+            for (int64_t j = 0; j < L; ++j) {
+                const float vp = s_W[j * vW + e];
+                const float gs = r3d_exp_f(s_gc[L - 1] - s_gc[j]);
+                const uint8_t* __restrict__ kr = kb + (tb + j) * k_s0b;
+                #pragma unroll
+                for (int d = 0; d < kScanK; ++d) st[d] += vp * (gs * ldt2(kr, dtK, d));
+            }
+        }
+    }
+
+    if (ht && own) {
+        uint8_t* __restrict__ tb_ht = ht + sn * t_s0b + h * t_s1b + e * t_s2b;
+        #pragma unroll
+        for (int d = 0; d < kScanK; ++d) stt2(tb_ht, dtT, d, st[d]);
+    }
 }
 
 /* ---- gdn_conv_update ----------------------------------------------------------------------
@@ -565,5 +715,132 @@ extern "C" int r3d_rad_gdn_kkt_solve(const RadArgs* a, RadStream s) {
         (uint8_t*)A->data, A->dtype, rad_dtype_bytes(A->dtype, A_s0), rad_dtype_bytes(A->dtype, A_s1),
         cu->data, cu->dtype,
         H / Hg, Kd);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* gdn_chunk_scan: verbatim libref operand list (q, k, v, A, g, beta, h0?, cu, o, ht?,
+ * state_idx?). The derivation rules are ref's (H = numel(beta)/T, Hg = numel(q)/(T*head_k),
+ * T from q's own token axis at rank-3 -- the kkt lesson: shape[rank-2] is the HEAD axis on
+ * these operands); scale is the caller's f64 parameter read as f32 like ref's p_f32, and the
+ * recorded packs all carry 1/sqrt(head_k). h0/ht strides are READ off the tensor at rank >= 4,
+ * never derived: ref's v4 comment says a paged state cache is padded to the attention page.
+ * state_idx rows may be wider than one slot (speculative decode keeps extras beside column 0);
+ * the scan reads column 0 at stride[0] and a negative slot skips the whole (n, h) row --
+ * o included, exactly as ref's `continue` does. `state_fp16` is accepted and ignored, as ref
+ * ignores it. */
+extern "C" int r3d_rad_gdn_chunk_scan(const RadArgs* a, RadStream s) {
+    const RadTensor* q    = rad_arg_in(a, 0);
+    const RadTensor* k    = rad_arg_in(a, 1);
+    const RadTensor* v    = rad_arg_in(a, 2);
+    const RadTensor* A    = rad_arg_in(a, 3);
+    const RadTensor* g    = rad_arg_in(a, 4);
+    const RadTensor* bt   = rad_arg_in(a, 5);
+    const RadTensor* h0   = rad_arg_in(a, 6);        /* optional: absent is a zero initial state */
+    const RadTensor* cu   = rad_arg_in(a, 7);
+    const RadTensor* o    = rad_arg_in(a, 8);
+    const RadTensor* ht   = rad_arg_in(a, 9);        /* optional: absent stores no state */
+    const RadTensor* sidx = rad_arg_in(a, 10);       /* optional: slots pool is not batch-ordered */
+    if (!q || !k || !v || !A || !g || !bt || !cu || !o) return RAD_E_INVAL;
+
+    const auto dt2_ok = [](uint32_t d) { return d == RAD_F32 || d == RAD_BF16; };
+    const bool h0_on = h0 && h0->data, ht_on = ht && ht->data;
+    const void* sidx_p = (sidx && sidx->data) ? sidx->data : nullptr;
+    if (!dt2_ok(q->dtype) || !dt2_ok(k->dtype) || !dt2_ok(v->dtype) || !dt2_ok(A->dtype) ||
+        !dt2_ok(g->dtype) || !dt2_ok(bt->dtype) || !dt2_ok(o->dtype) ||
+        (h0_on && !dt2_ok(h0->dtype)) || (ht_on && !dt2_ok(ht->dtype))) return RAD_E_DTYPE;
+    if (!idx_dt_ok(cu->dtype) || !idx_dense(cu)) return RAD_E_STRIDE;
+    if (sidx_p && !idx_dt_ok(sidx->dtype)) return RAD_E_DTYPE;
+
+    long long K_ll = 0, V_ll = 0;
+    if (!rad_args_geti(a, "head_k", &K_ll) || !rad_args_geti(a, "head_v", &V_ll))
+        return RAD_E_SHAPE;
+    const int64_t Kd = K_ll, Vd = V_ll;
+    if (Kd <= 0 || Vd <= 0) return RAD_E_SHAPE;
+    /* head_k 128 is the register bound (the state column IS a thread's register array);
+     * head_v <= 128 is the one-column-per-thread block. The pack records 128/128. */
+    if (Kd != kScanK || Vd > (int64_t)kScanThreads) return RAD_E_UNSUPPORTED;
+
+    long long ch_ll = 0;
+    if (!rad_args_geti(a, "chunk", &ch_ll))
+        ch_ll = A->rank >= 3 ? A->shape[A->rank - 1] : 0;
+    if (ch_ll <= 0) return RAD_E_SHAPE;
+    if (ch_ll != kScanChunk) return RAD_E_UNSUPPORTED;
+
+    const int64_t N = rad_tensor_numel(cu) - 1;
+    if (N <= 0 || N > 0xffff) return RAD_E_SHAPE;
+    const int64_t T = q->rank >= 3 ? q->shape[q->rank - 3] : (q->rank >= 2 ? q->shape[0] : 1);
+    if (T <= 0) return RAD_E_SHAPE;
+    const int64_t H  = rad_tensor_numel(bt) / T;
+    const int64_t Hg = rad_tensor_numel(q) / (T * Kd);
+    if (H <= 0 || Hg <= 0 || H % Hg != 0) return RAD_E_SHAPE;
+    if (rad_tensor_numel(k) < T * Hg * Kd) return RAD_E_SHAPE;
+    if (rad_tensor_numel(v) < T * H * Vd || rad_tensor_numel(o) < T * H * Vd) return RAD_E_SHAPE;
+    if (rad_tensor_numel(A) < T * H * kScanChunk) return RAD_E_SHAPE;
+    if (rad_tensor_numel(g) < T * H || rad_tensor_numel(bt) < T * H) return RAD_E_SHAPE;
+
+    int64_t sw = 1;
+    if (sidx_p) {
+        if (sidx->rank < 1 || sidx->shape[0] < N) return RAD_E_SHAPE;
+        sw = sidx->stride[0];
+    } else {
+        const int64_t need = N * H * Vd * Kd;
+        if (ht_on && rad_tensor_numel(ht) < need) return RAD_E_SHAPE;
+        if (h0_on && rad_tensor_numel(h0) < need) return RAD_E_SHAPE;
+    }
+
+    /* Strides verbatim ref's views: v3(q/k, Hg, K), v3(v/o, H, V), v3(A, H, chunk), v2(g/beta,
+     * H), v4(h0/ht, H, V, K); tensor strides at the matching rank, tight below; the unit-stride
+     * axis must be unit (ref's at3/4 accept wider, this library refuses them everywhere). */
+    auto v3_ok = [&](const RadTensor* t, int64_t heads, int64_t dim,
+                     int64_t* s0, int64_t* s1) -> int {
+        *s0 = t->rank >= 3 ? t->stride[t->rank - 3] : heads * dim;
+        *s1 = t->rank >= 3 ? t->stride[t->rank - 2] : dim;
+        if (t->rank >= 3 && t->stride[t->rank - 1] != 1) return RAD_E_STRIDE;
+        return RAD_OK;
+    };
+    int64_t q_s0, q_s1, k_s0, k_s1, v_s0, v_s1, A_s0, A_s1, o_s0, o_s1;
+    int rc = v3_ok(q, Hg, Kd, &q_s0, &q_s1); if (rc) return rc;
+    rc = v3_ok(k, Hg, Kd, &k_s0, &k_s1);     if (rc) return rc;
+    rc = v3_ok(v, H, Vd, &v_s0, &v_s1);      if (rc) return rc;
+    rc = v3_ok(A, H, kScanChunk, &A_s0, &A_s1); if (rc) return rc;
+    rc = v3_ok(o, H, Vd, &o_s0, &o_s1);      if (rc) return rc;
+
+    const int64_t b_s0 = bt->rank >= 2 ? bt->stride[bt->rank - 2] : H;
+    if (bt->rank >= 2 && bt->stride[bt->rank - 1] != 1) return RAD_E_STRIDE;
+    const int64_t g_s0 = g->rank >= 2 ? g->stride[g->rank - 2] : H;
+    if (g->rank >= 2 && g->stride[g->rank - 1] != 1) return RAD_E_STRIDE;
+
+    auto v4_strides = [&](const RadTensor* t, int64_t* s0, int64_t* s1, int64_t* s2) -> int {
+        *s0 = t->rank >= 4 ? t->stride[t->rank - 4] : H * Vd * Kd;
+        *s1 = t->rank >= 4 ? t->stride[t->rank - 3] : Vd * Kd;
+        *s2 = t->rank >= 4 ? t->stride[t->rank - 2] : Kd;
+        if (t->rank >= 4 && t->stride[t->rank - 1] != 1) return RAD_E_STRIDE;
+        return RAD_OK;
+    };
+    int64_t h_s0 = 0, h_s1 = 0, h_s2 = 0, t_s0 = 0, t_s1 = 0, t_s2 = 0;
+    if (h0_on && v4_strides(h0, &h_s0, &h_s1, &h_s2)) return RAD_E_STRIDE;
+    if (ht_on && v4_strides(ht, &t_s0, &t_s1, &t_s2)) return RAD_E_STRIDE;
+
+    const double scale_d = rad_args_getf_or(a, "scale", 1.0);
+    const float scale = (float)scale_d;
+
+    const uint32_t shm = (uint32_t)(kScanChunk * Vd * sizeof(float));
+    const uint32_t dtH = h0_on ? h0->dtype : RAD_F32, dtT = ht_on ? ht->dtype : RAD_F32;
+    gdn_chunk_scan_kernel<<<dim3((uint32_t)H, (uint32_t)N), dim3(kScanThreads), shm,
+                            (hipStream_t)(uintptr_t)s>>>(
+        (const uint8_t*)q->data, q->dtype, rad_dtype_bytes(q->dtype, q_s0), rad_dtype_bytes(q->dtype, q_s1),
+        (const uint8_t*)k->data, k->dtype, rad_dtype_bytes(k->dtype, k_s0), rad_dtype_bytes(k->dtype, k_s1),
+        (const uint8_t*)v->data, v->dtype, rad_dtype_bytes(v->dtype, v_s0), rad_dtype_bytes(v->dtype, v_s1),
+        (const uint8_t*)A->data, A->dtype, rad_dtype_bytes(A->dtype, A_s0), rad_dtype_bytes(A->dtype, A_s1),
+        (const uint8_t*)g->data,  g->dtype,  rad_dtype_bytes(g->dtype, g_s0),
+        (const uint8_t*)bt->data, bt->dtype, rad_dtype_bytes(bt->dtype, b_s0),
+        h0_on ? (const uint8_t*)h0->data : nullptr, dtH,
+        rad_dtype_bytes(dtH, h_s0), rad_dtype_bytes(dtH, h_s1), rad_dtype_bytes(dtH, h_s2),
+        (uint8_t*)o->data, o->dtype, rad_dtype_bytes(o->dtype, o_s0), rad_dtype_bytes(o->dtype, o_s1),
+        ht_on ? (uint8_t*)ht->data : nullptr, dtT,
+        rad_dtype_bytes(dtT, t_s0), rad_dtype_bytes(dtT, t_s1), rad_dtype_bytes(dtT, t_s2),
+        cu->data, cu->dtype,
+        sidx_p, sidx_p ? sidx->dtype : 0, sw,
+        Vd, Vd, H / Hg, scale);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
