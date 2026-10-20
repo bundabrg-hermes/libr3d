@@ -978,3 +978,44 @@ Design calls worth keeping:
 GDN holes left for the 27B trunk: `gdn_kkt_solve`, `gdn_chunk_scan`,
 `gdn_recurrent_update` (three encoded planes, needs the layout hook), plus the
 two unrecorded ops.
+
+## gdn_kkt_solve_bf16 -- the third GDN row, forward substitution bit-exact (2026-10-20)
+
+The chunk triangular inverse `A = (I + strict_lower(diag(beta) K K^T e^{g_i-g_j}))^-1`,
+one block per (chunk, sequence, v head). Geometry pinned by `kf_probe_ops` before any
+code: head_k 128, chunk 64 recorded ONLY via A's shape `[M, 48, 64]` (the param digests
+carry `M` and `head_k` alone -- ref's fallback of reading chunk from A's trailing shape
+is the live path, not the dead one), k bf16 `[T,16,128]`, beta/g f32 `[T,48]`, cu i32,
+M 1..512.
+
+The row is deliberately the SCALAR sibling of libr4d's `k128_c64` WMMA row: ref's inverse
+is a per-column forward-substitution chain (`A[i][j] = delta - sum_{l=j}^{i-1} M[i][l]
+A[l][j]`, f32, l ascending), and a thread-owns-column kernel walks that chain in ref's
+exact order -- bit-exact by construction, which the WMMA blocked merge cannot claim.
+Chunks are independent by construction, so the chunk index became the grid's free axis
+(it is what fills the CUs where ref's N*H parallelism would idle the card at prefill);
+thread ownership makes the substitution barrier-free inside its loops. LDS ~25 KB
+(strict-lower triangle + per-thread columns padded to 65) -> two blocks/CU.
+
+Gates (all on the real packs, serve untouched throughout):
+
+| sweep | result |
+|---|---|
+| nodraft 27B pack, `--op gdn_kkt_solve` | 80/80, worst 0.000e+00; all 10 digests attributed `gdn_kkt_solve_bf16 \| libr3d \| device` |
+| stock kernels.rkb, all libraries | **1887/1887** (was 1877 -- the stock pack carries 10 kkt cases, one per digest M=1..512, previously host-only, now device-side AND bit-exact), worst rel_l2 unchanged at 3.135e-03, libr3d coverage 31 rows |
+| full mxfp4 pack (drafter + vision) | **4593/4593** (was 4553, the +40 the kkt cases), worst 2.859e-03 unchanged, the same 7 known not-reached rows, 1215 guarded-allocation cases 0 OOB |
+
+Lessons, permanent:
+
+* **T is `k->shape[rank-3]`, not `[rank-2]`.** The conv row's "T from the tensor shape"
+  reading reads shape[rank-2] -- correct for a rank-2 `x`, but for a rank-3 `[T, Hg, K]`
+  operand that slot is the HEAD axis. Wrong T mis-derived H/Hg, inflated grid z past the
+  real head count, and wrote 256 B past A on the first L==chunk cases -- kbench's guarded
+  allocations named the operand and the size on the very first card run. "shape[rank-2]
+  is the token axis" is a rank-2 fact, not a house rule. (591de90 caught, a8d69aa fixed.)
+* The stock kernels.rkb is not shape-free of the 27B: it now carries gdn cases at
+  head_k/head_v 128 (the conv and kkt digests), so a new GDN row shows up in the STOCK
+  regression count too. Expect the +N; it is the row proving itself twice.
+
+GDN holes left for the 27B trunk: `gdn_chunk_scan`, `gdn_recurrent_update` (three encoded
+planes, needs the layout hook), plus the two unrecorded ops.
