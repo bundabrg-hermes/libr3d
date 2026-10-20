@@ -252,9 +252,12 @@ bool int_dt_ok(uint32_t dt) {
 
 } /* anonymous namespace */
 
-/* Launch entry; operands positional in the attn_paged schema:
- * q, kv_cache, block_table, seqused, [k_descale], [v_descale], [cu_seqlens], out. */
-extern "C" int r3d_rad_attn_paged(const RadArgs* a, RadStream s) {
+/* Derives one launch's full scalar set from the RadArgs -- the oracle's parameter reads
+ * with the oracle's defaults, the pitches and views where the oracle computes them from
+ * the tensor headers, and the dtype gates. Every attn_paged entry (the any-length row, and
+ * the split-KV decode row) calls exactly this, so no dispatch path can fork the arithmetic
+ * it is supposed to A/B. Shared declaration: r3d_attn.h. */
+int r3d_attn_fill(const RadArgs* a, R3dAttnParams& P) {
     if (a->n_t < 8) return RAD_E_INVAL;
     const RadTensor* q   = rad_arg_in(a, 0);
     const RadTensor* kv  = rad_arg_in(a, 1);
@@ -266,7 +269,6 @@ extern "C" int r3d_rad_attn_paged(const RadArgs* a, RadStream s) {
     const RadTensor* cus  = rad_arg_in(a, 6);
     if (!q || !kv || !bt || !su || !o) return RAD_E_INVAL;
 
-    AttnParams P{};
     P.q = q->data; P.kv = kv->data; P.out = o->data;
     P.bt = bt->data; P.su = su->data; P.cus = cus ? cus->data : nullptr;
     P.kdes = kdes; P.vdes = vdes;
@@ -333,8 +335,36 @@ extern "C" int r3d_rad_attn_paged(const RadArgs* a, RadStream s) {
 
     const int64_t total = rows * P.q_heads;
     if (total <= 0 || total > 0x7fffffffLL) return RAD_E_SHAPE;
+    return RAD_OK;
+}
 
+/* The scalar reference port's launch: one workgroup per (query row, q head), head_dim
+ * threads. Exposed (r3d_attn.h) so the decode row can serve what the split-K tile refuses
+ * without any scalar being derived twice. */
+int r3d_attn_v1_launch(const R3dAttnParams& P, hipStream_t stream) {
     const size_t shmem = (size_t)P.head_dim * sizeof(float);
+    dim3 grid((unsigned)(P.rows * P.q_heads));
+    dim3 block((unsigned)P.head_dim);
+    #define R3D_ATTN(Q, KV) hipLaunchKernelGGL((attn_paged_kernel<Q, KV>), grid, block, \
+                                               shmem, stream, P)
+    const int qdt = (int)P.qdt, kvdt = (int)P.kvdt;
+    if      (qdt == RAD_BF16 && kvdt == RAD_BF16)   R3D_ATTN(RAD_BF16, RAD_BF16);
+    else if (qdt == RAD_BF16 && kvdt == RAD_F32)    R3D_ATTN(RAD_BF16, RAD_F32);
+    else if (qdt == RAD_BF16 && kvdt == RAD_F8E4M3) R3D_ATTN(RAD_BF16, RAD_F8E4M3);
+    else if (qdt == RAD_F32  && kvdt == RAD_BF16)   R3D_ATTN(RAD_F32, RAD_BF16);
+    else if (qdt == RAD_F32  && kvdt == RAD_F32)    R3D_ATTN(RAD_F32, RAD_F32);
+    else                                             R3D_ATTN(RAD_F32, RAD_F8E4M3);
+    #undef R3D_ATTN
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* Launch entry; operands positional in the attn_paged schema (rad_arg_in), scalars via
+ * r3d_attn_fill. */
+extern "C" int r3d_rad_attn_paged(const RadArgs* a, RadStream s) {
+    AttnParams P{};
+    const int rc = r3d_attn_fill(a, P);
+    if (rc != RAD_OK) return rc;
+
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
 
     /* Offer the launch to the WMMA tile first (r3d_attn_paged_wmma.hip). It sees the
@@ -344,17 +374,5 @@ extern "C" int r3d_rad_attn_paged(const RadArgs* a, RadStream s) {
      * below was never launched in that case and serves the op exactly as before. */
     if (r3d_attn_paged_wmma_launch(P, stream) == RAD_OK) return RAD_OK;
 
-    dim3 grid((unsigned)total);
-    dim3 block((unsigned)P.head_dim);
-    #define R3D_ATTN(Q, KV) hipLaunchKernelGGL((attn_paged_kernel<Q, KV>), grid, block, \
-                                               shmem, stream, P)
-    const int qdt = (int)q->dtype, kvdt = (int)kv->dtype;
-    if      (qdt == RAD_BF16 && kvdt == RAD_BF16)   R3D_ATTN(RAD_BF16, RAD_BF16);
-    else if (qdt == RAD_BF16 && kvdt == RAD_F32)    R3D_ATTN(RAD_BF16, RAD_F32);
-    else if (qdt == RAD_BF16 && kvdt == RAD_F8E4M3) R3D_ATTN(RAD_BF16, RAD_F8E4M3);
-    else if (qdt == RAD_F32  && kvdt == RAD_BF16)   R3D_ATTN(RAD_F32, RAD_BF16);
-    else if (qdt == RAD_F32  && kvdt == RAD_F32)    R3D_ATTN(RAD_F32, RAD_F32);
-    else                                             R3D_ATTN(RAD_F32, RAD_F8E4M3);
-    #undef R3D_ATTN
-    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    return r3d_attn_v1_launch(P, stream);
 }

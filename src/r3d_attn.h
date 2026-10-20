@@ -37,8 +37,28 @@ struct R3dAttnParams {
     int64_t window;
     float   scale;
     int64_t q_len_uniform;                  /* rows/n_seq when cu_seqlens is absent */
+
+    /* split-KV decode only (r3d_attn_paged_decode.hip); zero/null for every other path.
+     * pf is the engine's scratch arena (RadArgs.scratch), laid out as
+     *   float  O   [(tok*q_heads + h) * splits + sp][head_dim]   the un-normalized O
+     *   float  m   [same idx]                                    the slice's row max
+     *   float  l   [same idx]                                    its exp-sum
+     * (the m/l planes sit after the O plane, like libr4d's non-PF16 partials). */
+    void*   pf;
+    int     splits;
 };
 
 /* Launches the WMMA flash tile. Returns RAD_OK when enqueued, or RAD_E_UNSUPPORTED /
  * RAD_E_DEVICE to hand the launch back to the entry's v1 kernel. */
 int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream);
+
+/* The scalar reference port (r3d_attn_paged.hip's v1 kernel), exposed so the decode row can
+ * serve what the split-K tile refuses (foreign chips, R3D_NO_WMMA, head_dim outside the
+ * WMMA templates) without re-deriving a single scalar. */
+int r3d_attn_v1_launch(const R3dAttnParams& P, hipStream_t stream);
+
+/* Derives every scalar of R3dAttnParams from the RadArgs exactly where libref derives it
+ * (lives in r3d_attn_paged.hip). All three attn_paged entries call this one function, so the
+ * dispatch decision can never fork the arithmetic it is supposed to A/B. Returns RAD_OK or
+ * the entry's refusal code; fills P on RAD_OK only. */
+int r3d_attn_fill(const RadArgs* a, R3dAttnParams& P);

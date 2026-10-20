@@ -534,6 +534,8 @@ static const RadConstraint cKvStore[] = {
 /* libr3d is the only device library on RDNA3, so no in-plugin arbitration; the value only
  * needs to sit above a future fallback row. */
 enum { R3D_PRIO_ONLY = 1000 };
+enum { R3D_PRIO_ATTN_DECODE = 1100 };   /* split-KV rows win the decode band from the
+                                           any-length tile; nothing else is ranked */
 
 /* act_mul: the bf16 gated MLP, all four oracle activations this kernel ports. */
 static const RadConstraint cActMul[] = {
@@ -562,6 +564,34 @@ static const RadConstraint cAttnPaged[] = {
     { "head_dim", RAD_C_GE, 1, nullptr },
     { "q_dtype",  RAD_C_IN, 0, "bf16" },
     { "kv_dtype", RAD_C_IN, 0, "bf16 f32 fp8_e4m3" },
+};
+
+/* Split-KV decode: the tuning axis is the split count -- 0 is the kernel's own
+ * parallelism law (slices cut to fill the CUs), 8..64 measured overrides. 0 is
+ * launchable by construction (the law's own floor is 1, and splits=1 runs the plain
+ * tile through the same entry), which is all the loader requires of a default. */
+static const int64_t kSplits[] = { 0, 8, 16, 32, 64 };
+static const RadTunable tAttnSplit = { "splits", kSplits, 5, 0,
+    "KV slices per (head, seq) computed in parallel; 0 = kernel law (fill the CUs)" };
+
+/* The decode band these rows take from attn_paged_bf16: q_len <= 8 (decode and
+ * speculative verify -- libr4d's decode-band bound, same spelling), window 0 (the row
+ * serves a full KV walk; windowed decode stays with the tile), bf16 q, bf16/fp8-e4m3
+ * cache. head_dim is one row per value, libr4d's convention: each is exactly a WMMA
+ * template instantiation, and no IN set exists for integer keys. */
+static const RadConstraint cAttnDecodeH128[] = {
+    RAD_CLE("q_len", 8),
+    RAD_CEQ("window", 0),
+    RAD_CEQ("head_dim", 128),
+    RAD_CIN("q_dtype", "bf16"),
+    RAD_CIN("kv_dtype", "bf16 fp8_e4m3"),
+};
+static const RadConstraint cAttnDecodeH64[] = {
+    RAD_CLE("q_len", 8),
+    RAD_CEQ("window", 0),
+    RAD_CEQ("head_dim", 64),
+    RAD_CIN("q_dtype", "bf16"),
+    RAD_CIN("kv_dtype", "bf16 fp8_e4m3"),
 };
 
 /* rope: neox and gptj over [M] positions -- a subset of libr4d's five modes. A query for
@@ -594,6 +624,8 @@ extern "C" int r3d_rad_rope(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt(const RadArgs*, RadStream);
 extern "C" int r3d_rad_logits_gemm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_attn_paged(const RadArgs*, RadStream);
+extern "C" int r3d_rad_attn_paged_decode(const RadArgs*, RadStream);
+extern "C" int64_t r3d_rad_attn_decode_scratch(const RadArgs*);
 extern "C" int r3d_rad_sample_temp(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_mask(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_argmax(const RadArgs*, RadStream);
@@ -732,6 +764,28 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cAttnPaged, 3, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_attn_paged },
+
+{ "attn_paged_decode_bf16kv_h128", "attn_paged", "attn",
+  "split-KV decode attention: the WMMA tile's two passes over each of `splits` KV slices "
+  "in parallel, un-normalized partials (O, m, l) in the engine arena, one merge kernel "
+  "rescaling them per output row; splits=1 IS the plain tile, same body, same tail math",
+  "decode and speculative verify (q_len <= 8), window 0, head_dim 128, any gqa, any "
+  "block size, ragged batches via cu_seqlens, unmapped block table entries skipped",
+  "bf16 query, bf16 / fp8-e4m3 kv cache with optional per-(seq,head) descales, bf16 or "
+  "f32 out, f32 partials and merge",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ATTN_DECODE,
+  cAttnDecodeH128, 5, &tAttnSplit, 1, nullptr,
+  nullptr, nullptr, r3d_rad_attn_paged_decode, r3d_rad_attn_decode_scratch },
+
+{ "attn_paged_decode_bf16kv_h64", "attn_paged", "attn",
+  "split-KV decode attention, head_dim 64: as attn_paged_decode_bf16kv_h128",
+  "decode and speculative verify (q_len <= 8), window 0, head_dim 64, any gqa, any "
+  "block size, ragged batches via cu_seqlens, unmapped block table entries skipped",
+  "bf16 query, bf16 / fp8-e4m3 kv cache with optional per-(seq,head) descales, bf16 or "
+  "f32 out, f32 partials and merge",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ATTN_DECODE,
+  cAttnDecodeH64, 5, &tAttnSplit, 1, nullptr,
+  nullptr, nullptr, r3d_rad_attn_paged_decode, r3d_rad_attn_decode_scratch },
 
 /* ---- the sampling chain. The candidate-width cap on the cand-plane rows mirrors
  * libr4d's: the engine's declare-time bound is the buffer width, and 4096 covers it.
