@@ -149,7 +149,15 @@ __device__ __forceinline__ void st_kv_regs(const uint4* src, bf16* KVp) {
     }
 }
 
-template <int D, int KVDT, int SPLITK, int DBUF = 0>
+/* FOLD (GQA fold, llama.cpp's tile-kernel fold ported to this body): blockIdx.x is a
+ * KV HEAD and the 64 tile rows pack that group's P.gqa q-heads token-major -- row r is
+ * token (i0+r)/gqa, head kh*gqa + (i0+r)%gqa. The decode band (qlen <= 8) reads the
+ * whole KV history per block, so folding divides that traffic by gqa; each row's
+ * arithmetic is verbatim v1's, so outputs are bit-identical per row. FOLD=0 collapses
+ * every helper below to the original expressions at compile time -- the prefill
+ * instantiation is unchanged by construction (a prefill fold would stream the same
+ * bytes: its tiles already carry 64 tokens of ONE head and skip dead KV heads). */
+template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams P) {
     constexpr int DSH = (D == 128) ? 7 : 6, DM1 = D - 1;
     typedef Carve<D> C;
@@ -199,13 +207,20 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
         qlen  = P.q_len_uniform;
         start = (int64_t)s * qlen;
     }
+    const int64_t nrows_q = FOLD ? qlen * P.gqa : qlen;   /* live tile rows, fold units */
     const int64_t i0 = (int64_t)qt * kBM;
-    if (i0 >= qlen) return;
+    if (i0 >= nrows_q) return;
     const int64_t tok_base = start + i0;
-    const int64_t valid    = min<int64_t>(qlen - i0, kBM);
+    const int64_t valid    = min<int64_t>(nrows_q - i0, kBM);
     const int64_t ctx      = (int64_t)ldi_w(P.su_dt, P.su, s);
     const int64_t pos_base = ctx - qlen + i0;
-    const int64_t kh       = h / P.gqa;
+    const int64_t pos_f0   = ctx - qlen;              /* position of token 0 (fold rows) */
+    const int64_t kh       = FOLD ? (int64_t)h : h / P.gqa;
+    /* row -> (token, head) maps; FOLD=0 collapses to tok_base+r / h / pos_base+r */
+    auto tokabs    = [&](int64_t r) { return FOLD ? start + (i0 + r) / P.gqa : tok_base + r; };
+    auto headabs   = [&](int64_t r) { return FOLD ? kh * P.gqa + (i0 + r) % P.gqa : (int64_t)h; };
+    auto rowpos_of = [&](int64_t r) { return FOLD ? pos_f0 + (i0 + r) / P.gqa : pos_base + r; };
+    auto paridx    = [&](int64_t r) { return (tokabs(r) * P.q_heads + headabs(r)) * spl + sp; };
     const float   kds      = P.kdes ? ldt_w(P.kdes, s * P.kv_heads + kh) : 1.0f;
     const float   vds      = P.vdes ? ldt_w(P.vdes, s * P.kv_heads + kh) : 1.0f;
     const float   scale2   = P.scale * kds * kLog2e;
@@ -241,12 +256,12 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
 
     /* Tile range that any row can see (skip the dead head of a window, stop past the
      * last position any row may attend to). */
-    const int64_t pos_last = pos_base + valid - 1;
+    const int64_t pos_last = rowpos_of(valid - 1);
     int64_t jmax = jend;
     if (causal && pos_last + 1 < jmax) jmax = pos_last + 1;
     if (!causal && window > 0 && pos_last + window < jmax) jmax = pos_last + window;
     int64_t jmin = 0;
-    if (window > 0) jmin = max<int64_t>(0, pos_base - window + 1);
+    if (window > 0) jmin = max<int64_t>(0, rowpos_of(0) - window + 1);
     const int t0 = (int)(jmin / kBN);
     const int t1 = (int)((jmax + kBN - 1) / kBN);
 
@@ -267,7 +282,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             const int64_t pn = P.rows * P.q_heads;
             float* psm = pso + pn * spl * D, * psl = psm + pn * spl;
             for (int64_t row = tid; row < valid; row += kThreads) {
-                const int64_t idx = ((tok_base + row) * P.q_heads + h) * spl + sp;
+                const int64_t idx = paridx(row);
                 psm[idx] = -INFINITY; psl[idx] = 0.0f;
             }
             return;
@@ -278,22 +293,27 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
      * and never store), columns 0..head_dim-1. Vector path when the q walk is
      * contiguous and 8-aligned on both sides (bit-identical copy either way). ---- */
     const int64_t qbase = tok_base * P.q_rs + (int64_t)h * P.q_hs;
+    /* per-tile-row Q base; FOLD gathers across the kv group's heads (row-major q walk
+     * becomes a gather, but the vec gate is row-local: (q_rs&7)==0 and (q_hs&7)==0
+     * keep every fold row 8-aligned on its own). */
+    auto qrow = [&](int64_t r) { return FOLD
+        ? tokabs(r) * P.q_rs + headabs(r) * P.q_hs : qbase + r * P.q_rs; };
     const bool qvec = (P.q_ds == 1) && ((P.q_rs & 7) == 0) && ((P.q_hs & 7) == 0) &&
-                      ((qbase & 7) == 0) && ((((uintptr_t)P.q) & 15) == 0);
+                      (FOLD || (qbase & 7) == 0) && ((((uintptr_t)P.q) & 15) == 0);
     if (qvec) {
         for (int e = tid; e < kBM * D / 8; e += kThreads) {
             const int r = e >> (DSH - 3), d = (e & ((1 << (DSH - 3)) - 1)) << 3;
             uint4 v = make_uint4(0, 0, 0, 0);
             if (r < valid)
                 v = *reinterpret_cast<const uint4*>((const uint16_t*)P.q
-                                                    + qbase + (int64_t)r * P.q_rs + d);
+                                                    + qrow(r) + d);
             *reinterpret_cast<uint4*>(Qsp + r * C::kQP + d) = v;
         }
     } else {
         for (int e = tid; e < kBM * D; e += kThreads) {
             const int r = e >> DSH, d = e & DM1;
             bf16_store(Qsp + r * C::kQP + d, (r < valid)
-                ? ((const uint16_t*)P.q)[qbase + (int64_t)r * P.q_rs + (int64_t)d * P.q_ds]
+                ? ((const uint16_t*)P.q)[qrow(r) + (int64_t)d * P.q_ds]
                 : (uint16_t)0);
         }
     }
@@ -361,7 +381,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP + 16, a1, C::kSP, roCW::mem_row_major);
             __syncthreads();                                   /* K(t)'s fragments have left */
             if (tid < kBM && tid < valid) {
-                const int64_t rowpos = pos_base + tid;
+                const int64_t rowpos = rowpos_of(tid);
                 const float* srow = Ssp + tid * C::kSP;
                 float mx = MSP[tid];
                 for (int jj = 0; jj < kBN; ++jj) {
@@ -415,7 +435,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             for (int e = tid; e < kBM * kBN; e += kThreads) {  /* S -> P, all four waves */
                 const int r = e >> 5, jj = e & 31;
                 float pv = 0.0f;
-                if (r < valid && !CBc[jj] && visible(pos_base + r, jb + jj)) {
+                if (r < valid && !CBc[jj] && visible(rowpos_of(r), jb + jj)) {
                     const float m = MSP[r];
                     if (m != -INFINITY) pv = exp2f(Ssp[r * C::kSP + jj] * scale2 - m);
                 }
@@ -524,7 +544,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
 
         /* one thread per query row: visible max, then the online update of (m, l) */
         if (tid < kBM && tid < valid) {
-            const int64_t rowpos = pos_base + tid;
+            const int64_t rowpos = rowpos_of(tid);
             const float* srow = Ssp + tid * C::kSP;
             float mx = MSP[tid];
             for (int jj = 0; jj < kBN; ++jj) {
@@ -594,7 +614,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
         for (int e = tid; e < kBM * kBN; e += kThreads) {   /* S -> P, all four waves */
             const int r = e >> 5, jj = e & 31;
             float pv = 0.0f;
-            if (r < valid && !CB[jj] && visible(pos_base + r, jb + jj)) {
+            if (r < valid && !CB[jj] && visible(rowpos_of(r), jb + jj)) {
                 const float m = MSP[r];
                 if (m != -INFINITY) pv = exp2f(Ssp[r * C::kSP + jj] * scale2 - m);
             }
@@ -680,13 +700,13 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                 const int r = e >> DSH, d = e & DM1;
                 const int row = half * 32 + r;
                 if (row >= valid) continue;
-                const int64_t idx = ((tok_base + row) * P.q_heads + h) * spl + sp;
+                const int64_t idx = paridx(row);
                 pso[idx * D + d] = Osp[r * C::kOP + d];
             }
             if (tid < 32) {
                 const int row = half * 32 + tid;
                 if (row < valid) {
-                    const int64_t idx = ((tok_base + row) * P.q_heads + h) * spl + sp;
+                    const int64_t idx = paridx(row);
                     psm[idx] = MSP[row];
                     psl[idx] = LSP[row];
                 }
@@ -720,7 +740,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                 dbg[17] = (double)vds;
             }
 #endif
-            const int64_t ob = (tok_base + row) * P.o_rs + (int64_t)h * P.o_hs
+            const int64_t ob = tokabs(row) * P.o_rs + headabs(row) * P.o_hs
                              + (int64_t)d * P.o_ds;
             if (P.out_f32) ((float*)P.out)[ob] = o;
             else           ((uint16_t*)P.out)[ob] = f32_bf16_w(o);

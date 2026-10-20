@@ -116,7 +116,7 @@ using bf16 = roCW::bfloat16_t;
         * the launcher's gcnArchName gate never dispatches it on such a chip. */
 
 namespace {
-template <int D, int KVDT, int SPLITK, int DBUF = 0>
+template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams) {}
 template <int D, int KVDT, int SPLITK>
 __global__ __launch_bounds__(kT) void attn_paged_wmma_kernel2(R3dAttnParams) {}
@@ -183,7 +183,10 @@ __global__ __launch_bounds__(D) void attn_splitk_merge_kernel(R3dAttnParams P, i
  * tiles_kv: KV tile upper bound (max_ctx or the block table width, kBN keys each).
  * The 192: two waves per CU on 96 CUs -- slices want to be long enough that partial
  * traffic (written once, read once) stays noise next to the KV bytes (it is ~1% at the
- * sizes this row serves), and short enough that every CU carries a block. */
+ * sizes this row serves), and short enough that every CU carries a block.
+ * The head count passed in is q_heads for the plain arm and kv_heads for the GQA-fold
+ * arm -- folded blocks are gqa-times fewer, so the same wave target needs gqa-times
+ * more slices (and the fold arm is the more demanding arena consumer). */
 int decode_splits(int64_t q_heads, int64_t n_seq, int64_t tiles_kv, int forced) {
     if (forced > 0) return forced > 64 ? 64 : forced;
     const int64_t units = q_heads * (n_seq > 0 ? n_seq : 1);
@@ -196,9 +199,20 @@ int decode_splits(int64_t q_heads, int64_t n_seq, int64_t tiles_kv, int forced) 
     return (int)s;
 }
 
-/* Bytes of partials for one launch: rows*q_heads*splits*(head_dim+2) floats. */
+/* Bytes of partials for one launch: rows*q_heads*splits*(head_dim+2) floats.
+ * (rows*q_heads is the (token, q-head) row space -- the fold arm writes the SAME
+ * index space, one block just now fills gqa of those head slots per tile row.) */
 int64_t decode_partial_bytes(int64_t rows, int64_t q_heads, int splits, int64_t head_dim) {
     return rows * q_heads * (int64_t)splits * (head_dim + 2) * 4;
+}
+
+/* Can this shape take the GQA fold? gqa<=8 keeps the folded row count (qlen<=8 band
+ * times gqa) inside the 64-row WMMA tile; !cus keeps the uniform-position contract the
+ * launcher uses to size the fold tiles from q_len_uniform alone. Ragged batches take
+ * the plain split arm unchanged. */
+bool decode_fold_ok(int64_t gqa, int64_t qlen_uniform, int n_cus) {
+    return gqa > 1 && gqa <= 8 && !n_cus && qlen_uniform > 0
+        && qlen_uniform * gqa <= kBM;
 }
 
 } /* anonymous namespace */
@@ -219,12 +233,17 @@ extern "C" int64_t r3d_rad_attn_decode_scratch(const RadArgs* a) {
         int64_t mc = rad_args_geti_or(a, "max_ctx", 0);
         if (mc <= 0) return 0;
         const int64_t gqa  = rad_args_geti_or(a, "gqa", 1) > 0 ? rad_args_geti_or(a, "gqa", 1) : 1;
-        (void)gqa;                                   /* the law needs q_heads only */
+        const int64_t kvh  = gqa > 1 ? n_head / gqa : n_head;
         const int64_t qlen = rad_args_geti_or(a, "q_len", 8) > 0 ? rad_args_geti_or(a, "q_len", 8) : 8;
         const int64_t tkv  = (mc + kBN - 1) / kBN;
+        const bool foldable = decode_fold_ok(gqa, qlen, 0);   /* declare has no cus tensor */
         int64_t worst = 0;
         for (int64_t S = 1; S <= max_seqs; ++S) {
-            const int sp = decode_splits(n_head, S, tkv, sp_param);
+            int sp = decode_splits(n_head, S, tkv, sp_param);
+            if (foldable) {
+                const int spf = decode_splits(kvh, S, tkv, sp_param);
+                if (spf > sp) sp = spf;                       /* arm-agnostic worst case */
+            }
             const int64_t need = decode_partial_bytes(S * qlen, n_head, sp, D);
             if (need > worst) worst = need;
         }
@@ -236,7 +255,11 @@ extern "C" int64_t r3d_rad_attn_decode_scratch(const RadArgs* a) {
         int64_t mc = rad_args_geti_or(a, "max_ctx", 0);
         if (mc <= 0) mc = P.jcap;
         const int64_t tkv = (mc + kBN - 1) / kBN;
-        const int sp = decode_splits(P.q_heads, P.n_seq, tkv, sp_param);
+        int sp = decode_splits(P.q_heads, P.n_seq, tkv, sp_param);
+        if (decode_fold_ok(P.gqa, P.q_len_uniform, P.cus ? 1 : 0)) {
+            const int spf = decode_splits(P.kv_heads, P.n_seq, tkv, sp_param);
+            if (spf > sp) sp = spf;
+        }
         return decode_partial_bytes(P.rows, P.q_heads, sp, P.head_dim);
     }
     return 0;
@@ -284,15 +307,32 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
         if (v > 0) forced = v;
     }
     if (getenv("R3D_NO_SPLITK")) forced = 1;             /* A/B kill: the tile, same row */
+    static int fold = -1;
+    if (fold < 0) fold = getenv("R3D_NO_GQA") ? 0 : 1;   /* A/B kill: the GQA fold arm */
+    static int v2 = -1;
+    if (v2 < 0) v2 = getenv("R3D_ATTN_V2") ? 1 : 0;      /* v1 default: see wmma launcher */
     int64_t mc = rad_args_geti_or(a, "max_ctx", 0);
     if (mc <= 0) mc = P.jcap;
     const int64_t tkv = (mc + kBN - 1) / kBN;
-    const int spl = decode_splits(P.q_heads, P.n_seq, tkv, forced);
+    const int spl_plain = decode_splits(P.q_heads, P.n_seq, tkv, forced);
+    /* GQA fold (llama.cpp's tile-kernel fold, ported): one block per KV head streams
+     * the slice once for the whole q-head group, so decode KV traffic drops by gqa.
+     * Folded blocks are gqa-times fewer, so its splits law runs on kv_heads; a shape
+     * the fold gate refuses, or one where fold resolves to 1 slice, takes the plain
+     * split arm unchanged. Ragged batches (cus) stay plain. */
+    const bool fold_ok = fold && !v2
+                      && decode_fold_ok(P.gqa, P.q_len_uniform, P.cus ? 1 : 0);
+    const int spl_fold = fold_ok ? decode_splits(P.kv_heads, P.n_seq, tkv, forced) : 1;
+    const bool use_fold = fold_ok && spl_fold > 1;
+    const int spl = use_fold ? spl_fold : spl_plain;
     if (spl <= 1) return tile_or_v1();
 
-    const int64_t tiles_q = (P.rows + kBM - 1) / kBM;   /* loose bound, as the tile */
+    const int64_t per_seq = (P.cus ? P.rows : P.q_len_uniform * (use_fold ? P.gqa : 1));
+    const int64_t tiles_q = (per_seq + kBM - 1) / kBM;   /* per-seq exact, ragged loose */
     const int64_t gz = tiles_q * spl;
-    if (P.q_heads > 65535 || P.n_seq > 65535 || gz <= 0 || gz > 65535 || P.rows > 65535)
+    const int64_t gx = use_fold ? P.kv_heads : P.q_heads;
+    if (gx > 65535 || P.q_heads > 65535 || P.n_seq > 65535 || gz <= 0 || gz > 65535
+        || P.rows > 65535)
         return tile_or_v1();
 
     const int64_t need = decode_partial_bytes(P.rows, P.q_heads, spl, P.head_dim);
@@ -309,9 +349,8 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
      * deep ctx on the prefill bench (bit-identical, 0.43-0.80x; see the wmma launcher).
      * R3D_ATTN_V2=1 covers BOTH halves of this row: the tile_or_v1 arm through the
      * prefill launcher's own v2 selection, and the slice kernel here. The merge kernel
-     * is body-agnostic -- same arena contract -- so one instantiation serves both. */
-    static int v2 = -1;
-    if (v2 < 0) v2 = getenv("R3D_ATTN_V2") ? 1 : 0;   /* v1 default: see wmma launcher */
+     * is body-agnostic -- same arena contract -- so one instantiation serves both.
+     * (v2's flag is read at the top of this entry: the fold gate refuses v2 shapes.) */
 
     #define R3D_DK_LAUNCH(K, D, KV)                                                                  \
         do {                                                                                         \
@@ -326,10 +365,10 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
             return e1 == hipSuccess ? RAD_OK : RAD_E_DEVICE;                                         \
         } while (0)
 
-    if (dbg) printf("DBG attn-decode splitk hd=%lld kvdt=%d spl=%d tiles_kv=%lld "
+    if (dbg) printf("DBG attn-decode splitk hd=%lld kvdt=%d spl=%d fold=%d tiles_kv=%lld "
                     "grid(%lld,%lld,%lld) merge(%lld,%lld) need=%lld\n",
-                    (long long)P.head_dim, (int)P.kvdt, spl, (long long)tkv,
-                    (long long)P.q_heads, (long long)P.n_seq, (long long)gz,
+                    (long long)P.head_dim, (int)P.kvdt, spl, (int)use_fold, (long long)tkv,
+                    (long long)gx, (long long)P.n_seq, (long long)gz,
                     (long long)P.q_heads, (long long)P.rows, (long long)need);
 
     const int kvbf = (P.kvdt == RAD_BF16);
@@ -344,10 +383,10 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
     if (dbuf < 0) dbuf = getenv("R3D_ATTN_NO_DBUF") ? 0 : 1;
 #endif
     const bool dbuf_ok = dbuf && !v2 && kvbf && (P.kv_sd == 1) && ((((uintptr_t)P.kv) & 15) == 0);
-    #define R3D_DK_LAUNCH4(K, D, KV, SK, DB)                                                               \
+    #define R3D_DK_LAUNCH4(K, D, KV, SK, DB, FD)                                                           \
         do {                                                                                               \
-            hipLaunchKernelGGL((K<D, KV, SK, DB>),                                                         \
-                               dim3((unsigned)P.q_heads, (unsigned)P.n_seq, (unsigned)gz),                \
+            hipLaunchKernelGGL((K<D, KV, SK, DB, FD>),                                                     \
+                               dim3((unsigned)gx, (unsigned)P.n_seq, (unsigned)gz),                        \
                                dim3(kThreads), 0, stream, P);                                             \
             hipError_t e0 = hipGetLastError();                                                             \
             if (e0 != hipSuccess) return RAD_E_DEVICE;   /* partial state: fail the step */                \
@@ -362,11 +401,24 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
         else if (!d128 &&  kvbf) R3D_DK_LAUNCH(K, 64, RAD_BF16);                     \
         else                     R3D_DK_LAUNCH(K, 64, RAD_F8E4M3);
     if (v2)           { R3D_DK_ARMS(attn_paged_wmma_kernel2) }
+    else if (use_fold) {
+        /* GQA fold: one block per kv head (grid x = gx = kv_heads), rows = the group's
+         * heads token-major. DBUF staging composes (bf16 arm only, dispatch on the
+         * runtime gate -- template args must stay literal); fp8 keeps the scalar
+         * staging. Per-row arithmetic is v1's exactly -- hashes must match the plain
+         * arm bit for bit at pinned splits. */
+        if      (dbuf_ok &&  d128) R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 128, RAD_BF16,   1, 1, 1);
+        else if (dbuf_ok)          R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 64,  RAD_BF16,   1, 1, 1);
+        else if (d128 &&  kvbf)    R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 128, RAD_BF16,   1, 0, 1);
+        else if (d128 && !kvbf)    R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 128, RAD_F8E4M3, 1, 0, 1);
+        else if (!d128 &&  kvbf)   R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 64,  RAD_BF16,   1, 0, 1);
+        else                       R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 64,  RAD_F8E4M3, 1, 0, 1);
+    }
     else if (dbuf_ok) {
-        if      (d128 &&  kvbf) R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 128, RAD_BF16, 1, 1);
-        else if (d128 && !kvbf) R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 128, RAD_F8E4M3, 1, 1);
-        else if (!d128 &&  kvbf) R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 64, RAD_BF16, 1, 1);
-        else                     R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 64, RAD_F8E4M3, 1, 1);
+        if      (d128 &&  kvbf) R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 128, RAD_BF16, 1, 1, 0);
+        else if (d128 && !kvbf) R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 128, RAD_F8E4M3, 1, 0, 0);
+        else if (!d128 &&  kvbf) R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 64, RAD_BF16, 1, 1, 0);
+        else                     R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 64, RAD_F8E4M3, 1, 0, 0);
     }
     else              { R3D_DK_ARMS(attn_paged_wmma_kernel)  }
     #undef R3D_DK_ARMS

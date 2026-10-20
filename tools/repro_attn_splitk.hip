@@ -37,6 +37,7 @@ int main() {
     const int ROWW = QH * HD;
     const int SPL  = envid("REPRO_SPL", 2);            // mirrored into R3D_FORCE_SPLITS
     setenv("R3D_FORCE_SPLITS", getenv("REPRO_SPL") ? getenv("REPRO_SPL") : "2", 1);
+    if (envid("REPRO_NO_GQA", 0)) setenv("R3D_NO_GQA", "1", 1);   // force the plain arm
 
     uint32_t st = 0x1357bd9fu;
     auto rnd = [&]() { st ^= st << 13; st ^= st >> 17; st ^= st << 5; return st; };
@@ -154,6 +155,11 @@ int main() {
     }
     printf("(a) device  rel_l2=%.3e bad_cells=%d/%zu\n", std::sqrt(num / (den + 1e-30)), bad,
            want.size());
+    {   // bit-identity across arms: same hash fold vs plain at pinned splits
+        uint64_t hv = 0xcbf29ce484222325ull;
+        for (auto v : got) { hv ^= v; hv *= 0x100000001b3ull; }
+        printf("device O hash=%016llx\n", (unsigned long long)hv);
+    }
 
     // ---- (b) host re-merge of the arena ----
     // layout: so[idx*HD+d], sm[pn*SPL*HD + idx], sl[pn*SPL*(HD+1) + idx], idx=(t*QH+h)*SPL+sp
