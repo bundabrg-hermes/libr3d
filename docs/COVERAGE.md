@@ -1229,3 +1229,38 @@ blocked behind the fp8_e4m3 GEMM wall above. The earlier claim that "minicpm
 serve exercises GDN" was false — the evidence was `grep -c gdn` on a binary
 container (589 hits = quantization noise). `grep -a` on binaries proves nothing;
 ask `rad-info`.
+
+## gdn_conv_prep_bf16 + gdn_conv_recurrent_update_bf16: SHIPPED, byte-exact (2026-10-21)
+
+The pair that pinned the 27B placement chain (`0d9862f`, cold-fix `f2b1e13`).
+Device rows remove the host-only group members, which is what force-mapped the
+groups holding widened norms. `conv_prep` is the prefill preamble in three
+launches (conv+state-commit, serial-order per-head l2 norms, chunk-reset gate
+cumsum) so libref's phase order holds: the norms read the ROUNDED conv output,
+the cumsum resets per 64-chunk. The fused row runs conv + recurrent in one
+launch per (sequence, v head), staging through LDS rounded by x's dtype to
+reproduce the pair's staging round trip; the conv window commits BEFORE the
+state_idx skip, as the ref pair defines it.
+
+Evidence (`mxfp4_nodraft.rkb` and stock/full carry ZERO recorded cases for
+these ops — ssm-dt quirk), `tools/test_conv_pair.cpp`: dlopen both plugins,
+launch each row through its own `rad_kernel_at` entry (the engine's own table),
+seed -> device -> reseed -> ref -> memcmp, all four geometries byte-exact:
+prep A (cold+warm slots, chunk-crossing cumsum, gates fused in x, slot order
+out of batch order), prep B (V==K==128, separate gate projections, two chunk
+resets), fused A (GQA grp 3, V<K idle-tail threads, n_acc rollback, negative
+output slot), fused B (V==K==128, z absent, window longer than commit span).
+
+Gates after the pair: stock 1917/1917 (worst 3.135e-03 unchanged), full
+4633/4633 (see below), 0 OOB.
+
+Two lessons paid for:
+- **ref gates the history READ on has_init, not just the commit.** My conv
+  kernel read the slot whenever it existed: a cold prefill on a recycled cache
+  slot convolved over garbage. prep A caught it (exactly the cold tokens 70..72
+  diverged); prep B stayed byte-exact throughout, which is why both belong.
+- **a sequence's INPUT state slot must be disjoint from every slot another
+  sequence WRITES this step.** The test's fused A first shared slot 0 between
+  seq0's commit and seq1's read; BOTH arms raced (diff sets shifted run to
+  run). That is a legal-violation detector worth keeping in mind for real
+  batch construction, not just tests.
