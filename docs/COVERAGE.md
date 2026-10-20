@@ -707,3 +707,76 @@ Lesson for the skill: when a copy path is vectorized but still slow, the
 next lever is pipelining the copy across the compute step -- re-tiling
 geometry (v2/v3) was waste; the same DBUF pattern transferred from gemm to
 attention staging nearly verbatim.
+
+## The 27B MXFP4 target: what the container actually asks for (2026-10-20)
+
+`/srv/models/rad/qwen3.8-27b-mxfp4.rad` (18.05 GiB, RAD2, arch `qwen35`, source
+quant fp8_e4m3, converted from amd/Qwen3.8-27B-Quark-AWQ-MXFP4). Assessed with a
+recorded fixture, not by reading code: `rad-kbench -m <skeleton> --record` needs
+no card at all, because the skeleton keeps the tables and holes the data, and
+recording draws weights from seeds.
+
+```
+rad-kbench -m /models/qwen3.8-27b-mxfp4.rad --skeleton /scratch/skel27.rad   # 7 MB on disk
+rad-kbench -m /scratch/skel27.rad --record /scratch/mxfp4.rkb --max-ctx 4096  # ~6 min, CPU
+```
+
+**The model is a hybrid, and most of it is not attention.** 64 layers, full
+attention every 4th (16 layers: head_dim 256, GQA 6, gated q/gate interleave,
+partial rotary 64/256, MROPE interleaved); the other **48 are Gated DeltaNet**.
+Drafter scope is five `dflash.blk.*` layers at layer indices 64-68 (head_dim
+128, plus `attn_conv_base`/`attn_conv_proj` and `ffn_conv_base`/`ffn_conv_proj`),
+with `dflash.draft_head.weight` at 2 bits (`u2*f16[1x128]-u8[1x128]`, 331 MiB).
+Trunk `output.weight` is one fp8 tensor with 128x128 block scales (1.18 GiB),
+not bf16 -- `logits_gemm_bf16` cannot serve it. Weight bytes: 71.5% MXFP4
+(319 tensors, 12.89 GiB), 20.2% bf16.
+
+**Completeness, from the fixture (op x library matrix in the kbench report):**
+
+| declared graph | ops | libr3d holes |
+|---|---|---|
+| drafter + vision tower | 41 | 15 |
+| `--num-speculative-tokens 0 --mm-max-patches 0` | 31 | 9 |
+
+Holes with the drafter off: `gdn_chunk_scan`, `gdn_conv_update`,
+`gdn_gated_rmsnorm`, `gdn_kkt_solve`, `gdn_recurrent_update`, `gemm_nt_q`,
+`mul`, `rope_table`, `sigmoid`. The drafter/vision scope adds ten ops, six of
+them holes (`attn_dense`, `dflash_select`, `gemm_nt_bias`, `grid_embed`,
+`layernorm`, `scatter_rows`).
+
+**The MTP heads are avoidable at runtime, GDN is not.** Speculation off drops the
+drafter's whole scope, its conv tensors and its 2-bit head from the declared
+graph -- so the `mtp_num_hidden_layers 1` headers cost us nothing as long as we
+serve `--num-speculative-tokens 0` (which our fixture serve already does). The
+gate is the five GDN rows: 48 of 64 layers, and libr3d has no GDN family at all.
+Two more GDN ops (`gdn_conv_prep`, `gdn_conv_recurrent_update`) are in the
+program but absent from the matrix, because record declined them -- see below.
+The graph column reflects ops with recorded cases, so it also under-reports
+`embed_lookup`/`logits_gemm`, whose cases the memory budget skipped (each needs
+>7 GiB).
+
+**A dtype disagreement worth reporting upstream.** The container stores
+`ssm_dt.bias` and `ssm_a_log` as **bf16** (48 elements) while
+`arch/common/rad_block_gdn_fp8.h` declares `w_dt_bias`/`w_a_log` as **RAD_F32**
+`{n_head_v}`. kbench then declines 40 `gdn_conv_prep` cases ("operand 'dt_bias'
+is a weight and the declaration bound none to it") and substitutes
+`ssm_norm.weight` (128) for `dt_bias` (wants 48) on `gdn_conv_recurrent_update`.
+The check that fires is in `tools/rad_kbench.cpp`, so this is a harness-side
+substitution failure -- whether the engine's loader casts bf16 planes behind
+f32-declared weights is still unverified, and a real load attempt would settle
+it. The container's recipe casts only `ssm_ab.weight` (`cast dtype=bf16`), so
+re-converting with f32 casts for those three vectors is the cheap workaround if
+the loader turns out to be strict.
+
+**Feasibility, stated plainly.** On gfx1100 the trunk's shape arithmetic is not
+the problem -- 15.6 GiB of weights fit the 24 GB card and GDDR6 at ~480 GB/s
+bounds decode near 30 tok/s. The problem is that two whole op families are
+missing (GDN chunked scan + triangular solve, and MXFP4 GEMM), and GDN is the
+largest single body of work attempted in this library. **The same container is
+already fully served on the R9700 cards**: the stock `stilldeadcode/radiance`
+image ships `libr4d 0.5.0, 351 kernels, built for gfx1201` (absent from our
+gfx11 build, which is why it looked missing), covering GDN, h256/gqa6 attention,
+`gemm_mxfp4a8_{m64,decode,tiled}` and the drafter. Trying the 27B MXFP4 on rdna3-dev is
+therefore a scheduling question -- one R9700 window on the stock image -- not a
+kernel question. libr3d's MXFP4 row is still worth doing, but GDN first, or the
+48 GDN layers run on AVX in host RAM regardless of how good the GEMM gets.
