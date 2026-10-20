@@ -92,7 +92,8 @@ __device__ __forceinline__ float ldi_w(uint32_t dt, const void* p, int64_t i) {
 }
 
 constexpr int kBM = 64, kBN = 32;           /* query rows x keys per step */
-constexpr int kThreads = 128;               /* 4 wave32s, 16 query rows each */
+constexpr int kThreads = 128;               /* v1 body: 4 wave32s, 16 query rows each */
+constexpr int kT = 256;                     /* v2 body (body2.inc): 8 wave32s */
 constexpr float kLog2e = 1.44269504088896340736f;
 
 } /* anonymous namespace */
@@ -106,7 +107,8 @@ namespace {
 namespace roCW = rocwmma;
 using bf16 = roCW::bfloat16_t;
 
-#include "r3d_attn_wmma_body.inc"   /* attn_paged_wmma_kernel<D, KVDT, SPLITK> */
+#include "r3d_attn_wmma_body.inc"    /* attn_paged_wmma_kernel<D, KVDT, SPLITK>  -- v1 schedule */
+#include "r3d_attn_wmma_body2.inc"   /* attn_paged_wmma_kernel2<D, KVDT, SPLITK> -- v2 schedule */
 
 } /* anonymous namespace */
 
@@ -116,6 +118,8 @@ using bf16 = roCW::bfloat16_t;
 namespace {
 template <int D, int KVDT, int SPLITK>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams) {}
+template <int D, int KVDT, int SPLITK>
+__global__ __launch_bounds__(kT) void attn_paged_wmma_kernel2(R3dAttnParams) {}
 } /* anonymous namespace */
 
 #endif
@@ -301,11 +305,19 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
     P.pf = a->scratch;
     P.splits = spl;
 
-    #define R3D_DK_LAUNCH(D, KV)                                                                     \
+    /* v1 slice kernel is the default -- the v2 256-thread schedule measured slower at
+     * deep ctx on the prefill bench (bit-identical, 0.43-0.80x; see the wmma launcher).
+     * R3D_ATTN_V2=1 covers BOTH halves of this row: the tile_or_v1 arm through the
+     * prefill launcher's own v2 selection, and the slice kernel here. The merge kernel
+     * is body-agnostic -- same arena contract -- so one instantiation serves both. */
+    static int v2 = -1;
+    if (v2 < 0) v2 = getenv("R3D_ATTN_V2") ? 1 : 0;   /* v1 default: see wmma launcher */
+
+    #define R3D_DK_LAUNCH(K, D, KV)                                                                  \
         do {                                                                                         \
-            hipLaunchKernelGGL((attn_paged_wmma_kernel<D, KV, 1>),                                   \
+            hipLaunchKernelGGL((K<D, KV, 1>),                                                        \
                                dim3((unsigned)P.q_heads, (unsigned)P.n_seq, (unsigned)gz),           \
-                               dim3(kThreads), 0, stream, P);                                        \
+                               dim3(v2 ? kT : kThreads), 0, stream, P);                             \
             hipError_t e0 = hipGetLastError();                                                       \
             if (e0 != hipSuccess) return RAD_E_DEVICE;   /* partial state: fail the step; no arm\n    * may resume on half a launch -- libr4d's decode entries abort the same way */             \
             hipLaunchKernelGGL((attn_splitk_merge_kernel<D>),                                        \
@@ -322,10 +334,14 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
 
     const int kvbf = (P.kvdt == RAD_BF16);
     const int d128 = (P.head_dim == 128);
-    if      (d128 &&  kvbf) R3D_DK_LAUNCH(128, RAD_BF16);
-    else if (d128 && !kvbf) R3D_DK_LAUNCH(128, RAD_F8E4M3);
-    else if (!d128 &&  kvbf) R3D_DK_LAUNCH(64, RAD_BF16);
-    else                     R3D_DK_LAUNCH(64, RAD_F8E4M3);
+    #define R3D_DK_ARMS(K)                                                           \
+        if      (d128 &&  kvbf) R3D_DK_LAUNCH(K, 128, RAD_BF16);                     \
+        else if (d128 && !kvbf) R3D_DK_LAUNCH(K, 128, RAD_F8E4M3);                   \
+        else if (!d128 &&  kvbf) R3D_DK_LAUNCH(K, 64, RAD_BF16);                     \
+        else                     R3D_DK_LAUNCH(K, 64, RAD_F8E4M3);
+    if (v2) { R3D_DK_ARMS(attn_paged_wmma_kernel2) }
+    else    { R3D_DK_ARMS(attn_paged_wmma_kernel)  }
+    #undef R3D_DK_ARMS
     #undef R3D_DK_LAUNCH
     return RAD_E_DEVICE;   /* unreachable: every macro arm returns */
 }
