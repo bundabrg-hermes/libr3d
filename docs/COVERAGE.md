@@ -633,7 +633,28 @@ fault-free; contention false-fails remain a reason to distrust FAILs, not
 passes).
 
 Kept: v3 stays behind `R3D_ATTN_V3=1` (same opt-in postmortem pattern as v2).
-Open next: serve-side A/B (the engine path, restart pending); the gemm DBUF
-lesson (prefetch the next slice during this tile's mma) is now the untried
-axis for attention -- at 143 GB/s there is ~3.5x of card left on the staging
-path alone.
+
+### Serve-side A/B (promotion run, same session, paired by mount swap)
+
+build6 (scalar staging) vs build7 (vec), identical container/model/flags,
+uuid-salted prompts, arms interleaved within one hour window:
+
+| probe            | build6       | build7       | verdict |
+|------------------|--------------|--------------|---------|
+| TTFT @981 (x5)   | 0.255 med    | 0.248 med    | wash (attention share small at short ctx; distributions touch) |
+| TTFT @1961 (x5)  | 0.485 med    | 0.446 med    | win, non-overlapping (0.484 min vs 0.454 max) |
+| decode @2k (x1)  | 31.7 tok/s   | 38.8 tok/s   | 1.22x single-shot |
+| decode @8k (x1)  | 14.0 tok/s   | 22.1 tok/s   | 1.57x -- lands exactly in the tile-bench predicted band (1.44-1.64x) |
+
+Decode window = cached-prompt pattern (n_predict=1 warm with cache_prompt=true,
+then timed generation; `tokens_predicted` is the count field). The 2k first
+sample early-stopped after 1 token: staging is bit-identical so it is not a
+kernel signal -- filler text near an EOS-prone shape; decode probes must pin
+gen length and treat early stop as a spoiled sample, not a rate.
+R3D_NO_WMMA=1 arm at 8k prefill exceeded a 300 s client budget (minutes-slow
+scalar attention) -- deep-context necessity of the WMMA row, quantitatively.
+Promoted: serve now mounts build7 as default (0ce1007); no env flag needed
+for rollback except rebuild-and-remount of build6 (kept on disk).
+Open next: the gemm DBUF lesson (prefetch the next slice during this tile's
+mma) is now the untried axis for attention -- at 143 GB/s there is ~3.5x of
+card left on the staging path alone.
