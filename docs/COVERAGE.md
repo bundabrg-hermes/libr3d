@@ -437,3 +437,48 @@ host-radiance co-tenant holds the RAM) but share gemm_nt's launch path verbatim.
 Side observation: today's re-measured baselines (0.36 s @981) run ~4x under the
 historical post-FA note (1.33 s) -- co-tenant and box state differ from that
 session; another reason A/B must be same-day paired runs, never historical deltas.
+
+## 2026-10-20: the WMMA attn tile is latency-bound, and long-ctx decode collapses
+
+Serve-side measurement (MiniCPM5-2B fixture, 42 layers, full-attention, KV 1024
+B/token, --bench kbench timing table from the shipped fixture pack):
+
+| ctx (tokens) | decode rate | decode step | prefill TTFT | prefill quadratic share |
+|--------------|-------------|-------------|--------------|-------------------------|
+| ~30          | 48.2 tok/s  | 21 ms       | -            | -                       |
+| 2048         | 11.2 tok/s  | 89 ms       | 0.578 s      | ~0.06 s (10%)           |
+| 4075         | -           | -           | 1.284 s      | ~0.20 s (16%)           |
+| 8200         | 3.1 tok/s   | 323 ms      | 3.671 s      | ~1.38 s (38%)           |
+
+Host CPU 0.1% during the 8k decode (docker stats): every ctx-proportional ms is
+DEVICE time -- no AVX fallback anywhere in this. Decode step is linear in ctx
+(0.038 ms per ctx token); the prefill quadratic is the KV re-read per 64-row
+query tile (~M/2 x ctx KV bytes), and the observed 1.38 s at 8k implies ~15 GB/s
+for those reads against a card doing 500-700 GB/s cold.
+
+kbench `attn_paged --bench --timing-only` attributes it exactly. The tile row
+(attn_paged_bf16, confirmed reached) sustains, at steady deep-ctx cases:
+hd=128 rows 2.6-15 GB/s; hd=256 rows 0.5 GB/s; and even the small-ctx prefill
+cases never exceed ~500 GF/s -- ~100x under WMMA peak. Root cause is the tile
+structure, not a fallback: one block per (head, query tile) -- a whole q_len=1
+layer runs on only n_head blocks of 96 CUs; 32-key steps with ~4 __syncthreads
+each; single-buffered K/V staging (load->barrier->mma->barrier fully serialised);
+at hd=256 the Q+KV+S LDS carve forces one block/CU, matching its 30x deficit vs
+hd=128. The old "2.1-3.1x from WMMA" claim stands only against the scalar
+reference; the tile itself is the long-ctx bottleneck.
+
+Fix directions (next milestone, ranked): (1) DECODE split-K -- the op schema
+already carries a `splits` parameter; stream KV chunks in parallel blocks and
+combine (flash-decode), turning 24 blocks into ~1000 and the 8k step from
+323 ms toward its ~1 ms bandwidth floor; (2) PREFILL tile redesign -- kBN 128+,
+double-buffered staging (gemm DBUF lesson applies), fewer barriers, softmax on
+fragments where possible, occupancy budget set per head_dim.
+
+MXFP4 feasibility note while we were in the vocabulary: radiance 1.8.1 loads OCP
+MXFP4 natively (RAD_FP4E2M1; e2m1 codes + E8M0 scale per 32 K) and serves it at
+op `gemm_nt_q` encoding `mxfp4a8` (fp8 e4m3 activations). `qwen3.8-27b-mxfp4.rad`
+(19 GiB) is already on rdna3-dev, and the SHIPPED fixture pack kernels.rkb contains
+recorded mxfp4a8 + fp8a8 gemm_nt_q cases -- the oracle loop for a Tier-3 tile
+runs with zero model risk. Boundary-conversion design (e2m1*e8m0 -> bf16
+fragments per k-slice, exponent add only) fits the existing m64 DBUF structure;
+e8m0 scales are powers of two, foldable into the per-group accumulator scale.
