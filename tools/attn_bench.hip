@@ -5,9 +5,12 @@
 // same path the engine takes) over serve-shaped geometries: head_dim 128/64, gqa 8,
 // bf16 KV, page-block table, causal.
 //
-// Two arms, two processes, one binary: R3D_ATTN_V1=1 selects the v1 schedule, unset
-// the v2 default (env is read once per process -- run twice). Same-binary/same-day
-// pairing, the gemm DBUF promotion pattern. The tool prints one line per geometry:
+// Arms, one process each, one binary: R3D_ATTN_V1=1 selects the v1 schedule (the
+// default), R3D_ATTN_V2=1 the v2 256-thread schedule, R3D_ATTN_V3=1 the v3 thin
+// 32-row block (env read once per process -- run once per arm). Same-binary/same-day
+// pairing, the gemm DBUF promotion pattern. v3's arithmetic is v1's per-row chain, so
+// v3 and v1 hashes MUST match -- hash equality is the gate, timing is the question.
+// The tool prints one line per geometry:
 // the min/median launch us, the effective KV-read GB/s (tiles_q * q_heads * ctx *
 // slot bytes -- the metric COVERAGE.md's latency diagnosis is written in), and a
 // FNV hash of the output. v1 and v2 fix the mma accumulation ORDER by construction,

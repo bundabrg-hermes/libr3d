@@ -97,6 +97,8 @@ constexpr int kBM = 64, kBN = 32;           /* query rows x keys per step */
 constexpr int kThreads = 128;               /* v1 body: 4 wave32s, 16 query rows each */
 constexpr int kT = 256;                     /* v2 body (body2.inc): 8 wave32s; outside the
                                              * chip gate so the launcher can size its block */
+constexpr int kBM3 = 32;                    /* v3 body (body3.inc): THIN block -- 2 wave32s, */
+constexpr int kThreads3 = 64;               /* ~25 KB LDS at D=128 for 2 blocks/CU */
 constexpr float kLog2e = 1.44269504088896340736f;
 
 } /* anonymous namespace */
@@ -113,6 +115,7 @@ using bf16 = roCW::bfloat16_t;
 
 #include "r3d_attn_wmma_body.inc"    /* attn_paged_wmma_kernel<D, KVDT, SPLITK>  -- v1 schedule */
 #include "r3d_attn_wmma_body2.inc"   /* attn_paged_wmma_kernel2<D, KVDT, SPLITK> -- v2 schedule */
+#include "r3d_attn_wmma_body3.inc"   /* attn_paged_wmma_kernel3<D, KVDT>         -- v3 thin block */
 
 } /* anonymous namespace */
 
@@ -124,6 +127,8 @@ template <int D, int KVDT, int SPLITK>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams) {}
 template <int D, int KVDT, int SPLITK>
 __global__ __launch_bounds__(kT) void attn_paged_wmma_kernel2(R3dAttnParams) {}
+template <int D, int KVDT>
+__global__ __launch_bounds__(kThreads3) void attn_paged_wmma_kernel3(R3dAttnParams) {}
 } /* anonymous namespace */
 
 #endif
@@ -182,11 +187,18 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
      * same .so, same shapes, every dtype either way. */
     static int v2 = -1;
     if (v2 < 0) v2 = getenv("R3D_ATTN_V2") ? 1 : 0;
+    /* v3: same arithmetic as v1 on a 32-row/64-thread block (body3.inc). The bet is
+     * occupancy, not schedule: ~25 KB LDS -> 2 blocks/CU at hd=128 where v1 fits one.
+     * Opt-in until the bench says otherwise. Takes precedence over v2 (v2 stays
+     * reachable only without v3). */
+    static int v3 = -1;
+    if (v3 < 0) v3 = getenv("R3D_ATTN_V3") ? 1 : 0;
 
-    const unsigned tiles = (unsigned)((P.rows + kBM - 1) / kBM);
+    const unsigned bm = v3 ? (unsigned)kBM3 : (unsigned)kBM;
+    const unsigned tiles = (unsigned)((P.rows + bm - 1) / bm);
     if (P.n_seq <= 0 || P.n_seq > 65535 || tiles == 0 || tiles > 65535) return RAD_E_UNSUPPORTED;
     dim3 grid((unsigned)P.q_heads, (unsigned)P.n_seq, tiles);
-    dim3 block(v2 ? kT : kThreads);
+    dim3 block(v3 ? kThreads3 : (v2 ? kT : kThreads));
 
     const int kvbf = (P.kvdt == RAD_BF16);
     if (!kvbf && P.kvdt != RAD_F8E4M3) return RAD_E_UNSUPPORTED;
@@ -197,8 +209,17 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
         else if (d128 && !kvbf) R3D_LAUNCH(K, 128, RAD_F8E4M3);                \
         else if (!d128 &&  kvbf) R3D_LAUNCH(K, 64, RAD_BF16);                  \
         else                     R3D_LAUNCH(K, 64, RAD_F8E4M3);
-    if (v2) { R3D_ARMS(attn_paged_wmma_kernel2) }
-    else    { R3D_ARMS(attn_paged_wmma_kernel)  }
+    #define R3D_LAUNCH3(K, D, KV) hipLaunchKernelGGL((K<D, KV>), grid, block, 0, stream, P)
+    #define R3D_ARMS3(K)                                                       \
+        if      (d128 &&  kvbf) R3D_LAUNCH3(K, 128, RAD_BF16);                 \
+        else if (d128 && !kvbf) R3D_LAUNCH3(K, 128, RAD_F8E4M3);               \
+        else if (!d128 &&  kvbf) R3D_LAUNCH3(K, 64, RAD_BF16);                 \
+        else                     R3D_LAUNCH3(K, 64, RAD_F8E4M3);
+    if (v3)      { R3D_ARMS3(attn_paged_wmma_kernel3) }
+    else if (v2) { R3D_ARMS(attn_paged_wmma_kernel2) }
+    else         { R3D_ARMS(attn_paged_wmma_kernel)  }
+    #undef R3D_ARMS3
+    #undef R3D_LAUNCH3
     #undef R3D_ARMS
     #undef R3D_LAUNCH
     hipError_t le = hipGetLastError();
