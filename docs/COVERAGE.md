@@ -1072,3 +1072,81 @@ Lessons, permanent:
 GDN holes left for the 27B trunk: `gdn_recurrent_update` (the last graph hole), plus the two
 unrecorded ops (`gdn_conv_recurrent_update` and the conv-prep sibling) and the two fixtures
 declined by the ssm-dt dtype quirk.
+
+## 2026-10-20: gdn_recurrent_update_bf16 -- the last device-graph hole closes, 31/31
+
+The decode recurrence against the paged state cache: per-token delta rule
+`S = e^g S + beta (v - S k) k^T`, the qk l2 norms, the q readout, and the gated RMS norm
+folded into the epilogue (ref_gdn.cpp; 48 of 64 layers run it every decode step). Row
+`gdn_recurrent_update_bf16`, kernel in `src/r3d_gdn.hip` after the chunk_scan section,
+schema `pRecurrent/oRecurrent` verbatim libref (kSchemas-declared so the row stands alone),
+constraints `head_k==128, 1<=head_v<=128, state_form in {per_candidate}`.
+
+**The layout hook was a phantom.** The handover carried `gdn_recurrent_update` as
+"needs the weight-layout hook for three encoded planes" -- the probe settled it in one
+run: `A_log`, `dt_bias`, `norm_w` are `scheme=plain`, ONE plane each, stored bf16 in this
+container. `weight_refusal` declines a hookless device row only above one plane, so the
+row reads them AS STORED through `ldt2` -- dtype-driven exactly like the oracle's `ldt`,
+which is what keeps bf16-stored weights bit-equal on both sides. The three-week-old
+"blocked by the layout hook" note was inherited, probed once, and dissolved.
+
+**One block per (sequence, v head) -- thread owns one value column.** The same
+transposed-state register layout as chunk_scan (thread e owns `St[d][e]`, 128 f32
+registers), and the delta rule turned out to be nearly barrier-free BY THE MATH: the
+update's two d loops read only `kn[d]` into thread e's own column, so decay, the S k
+product, the rank-1 add and the q readout are all register-local per thread. Only two
+reductions cross threads, and BOTH walk ref's serial order on purpose:
+
+* the qk l2 sums -- thread 0 over the staged q/k rows (not two per-thread chains);
+* the rms sum `sq2 += orow[e]^2` -- a 128-long ASCENDING-e chain, so `block_sum` (the
+  tree) would reassociate it. The squares stage to LDS and thread 0 walks the chain.
+  128 cheap LDS reads per token is the price of the contract; correctness trades no chain.
+
+Barriers: six per token, matched on every path (the `!own` tail marches through two
+beside the rms pair). Early returns (`slen<=0`, negative input slot) are block-uniform.
+
+**The two bugs the first card run found, both inherited-shape traps:**
+
+* `r3d_softplus` shipped as `log1p(-x)` / `log1p(x)` -- the exp fell out of the port, and
+  `log1p(-1) = -inf` sent the gate exponent to +inf and the state to 1e14. Ref's
+  act_softplus takes `log1p(exp(+/-x))` in both branches; the fix restores it verbatim.
+* `norm_w` was offset TWICE -- `nw + e*w_s1b` AND index `e`. The row landed on element
+  2e of the bf16 plane, so every channel got the wrong stored scale while the state
+  stayed bit-exact (the weight feeds only the epilogue) -- a failure signature that
+  localised the bug to the epilogue in one read of the report. One offset only.
+
+`state_form=per_candidate` is constraint-gated, and the rule that "a constraint on a key
+the query lacks does not hold" makes it exact: the arch block always declares state_form
+("anchor when speculating, else per_candidate"), so serve decode and the nodraft pack hit
+this row, while anchor batches (the drafter, and every gdn_recurrent case in the FULL
+pack) stay with libr4d/libavx untouched -- confirmed by the full-pack report: zero
+anchor cases attributed to libr3d. `o_q/o_scale` (the folded out-projection quantiser,
+absent from every recorded 27B case) is REFUSED, never silently ignored.
+
+Gates (all via `tools/gate.sh`, serve and co-tenant serve untouched throughout):
+
+| sweep | result |
+|---|---|
+| nodraft 27B pack, `--op gdn_recurrent_update` | **64/64**, worst rel_l2 **0.000e+00** (bit-exact, all 8 q_len digests 1..128 attributed `gdn_recurrent_update_bf16 \| libr3d \| device`), 0 OOB |
+| stock kernels.rkb, all libraries | **1897/1897** unchanged, worst rel_l2 unchanged at 3.135e-03 (the stock pack's recurrent cases are anchor-form -- correctly not taken) |
+| full mxfp4 pack (drafter + vision) | **4633/4633** unchanged, worst 2.859e-03 unchanged, 0 OOB (its recurrent cases are all anchor-form, all libavx/libref as before) |
+
+**The ratchet: 30 -> 31 of 31.** After staging the new `.so` into the serve home, the
+engine restarted clean (the startup refusal it exercised since day one is gone from this
+op): `kernel selection libavx (host) 564, libr3d 564 op bands` -- every device band
+covered, decode ~60 tok/s on a short request, health 200.
+
+Lessons, permanent:
+
+* **A serial reference reduction is the contract, not an implementation detail.** When
+  ref accumulates `sq2 += orow[e]^2` ascending, the tree sum is a different number.
+  Stage to LDS, walk it with one thread; the cost is bounded and the bit is exact.
+* **Early returns in barrier-carrying kernels must be block-uniform** -- guard on
+  blockIdx-derived values only (`slen`, `slot_in` qualify; `orow` never does).
+* **The probe answers the hook question for free.** Encoded != multi-plane: plain-scheme
+  single-plane weights are weight_refusal-invisible and dtype-driven reads on both sides.
+
+GDN holes for the 27B trunk: NONE -- the graph is whole. What remains in the family is
+the two unrecorded ops (`gdn_conv_recurrent_update` and the conv-prep sibling, blocked by
+the upstream ssm-dt dtype quirk, harness-side) and the anchor-form row the drafter needs
+(already libr4d's; the constraint keeps both libraries honest).
