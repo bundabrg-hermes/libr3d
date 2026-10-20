@@ -127,18 +127,32 @@ static void compare(const Opd& a, const Opd& d) {
     if (std::memcmp(a.b.h.data(), d.b.dout.data(), a.b.h.size()) == 0) return;
     ++g_fail;
     size_t eb = dt_bytes(a.b.dtype), bad = 0, shown = 0;
+    const auto& sh = a.b.shape;
+    /* Histogram by (dim0, dim1) cell: rows of a [T,H,.] output or [slots,H,.] state are
+     * exactly one head, and knowing WHICH heads diverge is the diagnosis. */
+    size_t cell = sh.size() >= 3 ? (size_t)sh[sh.size() - 2] * (size_t)sh[sh.size() - 1] : 1;
+    std::vector<std::pair<size_t, size_t>> hist;   // (cell index, count)
     for (size_t i = 0; i < a.b.n(); ++i) {
         const uint8_t* pa = a.b.h.data() + i * eb, *pb = d.b.dout.data() + i * eb;
         if (std::memcmp(pa, pb, eb) == 0) continue;
-        if (shown < 4) {
+        if (shown < 2) {
             double va = 0, vb = 0;
             if (a.b.dtype == RAD_F32) { std::memcpy(&va, pa, 4); std::memcpy(&vb, pb, 4); }
             std::printf("  MISMATCH %-12s elem %zu: ref=%.9g dev=%.9g\n", a.name, i, va, vb);
             ++shown;
         }
+        size_t c = i / cell, j = 0;
+        for (; j < hist.size(); ++j) if (hist[j].first == c) break;
+        if (j == hist.size()) hist.push_back({c, 0});
+        hist[j].second++;
         ++bad;
     }
-    std::printf("  %-12s: %zu/%zu elements differ\n", a.name, bad, a.b.n());
+    std::printf("  %-12s: %zu/%zu differ across cells [", a.name, bad, a.b.n());
+    for (size_t j = 0; j < hist.size() && j < 16; ++j)
+        std::printf(" (%zu,%zu):%zu", hist[j].first / (cell ? sh[sh.size()-2] : 1),
+                    hist[j].first % (sh[sh.size()-2] ? (size_t)sh[sh.size()-2] : 1),
+                    hist[j].second);
+    std::printf(" ]\n");
 }
 
 static void run_pair(Case& c, const RadKernelInfo* rk, const RadKernelInfo* dk) {
@@ -282,7 +296,7 @@ int main(int argc, char** argv) {
     {
         Case c; c.title = "fused A: N2 slen2+2 nacc{2,1} K128 V64 grp3 skip";
         const int T = 4, K = 128, V = 64, Hg = 2, H = 6, W = 4, CSL = 4, CSLOTS = 4,
-                  SST = 2, SW = 3, GRP = 3;
+                  SST = 4, SW = 3, GRP = 3;      // state pool [T,...], the recorded contract
         const int CD = 2 * Hg * K + H * V;
         c.pi("q_len", 2); c.pi("head_k", K); c.pi("head_v", V); c.pi("conv_width", W);
         c.pi("n_head_v", H); c.pf("scale", 0.08838834764831845); c.pf("eps", 1e-6);
@@ -313,7 +327,7 @@ int main(int argc, char** argv) {
         fill_f32(rng, c.o[st].b, 2.0f); fill_bf16(rng, c.o[z].b, 3.0f);
         fill_f32(rng, c.o[nw].b, 2.0f);
         fill_i32({1, 3}, c.o[ci].b);
-        fill_i32({0, 1, 1,  0, -1, 0}, c.o[si].b);     // seq0 in=si[0][1]=1; seq1 t1 write skipped
+        fill_i32({0, 1, 1,  2, -1, 0}, c.o[si].b);     // seq1 in=slot 2 (disjoint); t1 write skipped
         fill_i32({2, 1}, c.o[na].b);
         fill_i32({0, 2, 4}, c.o[cu].b);
         c.outs = {o, st, cs};
