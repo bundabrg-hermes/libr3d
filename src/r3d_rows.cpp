@@ -787,12 +787,13 @@ static const RadConstraint cAttnDecodeH64[] = {
     RAD_CIN("kv_dtype", "bf16 fp8_e4m3"),
 };
 
-/* rope: neox and gptj over [M] positions -- a subset of libr4d's five modes. A query for
- * mrope/imrope/axial resolves to no device row on this card, which is an honest failure at
- * issue, not an approximation. */
+/* rope: neox and gptj over [M] positions, plus imrope over [3, M] component-major positions
+ * (the 27B trunk's attention) -- a subset of libr4d's five modes. A query for mrope/axial
+ * resolves to no device row on this card, which is an honest failure at issue, not an
+ * approximation. */
 static const RadConstraint cRopeRow[] = {
     { "head_dim", RAD_C_GE, 1, nullptr },
-    { "mode",     RAD_C_IN, 0, "neox gptj" },
+    { "mode",     RAD_C_IN, 0, "neox gptj imrope" },
 };
 
 /* Sampler row constraints, mirroring libr4d's cSampleVoc / cSampleCand. */

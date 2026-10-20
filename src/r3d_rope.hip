@@ -12,10 +12,13 @@
  *   * the two products and the difference are separate f32 steps (-ffp-contract=off) and the
  *     store is the single RTNE narrowing.
  *
- * Scope: the neox and gptj pairings over [M] positions, which is everything a bf16 text model
- * issues (neox). The multi-component modes (mrope/imrope/axial), a non-rotary ladder, yarn and
- * llama3 frequency scaling, and [C, M] position tensors are refused at launch, not silently
- * approximated -- and the row's constraints keep the selector from asking.
+ * Scope: the neox and gptj pairings over [M] positions, plus `imrope` -- Qwen3-VL's interleaved
+ * M-RoPE over NeoX pairs (the 27B GDN trunk's attention) -- over [3, M] component-major
+ * positions and `sections`. `mrope`/`axial`, a non-rotary ladder, yarn and llama3 frequency
+ * scaling are refused at launch, not silently approximated -- and the row's constraints keep the
+ * selector from asking. With rank-1 positions the reference calls rope_freqs with no sections at
+ * all, so imrope there is exactly neox and rides the single-component kernel (ref_attn.cpp:
+ * "mrope and imrope over a text batch are neox exactly").
  *
  * Layout: one block per token; the frequency ladder is built once per block in LDS (the heads
  * within a token share it), then threads stride the (head, pair) work of the Q and K heads.
@@ -85,6 +88,43 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
     }
 }
 
+/* The imrope (Qwen3-VL interleaved M-RoPE) arm: [3, M] component-major positions. One block per
+ * token, same ladder in LDS as the single-component kernel; each (head, pair) item picks its
+ * position component by ref_rope's rule -- component 1 where i % 3 == 1 && i < 3*s1, component 2
+ * where i % 3 == 2 && i < 3*s2, component 0 everywhere else -- and reads it at
+ * `comp * pcs + m * pms`, exactly ref_rope's per-component rope_pos offset. NeoX pairing, one
+ * ladder: everything else about the rotation is the kernel above. */
+template <typename Tok>
+__global__ __launch_bounds__(kThreads) void rope_imrope_kernel(
+    uint16_t* __restrict__ qkv, const Tok* __restrict__ pos,
+    int64_t row_pitch, int64_t pcs, int64_t pms, int64_t ds,
+    uint32_t head_dim, uint32_t half, uint32_t rot, uint32_t heads,
+    uint32_t s1, uint32_t s2, float theta, float div) {
+    extern __shared__ float inv[];
+    const int64_t m = blockIdx.x;
+
+    for (uint32_t i = threadIdx.x; i < half; i += kThreads)
+        inv[i] = 1.0f / (float)pow((double)theta, (double)((float)(2u * i) / (float)rot));
+    __syncthreads();
+
+    const uint16_t* const row = qkv + m * row_pitch;
+    const uint32_t work = heads * half;
+    for (uint32_t w = threadIdx.x; w < work; w += kThreads) {
+        const uint32_t h = w / half, i = w - h * half;
+        const uint32_t c = (i % 3u == 1u && i < 3u * s1) ? 1u
+                       : (i % 3u == 2u && i < 3u * s2) ? 2u : 0u;
+        const float p = (float)(double)pos[(int64_t)c * pcs + m * pms] / div;
+        uint16_t* __restrict__ xr = (uint16_t*)row + (int64_t)h * head_dim;
+        const float ang = p * inv[i];
+        float cn, sn;
+        sincosf(ang, &sn, &cn);
+        const float x0 = r3d_bf16_to_f32(xr[i * ds]);
+        const float x1 = r3d_bf16_to_f32(xr[(i + half) * ds]);
+        xr[i * ds] = r3d_f32_to_bf16(x0 * cn - x1 * sn);
+        xr[(i + half) * ds] = r3d_f32_to_bf16(x0 * sn + x1 * cn);
+    }
+}
+
 } /* anonymous namespace */
 
 /* Launch entry. Operands positional in the rope schema: qkv (INOUT), positions (IN). */
@@ -103,17 +143,41 @@ extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
     rot = rad_args_geti_or(a, "rotary_dim", head_dim);
     if (rot <= 0 || rot > head_dim || (rot & 1)) return RAD_E_SHAPE;
 
-    /* Modes, ref's kModes order; the row serves neox (0) and gptj (1) only. */
+    /* Modes, ref's kModes order; the row serves neox (0), gptj (1) and imrope (3). mrope (2)
+     * and axial (4) resolve to no device row on this card -- an honest fallback, not an
+     * approximation. */
     const char* ms = rad_args_gets(a, "mode");
     if (!ms) return RAD_E_INVAL;
-    const int mode = !std::strcmp(ms, "neox") ? 0 : !std::strcmp(ms, "gptj") ? 1 : -1;
+    const int mode = !std::strcmp(ms, "neox") ? 0 : !std::strcmp(ms, "gptj") ? 1
+                   : !std::strcmp(ms, "imrope") ? 3 : -1;
     if (mode < 0) return RAD_E_UNSUPPORTED;
+    const bool multi = pos->rank >= 2;
+    if (multi && mode != 3) return RAD_E_UNSUPPORTED;    /* the multi arm is imrope only */
+
+    /* Sections, ref's rope_sections: a whitespace-free strtoll run, a non-positive part is a
+     * shape error. The single-component arm keeps its shipped refusal of any sections string
+     * (the reference ignores them at rank 1, but a stray ladder request should not reach the
+     * kernel by loosening an arm that is gated in the field); imrope needs at least three. */
+    int64_t sec[8] = {};
+    int n_sec = 0;
+    {
+        const char* v = rad_args_gets(a, "sections");
+        while (v && *v && n_sec < 8) {
+            char* end = nullptr;
+            const long long x = std::strtoll(v, &end, 10);
+            if (end == v) break;
+            if (x <= 0) return RAD_E_SHAPE;
+            sec[n_sec++] = x;
+            v = end;
+        }
+    }
+    if (n_sec > 0 && mode != 3) return RAD_E_UNSUPPORTED;
+    if (multi && n_sec < 3) return RAD_E_UNSUPPORTED;
 
     /* Refusals, each a shape the oracle computes differently than this kernel: the oracle
      * ignores sections and yarn for single-component neox/gptj too, but a mistyped ladder or
      * a scaling request reaching this row would compute silently different angles. */
-    if (pos->rank >= 2) return RAD_E_UNSUPPORTED;          /* multi-component positions */
-    if (rad_args_gets(a, "sections") || rad_args_gets(a, "ladder")) return RAD_E_UNSUPPORTED;
+    if (rad_args_gets(a, "ladder")) return RAD_E_UNSUPPORTED;
     if (rad_args_getf_or(a, "yarn_factor", 0.0) != 0.0 ||
         rad_args_getf_or(a, "llama3_factor", 0.0) != 0.0) return RAD_E_UNSUPPORTED;
 
@@ -121,9 +185,20 @@ extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
     const float scale = (float)rad_args_getf_or(a, "scale", 1.0);
     const float div = scale != 0.0f ? scale : 1.0f;
 
-    /* ref's offlin(pos, m) for a rank-1 position tensor: m * its element stride. */
-    const int64_t pos_stride = pos->rank >= 1 ? pos->stride[pos->rank - 1] : 1;
-    const int64_t M = rad_tensor_numel(pos);
+    /* ref's offlin(pos, m) for a rank-1 position tensor: m * its element stride. At rank 2
+     * ref_rope walks c * stride[0] + m * stride[1] and takes M from shape[1] (the components
+     * are not tokens). */
+    int64_t pos_stride = 1, pcs = 0, pms = 0, M;
+    if (multi) {
+        if (pos->rank != 2) return RAD_E_SHAPE;
+        if (pos->shape[0] < 3 || pos->shape[0] > 8) return RAD_E_SHAPE;   /* ref's n_comp guard */
+        pcs = pos->stride[0];
+        pms = pos->stride[1];
+        M = pos->shape[1];
+    } else {
+        pos_stride = pos->rank >= 1 ? pos->stride[pos->rank - 1] : 1;
+        M = rad_tensor_numel(pos);
+    }
     const int64_t stride_row = (n_head + 2 * n_head_kv) * head_dim;
     if (M <= 0 || M > 0x7fffffffLL) return RAD_E_SHAPE;
     if (rad_tensor_numel(qkv) < M * stride_row) return RAD_E_SHAPE;
@@ -155,21 +230,43 @@ extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
     const size_t shmem = (size_t)half * sizeof(float);
 
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
+    if (multi) {   /* imrope: the guards above proved mode 3, rank 2, n_sec >= 3 */
+        const uint32_t s1 = (uint32_t)sec[1], s2 = (uint32_t)sec[2];
+        if (pos->dtype == RAD_I32)
+            hipLaunchKernelGGL((rope_imrope_kernel<int32_t>), dim3((uint32_t)M), dim3(kThreads),
+                               shmem, stream, (uint16_t*)qkv->data, (const int32_t*)pos->data,
+                               row_pitch, pcs, pms, ds, (uint32_t)head_dim, half,
+                               (uint32_t)rot, heads, s1, s2, theta, div);
+        else if (pos->dtype == RAD_I64)
+            hipLaunchKernelGGL((rope_imrope_kernel<int64_t>), dim3((uint32_t)M), dim3(kThreads),
+                               shmem, stream, (uint16_t*)qkv->data, (const int64_t*)pos->data,
+                               row_pitch, pcs, pms, ds, (uint32_t)head_dim, half,
+                               (uint32_t)rot, heads, s1, s2, theta, div);
+        else
+            hipLaunchKernelGGL((rope_imrope_kernel<float>), dim3((uint32_t)M), dim3(kThreads),
+                               shmem, stream, (uint16_t*)qkv->data, (const float*)pos->data,
+                               row_pitch, pcs, pms, ds, (uint32_t)head_dim, half,
+                               (uint32_t)rot, heads, s1, s2, theta, div);
+        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    }
+    /* rank-1 imrope reaches the single-component kernel: the reference builds its frequencies
+     * with no sections at rank 1, so every component is the token's one position. */
+    const int pair_mode = mode == 1 ? kGptj : 0;
     if (pos->dtype == RAD_I32)
         hipLaunchKernelGGL((rope_kernel<int32_t>), dim3((uint32_t)M), dim3(kThreads),
                            shmem, stream, (uint16_t*)qkv->data, (const int32_t*)pos->data,
                            row_pitch, pos_stride, ds, (uint32_t)head_dim, half, (uint32_t)rot, heads,
-                           mode, theta, div);
+                           pair_mode, theta, div);
     else if (pos->dtype == RAD_I64)
         hipLaunchKernelGGL((rope_kernel<int64_t>), dim3((uint32_t)M), dim3(kThreads),
                            shmem, stream, (uint16_t*)qkv->data, (const int64_t*)pos->data,
                            row_pitch, pos_stride, ds, (uint32_t)head_dim, half, (uint32_t)rot, heads,
-                           mode, theta, div);
+                           pair_mode, theta, div);
     else
         hipLaunchKernelGGL((rope_kernel<float>), dim3((uint32_t)M), dim3(kThreads),
                            shmem, stream, (uint16_t*)qkv->data, (const float*)pos->data,
                            row_pitch, pos_stride, ds, (uint32_t)head_dim, half, (uint32_t)rot, heads,
-                           mode, theta, div);
+                           pair_mode, theta, div);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
