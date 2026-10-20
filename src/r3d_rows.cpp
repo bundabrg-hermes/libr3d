@@ -383,6 +383,41 @@ static const RadOperandSpec oChunkScan[] = {
     { "ht",        RAD_OPD_OUT, 1 },
     { "state_idx", RAD_OPD_IN,  1 },
 };
+/* gdn_recurrent_update: verbatim libref/libr4d (pGdnRecurrentUpdate/oGdnRecurrentUpdate).
+ * q_len is required (the 27B pack records it, 1..128); the rest optional with the launcher
+ * defaults matching ref's. norm_w is ROLE_WEIGHT like the oracle's, and its plain bf16 single
+ * plane (this container's storage) needs no layout hook -- the row reads what it is given. */
+static const RadParamSpec pRecurrent[] = {
+    { "q_len",        RAD_P_INT, RAD_REQUIRED },
+    { "head_k",       RAD_P_INT, RAD_REQUIRED },
+    { "head_v",       RAD_P_INT, RAD_REQUIRED },
+    { "n_head_v",     RAD_P_INT, RAD_OPTIONAL },
+    { "scale",        RAD_P_F64, RAD_OPTIONAL },
+    { "eps",          RAD_P_F64, RAD_OPTIONAL },
+    { "l2_eps",       RAD_P_F64, RAD_OPTIONAL },
+    { "softplus_thr", RAD_P_F64, RAD_OPTIONAL },
+    { "act",          RAD_P_STR, RAD_OPTIONAL },
+    { "state_fp16",   RAD_P_INT, RAD_OPTIONAL },
+    { "state_form",   RAD_P_STR, RAD_OPTIONAL },
+};
+static const RadOperandSpec oRecurrent[] = {
+    { "q",            RAD_OPD_IN,     0 },
+    { "k",            RAD_OPD_IN,     0 },
+    { "v",            RAD_OPD_IN,     0 },
+    { "a",            RAD_OPD_IN,     0 },
+    { "b",            RAD_OPD_IN,     0 },
+    { "A_log",        RAD_OPD_WEIGHT, 0 },
+    { "dt_bias",      RAD_OPD_WEIGHT, 0 },
+    { "state",        RAD_OPD_INOUT,  0 },
+    { "state_idx",    RAD_OPD_IN,     0 },
+    { "num_accepted", RAD_OPD_IN,     0 },
+    { "cu",           RAD_OPD_IN,     0 },
+    { "z",            RAD_OPD_IN,     1 },
+    { "norm_w",       RAD_OPD_WEIGHT, 1 },
+    { "o",            RAD_OPD_OUT,    0 },
+    { "o_q",          RAD_OPD_OUT,    1 },
+    { "o_scale",      RAD_OPD_OUT,    1 },
+};
 static const RadParamSpec pQuantActFp8[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -621,6 +656,10 @@ static const RadOpSchema kSchemas[] = {
       { "gdn_kkt_solve", pKktSolve, (int)(sizeof(pKktSolve)/sizeof(pKktSolve[0])),
         oKktSolve, (int)(sizeof(oKktSolve)/sizeof(oKktSolve[0])),
         "A = (I + strict_lower(diag(beta) K K^T e^dg))^-1 per chunk." },
+      { "gdn_recurrent_update", pRecurrent, (int)(sizeof(pRecurrent)/sizeof(pRecurrent[0])),
+        oRecurrent, (int)(sizeof(oRecurrent)/sizeof(oRecurrent[0])),
+        "The decode recurrence against the paged state cache, per-candidate form, gated RMS "
+        "norm folded. Verbatim libref/libr4d so co-loaded schema_same() passes." },
       { "gather_rows", pMnDtype, (int)(sizeof(pMnDtype)/sizeof(pMnDtype[0])),
         oGather, (int)(sizeof(oGather)/sizeof(oGather[0])),
         "y[i, :] = x[idx[i], :]. A negative index writes a zero row -- the padding convention a "
@@ -797,6 +836,17 @@ static const RadConstraint cChunkScan[] = {
     { "head_v", RAD_C_LE, 128,  nullptr },
     RAD_CEQ("chunk", 64),
 };
+/* recurrent_update: the same register bounds as chunk_scan (r4d declares 128/128 outright;
+ * the <= spelling keeps head_v under the one-column-per-thread block honest). The state_form
+ * constraint is the scope gate: per_candidate is the form this kernel implements and the form
+ * a non-speculative batch issues, and a constraint on a key the query lacks does not hold --
+ * so anchor batches (speculation) and unnamed callers stay with libr4d's anchor kernel. */
+static const RadConstraint cRecurrent[] = {
+    RAD_CEQ("head_k", 128),
+    { "head_v", RAD_C_GE, 1,    nullptr },
+    { "head_v", RAD_C_LE, 128,  nullptr },
+    RAD_CIN("state_form", "per_candidate"),
+};
 
 extern "C" int r3d_rad_rmsnorm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_embed_lookup(const RadArgs*, RadStream);
@@ -833,6 +883,7 @@ extern "C" int r3d_rad_gdn_gated_rmsnorm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gdn_conv_update(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gdn_kkt_solve(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gdn_chunk_scan(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gdn_recurrent_update(const RadArgs*, RadStream);
 extern "C" int r3d_rad_silu_mul(const RadArgs*, RadStream);
 extern "C" int r3d_rad_quant_act_i8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_row_topk(const RadArgs*, RadStream);
@@ -1240,6 +1291,27 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cChunkScan, 4, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gdn_chunk_scan },
+
+{ "gdn_recurrent_update_bf16", "gdn_recurrent_update", "gdn",
+  "the decode delta rule S = e^g S + beta(v - S k) k^T against the paged state cache, the qk l2 "
+  "norms, the q readout and the gated rms norm in one launch; one block per (sequence, v head), "
+  "the transposed f32 state in one-column-per-thread register arrays, every token walking the "
+  "oracle's order",
+  "head_k 128 (register bound, as on chunk_scan), head_v up to 128; state_form per_candidate "
+  "only -- anchor batches stay with libr4d's anchor kernel, and the constraint says so; the "
+  "state cache's slot/head/column strides are read off the tensor (a paged cache is page-"
+  "padded); state_idx rows may be wider than one column (the accepted-prefix walk clamps to the "
+  "last), a negative input slot skips the (sequence, head) row whole and a negative output slot "
+  "skips only that token's state write, both as the reference's guards do; the o_q/o_scale "
+  "quantiser pair is refused, never silently dropped",
+  "f32/bf16 q/k/v/a/b/o and z, f32-or-bf16 A_log/dt_bias/norm_w read as stored (plain single-"
+  "plane weights -- the 27B container stores them bf16 and the oracle's dtype-driven ldt reads "
+  "the same bytes); the delta-rule chains, the serial-order rms and qk reductions, the double-"
+  "rounded exp/softplus/sigmoid and the three-step gated norm are bit-exact by construction, "
+  "the scalar sibling of libr4d's recurrent row",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cRecurrent, 4, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gdn_recurrent_update },
 
 /* ---- the three bands MiniCPM5-2B's graph names at resolve (see r3d_more.hip). The
  * engine refused to START without them: weightless device bands have no host stand-in. */
