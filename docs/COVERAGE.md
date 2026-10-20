@@ -658,3 +658,52 @@ for rollback except rebuild-and-remount of build6 (kept on disk).
 Open next: the gemm DBUF lesson (prefetch the next slice during this tile's
 mma) is now the untried axis for attention -- at 143 GB/s there is ~3.5x of
 card left on the staging path alone.
+
+## 2026-10-20: attention DBUF staging shipped — the gemm lesson transfers (1.19-1.27x tile, +21% serve decode@8k)
+
+Closed the open item above the same day. `body.inc` gained a `DBUF` template
+arm: `ld_kv_regs` walks the NEXT k-slice's gather global->registers while the
+current tile stages LDS and runs mma, so the memory stall shrinks to
+max(load, stage) instead of load+stage. Two structural consequences:
+
+* Row addressing (`RB` row-bases, `CB` col-bad bytes) double-buffers on LDS --
+  the prefetch must not scribble the addressing the in-flight mmas read. CB
+  updates land strictly after the barrier that publishes the staged tile.
+* Barriers drop to a3 in pass1 and a4 in pass2 (v1: a4/a6) -- a side effect
+  of the restructure, not the point. v2 taught us barrier count is not the
+  bottleneck; here the win is the overlap.
+
+Arithmetic is v1's chain verbatim (same fragment order, same LDS slots): all
+five bench geometries hash byte-equal across arms, both directions.
+
+Paired tile bench (build8, same binary, old arm sandwiched, drift <1.3%):
+
+| hd/qlen/ctx | DBUF us | old us | DBUF/old |
+|---|---|---|---|
+| 128/64/1024 | 368 | 461 | 1.25x |
+| 128/128/2048 | 688 | 888 | 1.29x |
+| 128/981/8192 | 6265 | 7512 | 1.20x |
+| 128/512/4096 | 1698 | 2055 | 1.21x |
+| 64/512/4096 | 1358 | 1673 | 1.23x |
+
+Deep-ctx KV rate 141 -> 171 GB/s (~2.9x of card still left; the next stall is
+register-prefetch depth: one tile ahead, could be two).
+
+Serve A/B (build8 mount, arms differ only by `R3D_ATTN_NO_DBUF=1`, two rounds
+alternating, uuid-poisoned prompts):
+
+| metric | DBUF | old | verdict |
+|---|---|---|---|
+| decode 8k tok/s | 26.4/27.2/27.6/28.6 | 22.1/22.5/23.9 | non-overlapping, +21% |
+| TTFT 1961 s | 0.442-0.467 | 0.466-0.507 | ~4% faster |
+| TTFT 981 s | 0.254 | 0.263 | ~3%, near noise |
+
+Gates, both arms: kbench shipped pack 1075/1075 (worst rel_l2 3.135e-03
+unchanged), attn_rows 8/8, oracle sweep 7/7, splitk probe spl 2/8 identical.
+Kill switch `R3D_ATTN_NO_DBUF=1`; fp8 KV and odd shapes never enter the arm
+(vec-path gate). Live serve: build8, DBUF default.
+
+Lesson for the skill: when a copy path is vectorized but still slow, the
+next lever is pipelining the copy across the compute step -- re-tiling
+geometry (v2/v3) was waste; the same DBUF pattern transferred from gemm to
+attention staging nearly verbatim.
