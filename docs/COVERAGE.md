@@ -899,6 +899,15 @@ Four rows, all fixture-gated against the real 27B pack (995-case nodraft):
 | `rope_table_f32` | rope_table | 1.9e-08 (1e-05) | first row where the sincosf-vs-double delta is *visible*: the store is f32, so the ~1 ULP difference surfaces at 1e-8 instead of hiding under a bf16 narrowing. Still 500x under the case tolerance. |
 | `gdn_gated_rmsnorm_bf16` | gdn_gated_rmsnorm | 9.9e-06 (6e-03) | tree-vs-sequential row sum, the same rounding class `rmsnorm_bf16` has always traded; 600x margin on real GDN data |
 
+Regressions with all libraries: kernels.rkb **1867/1867** (was 1850 — the +17 are
+the stock pack's 7 rope_table + 10 gdn_gated_rmsnorm cases, which already carry
+27B shapes there and now run device-side as well as host), mxfp4 full pack
+(drafter + vision) **4513/4513**; worst rel_l2s unchanged at 3.135e-03 /
+2.859e-03, the 24 named skips the same 7+ GiB embed/logits budget class. After
+this batch the full-pack `not reached: libr3d` list is 7 rows, all known classes
+(budget-skips, cast pairs absent from that pack, M==1 decode rows) — no 27B-side
+surprises.
+
 Design notes that outlive this batch:
 
 * **`offlin` is a liar for linear walkers.** `ref_sigmoid` walks numel(Y) through
