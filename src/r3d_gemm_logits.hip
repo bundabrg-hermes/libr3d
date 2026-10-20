@@ -28,10 +28,12 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 
 #include "rad_abi.h"
+#include "rad_plugin.h"   /* rad_arg_in / rad_tensor_numel (host-side entry helpers) */
 #include "rad_planes.h"
 
 #define R3D_DEVICE __device__ __forceinline__
@@ -213,7 +215,10 @@ extern "C" int r3d_rad_logits_gemm_e4m3(const RadArgs* a, RadStream s) {
                     xp, x_pitch, cp, ec->row_bytes, sp, scols_i, br_i, sdt,
                     yp, y_pitch, (int)N, (int)K, m_total, 0); break;
     }
-    return hipStreamSynchronize((hipStream_t)s) == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    const hipError_t le = hipGetLastError();
+    if (le != hipSuccess) fprintf(stderr, "libr3d: logits_e4m3 launch FAILED (%s)\n",
+                                  hipGetErrorString(le));
+    return le == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------- layout hooks */
