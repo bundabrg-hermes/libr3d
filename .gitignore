@@ -18,3 +18,4 @@ docs/isa/isa.db
 # test-host droppings (diagnostic scratch, python caches)
 diagb/
 __pycache__/
+tools/kf_probe_q.bin
