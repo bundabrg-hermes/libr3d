@@ -323,6 +323,28 @@ static const RadOperandSpec oGatedNorm[] = {
     { "w", RAD_OPD_WEIGHT, 0 },
     { "o", RAD_OPD_OUT,    0 },
 };
+/* gdn_conv_update: verbatim libref (pConvUpdate/oConvUpdate). num_accepted is required by
+ * the schema -- ref's comment: an op that lets the caller omit it is an op whose rollback
+ * contract is optional. */
+static const RadParamSpec pConvUpdate[] = {
+    { "q_len",        RAD_P_INT, RAD_REQUIRED },
+    { "head_k",       RAD_P_INT, RAD_REQUIRED },
+    { "head_v",       RAD_P_INT, RAD_REQUIRED },
+    { "conv_width",   RAD_P_INT, RAD_REQUIRED },
+    { "max_query_len",RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oConvUpdate[] = {
+    { "x",            RAD_OPD_IN,     0 },
+    { "w",            RAD_OPD_WEIGHT, 0 },
+    { "b",            RAD_OPD_WEIGHT, 1 },
+    { "conv_state",   RAD_OPD_INOUT,  0 },
+    { "state_idx",    RAD_OPD_IN,     0 },
+    { "num_accepted", RAD_OPD_IN,     0 },
+    { "cu",           RAD_OPD_IN,     0 },
+    { "q",            RAD_OPD_OUT,    0 },
+    { "k",            RAD_OPD_OUT,    0 },
+    { "v",            RAD_OPD_OUT,    0 },
+};
 static const RadParamSpec pQuantActFp8[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -551,6 +573,13 @@ static const RadOpSchema kSchemas[] = {
         oGatedNorm, (int)(sizeof(oGatedNorm)/sizeof(oGatedNorm[0])),
         "o = x * rsqrt(mean_channels(x^2) + eps) * w * act(z). `act` is \"silu\" or "
         "\"sigmoid\"." },
+      { "gdn_conv_update", pConvUpdate, (int)(sizeof(pConvUpdate)/sizeof(pConvUpdate[0])),
+        oConvUpdate, (int)(sizeof(oConvUpdate)/sizeof(oConvUpdate[0])),
+        "The same convolution for a decode step against the rolling window: reads at "
+        "num_accepted-1 and rewrites the buffer shifted down by one, so a speculative "
+        "rejection is a change of read offset rather than a recompute. `num_accepted` is "
+        "REQUIRED, because an op that lets the caller omit it is an op whose rollback "
+        "contract is optional (spec \u00a710); a non-speculative decode passes ones." },
       { "gather_rows", pMnDtype, (int)(sizeof(pMnDtype)/sizeof(pMnDtype[0])),
         oGather, (int)(sizeof(oGather)/sizeof(oGather[0])),
         "y[i, :] = x[idx[i], :]. A negative index writes a zero row -- the padding convention a "
@@ -708,6 +737,11 @@ static const RadConstraint cGatedNorm[] = {
     { "channels", RAD_C_GE, 1, nullptr },
     { "act",      RAD_C_IN, 0, "silu sigmoid" },
 };
+static const RadConstraint cConvUpdate[] = {
+    { "head_k",     RAD_C_GE, 1, nullptr },
+    { "head_v",     RAD_C_GE, 1, nullptr },
+    { "conv_width", RAD_C_GE, 1, nullptr },
+};
 
 extern "C" int r3d_rad_rmsnorm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_embed_lookup(const RadArgs*, RadStream);
@@ -741,6 +775,7 @@ extern "C" int r3d_rad_mul(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sigmoid(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gather_rows(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gdn_gated_rmsnorm(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gdn_conv_update(const RadArgs*, RadStream);
 extern "C" int r3d_rad_silu_mul(const RadArgs*, RadStream);
 extern "C" int r3d_rad_quant_act_i8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_row_topk(const RadArgs*, RadStream);
@@ -1101,6 +1136,20 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cGatedNorm, 2, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gdn_gated_rmsnorm },
+
+{ "gdn_conv_update_bf16", "gdn_conv_update", "gdn",
+  "decode-step depthwise conv with silu over the rolling window, one block per "
+  "(sequence, channel); the window reads at num_accepted-1 and rewrites shifted down "
+  "by one, so rejection is a read-offset change, not a recompute",
+  "conv_width up to 17 taps; x dense-row [T, conv_dim] (wider pitch fine, wider "
+  "unit-stride not); conv_state [slots, conv_dim, state_len] or flat-tight; index "
+  "tensors (state_idx, num_accepted, cu) must be fully dense; a window check that "
+  "fails skips its sequence instead of failing the op",
+  "f32/bf16 x/w/b/conv_state/q/k/v; i32/u32/i64 index reads; the width-tap f32 chain "
+  "runs in ref's ascending order over exact loads -- bit-exact by construction",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cConvUpdate, 3, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gdn_conv_update },
 
 /* ---- the three bands MiniCPM5-2B's graph names at resolve (see r3d_more.hip). The
  * engine refused to START without them: weightless device bands have no host stand-in. */
