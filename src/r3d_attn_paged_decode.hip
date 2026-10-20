@@ -147,8 +147,8 @@ __global__ __launch_bounds__(D) void attn_splitk_merge_kernel(R3dAttnParams P, i
     const float vds = P.vdes ? ldt_w(P.vdes, s * P.kv_heads + kh) : 1.0f;
     const float* pso = reinterpret_cast<const float*>(P.pf);
     const int64_t pn = P.rows * P.q_heads;
-    const float* psm = pso + pn * D;
-    const float* psl = psm + pn;
+    const float* psm = pso + pn * (int64_t)splits * D;
+    const float* psl = psm + pn * (int64_t)splits;
     const int64_t base = (tok * P.q_heads + h) * splits;
 
     const int64_t ob = tok * P.o_rs + (int64_t)h * P.o_hs + (int64_t)d * P.o_ds;
@@ -275,6 +275,10 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
     if (!wmma_ok) return tile_or_v1();
 
     int forced = (int)rad_args_geti_or(a, "splits", 0);
+    if (const char* e = getenv("R3D_FORCE_SPLITS")) {   /* bench knob: pin the split count */
+        const int v = atoi(e);
+        if (v > 0) forced = v;
+    }
     if (getenv("R3D_NO_SPLITK")) forced = 1;             /* A/B kill: the tile, same row */
     int64_t mc = rad_args_geti_or(a, "max_ctx", 0);
     if (mc <= 0) mc = P.jcap;

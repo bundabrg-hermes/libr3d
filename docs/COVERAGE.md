@@ -482,3 +482,58 @@ recorded mxfp4a8 + fp8a8 gemm_nt_q cases -- the oracle loop for a Tier-3 tile
 runs with zero model risk. Boundary-conversion design (e2m1*e8m0 -> bf16
 fragments per k-slice, exponent add only) fits the existing m64 DBUF structure;
 e8m0 scales are powers of two, foldable into the per-group accumulator scale.
+
+## 2026-10-20: decode split-K shipped — deep-ctx decode 3.0 -> 14.5 tok/s
+
+The fix direction above is now the decode band's default. Rows
+`attn_paged_decode_bf16kv_h{64,128}` (priority 1100) take window 0, q_len <= 8:
+the two-pass tile body, shared verbatim with the prefill row via
+`r3d_attn_wmma_body.inc` under a `SPLITK` template parameter, runs once per KV
+slice across `q_heads * n_seq * splits` blocks, stores un-normalized (O, m, l)
+partials into the engine scratch arena, and a merge kernel (one block per
+q head x query row) rescales them into the out row. Shape law on the host, one
+closed form: `splits = min(192/(q_heads*n_seq), tiles_kv/2, tiles_kv, 64)`, `splits`
+tunable 0 = the law. Kill switch `R3D_NO_SPLITK=1` runs the SPLITK=0 tail through
+the same entry; `R3D_FORCE_SPLITS=N` pins the split count for benches.
+
+Same-binary serve A/B (pair-differenced decode rate, `tools/decode_probe.py`,
+co-tenant state shared by both arms):
+
+| ctx    | tile arm  | split-KV arm | speedup |
+|--------|-----------|--------------|---------|
+| 2048   | 10.6 t/s  | 33.5 t/s     | 3.2x    |
+| 8192   | 3.0 t/s   | 14.5 t/s     | 4.8x    |
+
+The tile arm reproduces this file's own 3.1 tok/s measurement to the digit in
+the same window — the baseline was not a drifted serve. The split arm still
+runs 12 slices at 8k, not the ~1000 blocks the estimate imagined: the law caps
+at tiles_kv/2 (a slice must hold >= 2 tiles) and 64, and q_heads*n_seq is the
+grid floor — but 192 blocks over 96 CUs is already the difference between one
+wave of latency chains and many. The bandwidth floor (~1 ms/step) remains open
+ground for a bigger-kBN slice kernel; this is the 4.8x that the structure
+supports without touching the tile body.
+
+Verification, in the order that caught things: `--record-rows`-derived fixture
+(`tools/attn_rows.rkb`, 16 KiB, regenerate with
+`rad-kbench --op attn_paged --record-rows ...` from the shipped pack) replays
+the h128/h64 decode rows at 8-split and passes 8/8 (the SHIPPED pack is
+head_dim-256-only — every attn case in it, so a pass column from it alone
+proves nothing about these rows: the vacuous-pass trap, again, and kbench
+says so itself: `2 of 194 rows ran`). `tools/repro_attn_splitk.hip` then
+separates mechanism halves: it runs the row entry on a poisoned arena and
+RE-MERGES the partials host-side against an independent oracle — device-out
+and host-merge rel_l2 must both be small; which one fails says which half lies.
+It is what pinned two plane-base bugs the card sweep showed but did not locate
+(m-plane base omitted the splits factor; l-plane omitted it too; writer and
+reader had AGREED on the wrong layout, so only a third implementation on the
+contract caught it). `R3D_FORCE_SPLITS` 1/2/8/64 all green:
+probe 8/8, kbench rows 8/8 (worst 0.000), full sweep with both fixtures and
+`--all-rows`: 1083/1083, worst rel_l2 unchanged at 3.135e-03, 24 budget skips
+(co-tenant serve holds 29 GiB of the 31). Serve now runs from `build6/radiance_home`
+(build5 retired) with split-KV as the default arm; `/completion` sanity reads
+coherent.
+
+Serve lesson for the day, worth keeping: the probe's first pair after a serve
+start can read -518 tok/s (t8 > t108 while the engine warms its KV pool);
+the tool reports every pair, and medians hide the sign of the nonsense rather
+than deleting it. Discard cold-start pairs by eye, not by averaging.

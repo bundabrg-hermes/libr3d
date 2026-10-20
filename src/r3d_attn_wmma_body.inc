@@ -149,7 +149,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
         if (et1 <= et0) {
             float* pso = reinterpret_cast<float*>(P.pf);
             const int64_t pn = P.rows * P.q_heads;
-            float* psm = pso + pn * D, * psl = psm + pn;
+            float* psm = pso + pn * spl * D, * psl = psm + pn * spl;
             for (int64_t row = tid; row < valid; row += kThreads) {
                 const int64_t idx = ((tok_base + row) * P.q_heads + h) * spl + sp;
                 psm[idx] = -INFINITY; psl[idx] = 0.0f;
@@ -405,7 +405,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
          * around the syncthreads as the direct-out halves below. */
         float* pso = reinterpret_cast<float*>(P.pf);
         const int64_t pn = P.rows * P.q_heads;
-        float* psm = pso + pn * D, * psl = psm + pn;
+        float* psm = pso + pn * spl * D, * psl = psm + pn * spl;
         for (int half = 0; half < 2; ++half) {
             __syncthreads();
             if ((half == 0) ? (w < 2) : (w >= 2)) {
