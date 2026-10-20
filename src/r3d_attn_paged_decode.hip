@@ -206,13 +206,16 @@ int64_t decode_partial_bytes(int64_t rows, int64_t q_heads, int splits, int64_t 
     return rows * q_heads * (int64_t)splits * (head_dim + 2) * 4;
 }
 
-/* Can this shape take the GQA fold? gqa<=8 keeps the folded row count (qlen<=8 band
- * times gqa) inside the 64-row WMMA tile; !cus keeps the uniform-position contract the
- * launcher uses to size the fold tiles from q_len_uniform alone. Ragged batches take
- * the plain split arm unchanged. */
-bool decode_fold_ok(int64_t gqa, int64_t qlen_uniform, int n_cus) {
-    return gqa > 1 && gqa <= 8 && !n_cus && qlen_uniform > 0
-        && qlen_uniform * gqa <= kBM;
+/* Can this shape take the GQA fold? Any gqa > 1: the tile's row space is folded
+ * rows (token-major across the kv group), and tiles_q covers them with the loose
+ * host bound (P.rows*gqa/kBM) -- the body bounds per-seq against qlen*gqa exactly
+ * and dead tiles exit at the door. That holds for ragged batches too: the engine
+ * always passes cu_seqlens on decode (live DBG proved the older !cus gate killed
+ * the fold for every serve call), and per-seq lengths never need to be known
+ * host-side -- only the tile grid bound does, and the loose one is exact for the
+ * n_seq==1 case serve actually runs. */
+bool decode_fold_ok(int64_t gqa) {
+    return gqa > 1;
 }
 
 } /* anonymous namespace */
@@ -236,7 +239,7 @@ extern "C" int64_t r3d_rad_attn_decode_scratch(const RadArgs* a) {
         const int64_t kvh  = gqa > 1 ? n_head / gqa : n_head;
         const int64_t qlen = rad_args_geti_or(a, "q_len", 8) > 0 ? rad_args_geti_or(a, "q_len", 8) : 8;
         const int64_t tkv  = (mc + kBN - 1) / kBN;
-        const bool foldable = decode_fold_ok(gqa, qlen, 0);   /* declare has no cus tensor */
+        const bool foldable = decode_fold_ok(gqa);
         int64_t worst = 0;
         for (int64_t S = 1; S <= max_seqs; ++S) {
             int sp = decode_splits(n_head, S, tkv, sp_param);
@@ -256,7 +259,7 @@ extern "C" int64_t r3d_rad_attn_decode_scratch(const RadArgs* a) {
         if (mc <= 0) mc = P.jcap;
         const int64_t tkv = (mc + kBN - 1) / kBN;
         int sp = decode_splits(P.q_heads, P.n_seq, tkv, sp_param);
-        if (decode_fold_ok(P.gqa, P.q_len_uniform, P.cus ? 1 : 0)) {
+        if (decode_fold_ok(P.gqa)) {
             const int spf = decode_splits(P.kv_heads, P.n_seq, tkv, sp_param);
             if (spf > sp) sp = spf;
         }
@@ -319,9 +322,8 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
      * the slice once for the whole q-head group, so decode KV traffic drops by gqa.
      * Folded blocks are gqa-times fewer, so its splits law runs on kv_heads; a shape
      * the fold gate refuses, or one where fold resolves to 1 slice, takes the plain
-     * split arm unchanged. Ragged batches (cus) stay plain. */
-    const bool fold_ok = fold && !v2
-                      && decode_fold_ok(P.gqa, P.q_len_uniform, P.cus ? 1 : 0);
+     * split arm unchanged (only gqa==1 ever resolves that way). */
+    const bool fold_ok = fold && !v2 && decode_fold_ok(P.gqa);
     const int spl_fold = fold_ok ? decode_splits(P.kv_heads, P.n_seq, tkv, forced) : 1;
     const bool use_fold = fold_ok && spl_fold > 1;
     const int spl = use_fold ? spl_fold : spl_plain;
