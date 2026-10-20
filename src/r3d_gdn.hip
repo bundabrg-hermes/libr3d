@@ -27,6 +27,12 @@
  *   * the gate reuses the band's double-rounded sigmoid (r3d_sigmoid), silu = z*sigmoid(z);
  *   * `z` may be a column slice of a wider fused row -- ref's gate_rowoff -- which the
  *     kernel walks as (row/heads)*z_pitch + (row%heads)*ch.
+ *
+ * gdn_kkt_solve (third member): the chunk triangular inverse -- see the section comment for
+ * the full shape; the short version is that ref's forward substitution is a per-column f32
+ * chain, a chain a thread-owns-column kernel can walk in ref's exact order, so this row is
+ * bit-exact against the oracle without ever touching a WMMA fragment (libr4d's blocked-merge
+ * sibling on gfx12 is not).
  */
 #include <cstring>
 
@@ -129,16 +135,6 @@ static inline int row2_pitch(const RadTensor* t, int64_t cols, int64_t* pitch) {
     return 0;
 }
 
-/* ---- gdn_conv_update ----------------------------------------------------------------------
- * One block per (sequence, channel): conv_dim blocks per sequence, exactly ref's
- * REF_PAR_FOR(N * conv_dim) decomposition. Shared holds the three tiny broadcasts ref
- * keeps per-channel in a stack frame: the history window, the weight taps, the bias.
- * Block size 64: decode blocks are launch-floored, and a wide block would only idle
- * more threads at slen == 1. */
-
-constexpr uint32_t kConvThreads = 64;
-constexpr int32_t  kConvHistMax = 16;   /* ref's REF_CONV_HIST_MAX */
-
 /* Index-tensor reads (i32/u32/i64), same pattern as the attention rows' ldi_w. */
 __device__ __forceinline__ int64_t ldi_g(uint32_t dt, const void* p, int64_t i) {
     switch (dt) {
@@ -148,6 +144,115 @@ __device__ __forceinline__ int64_t ldi_g(uint32_t dt, const void* p, int64_t i) 
         default:      return 0;
     }
 }
+
+/* ---- gdn_kkt_solve ----------------------------------------------------------------------
+ * A = (I + strict_lower(diag(beta) . K K^T . e^{g_i - g_j}))^{-1}, per chunk, per v head --
+ * ref_gdn.cpp's spec, and the 27B chunked path's second op (head_k 128, chunk 64, k/A bf16,
+ * beta/g f32, cu i32/i64, M 1..512 in the recorded band).
+ *
+ * One block per (chunk, sequence, v head): chunks are independent by construction (each one's
+ * A reads only its own tokens' k/beta/g), so the chunk index is a free grid axis -- it is what
+ * fills the CUs at prefill M, where ref's N*H parallelism would idle most of the card.
+ *
+ * BIT-EXACT BY CONSTRUCTION against ref's forward substitution, which is why this row skips
+ * libr4d's WMMA 16->32->64 blocked merge: ref's inverse chain per column is
+ *   A[i][j] = delta(i,j) - sum_{l=j}^{i-1} M[i][l] * A[l][j]   (f32, l ascending, mul-then-sub),
+ * and a thread-owns-column-j walk of exactly that chain reproduces every f32 operation in
+ * order -- no accumulator rescale, no fragment layout, no reassociation. The M elements
+ * themselves are a d-ascending f32 dot over exactly-widened loads plus ref's exact scale
+ * chain (beta*dot)*exp(g_i - g_j) on the band's double-rounded exp; the strict-lower triangle
+ * is staged to LDS and the substitution then needs no inter-thread cooperation at all --
+ * thread j reads only its own column and the shared M rows.
+ *
+ * LDS: M's strict triangle (2016 f32) + one column per thread (padded to 65 so a warp's
+ * per-thread column walks hit distinct banks) ~= 25 KB -> two blocks/CU. ref's chunk loop and
+ * per-chunk guards are the grid mapping itself; a block at or past its sequence's end exits
+ * empty, and tail chunks (L < chunk) compute and store only the L existing token rows -- full
+ * 64-wide A rows, zeros above the diagonal, exactly as ref writes them.
+ */
+constexpr uint32_t kKktChunk   = 64;   /* the c64 constraint, the libr4d row's and the pack's */
+constexpr uint32_t kKktThreads = 64;
+constexpr int32_t  kKktTri     = kKktChunk * (kKktChunk - 1) / 2;
+
+__global__ __launch_bounds__(kKktThreads) void gdn_kkt_solve_kernel(
+    const uint8_t* __restrict__ k,  uint32_t dtK, int64_t k_s0b, int64_t k_s1b,
+    const uint8_t* __restrict__ bt, uint32_t dtB, int64_t b_s0b,
+    const uint8_t* __restrict__ g,  uint32_t dtG, int64_t g_s0b,
+    uint8_t* __restrict__ A,        uint32_t dtA, int64_t A_s0b, int64_t A_s1b,
+    const void* __restrict__ cu, uint32_t dtC,
+    int64_t grp, int64_t Kd) {
+    const int64_t h = blockIdx.z, n = blockIdx.y;
+    const int64_t bos  = ldi_g(dtC, cu, n), slen = ldi_g(dtC, cu, n + 1) - bos;
+    const int64_t c0 = (int64_t)blockIdx.x * kKktChunk;
+    if (c0 >= slen) return;
+    const int64_t L = (slen - c0 < kKktChunk) ? slen - c0 : kKktChunk;
+    const int64_t hk = h / grp, tb = bos + c0;
+    const uint8_t* __restrict__ kbh = k + hk * k_s1b;
+
+    __shared__ float s_M[kKktTri];                    /* strict lower M[i][j], j < i, at i*(i-1)/2+j */
+    __shared__ float s_col[kKktChunk * (kKktChunk + 1)]; /* per-thread column, stride kKktChunk+1 */
+    __shared__ float s_g[kKktChunk], s_b[kKktChunk];
+
+    if ((int64_t)threadIdx.x < L) {
+        s_g[threadIdx.x] = ldt2(g  + (tb + threadIdx.x) * g_s0b, dtG, h);
+        s_b[threadIdx.x] = ldt2(bt + (tb + threadIdx.x) * b_s0b, dtB, h);
+    }
+    __syncthreads();
+
+    /* Phase 1: the decay-scaled gram's strict triangle. Pairs are flattened row-major over
+     * (i, j<i); every pair's dot is its own d-ascending f32 chain, so the flattening order is
+     * free -- only the chain WITHIN a pair is arithmetic. */
+    const int64_t pairs = L * (L - 1) / 2;
+    for (int64_t p = (int64_t)threadIdx.x; p < pairs; p += (int64_t)kKktThreads) {
+        int64_t i = (int64_t)((1.0f + sqrtf(1.0f + 8.0f * (float)p)) * 0.5f);
+        while (i > 0 && i * (i - 1) / 2 > p) --i;          /* sqrtf is an index decode, not */
+        while ((i + 1) * i / 2 <= p) ++i;                  /* arithmetic: make it exact    */
+        const int64_t j = p - i * (i - 1) / 2;
+        const uint8_t* __restrict__ ri = kbh + (tb + i) * k_s0b;
+        const uint8_t* __restrict__ rj = kbh + (tb + j) * k_s0b;
+        float acc = 0.0f;
+        if (dtK == RAD_F32) {
+            const float* __restrict__ fi = (const float*)ri;
+            const float* __restrict__ fj = (const float*)rj;
+            for (int64_t d = 0; d < Kd; ++d) acc += fi[d] * fj[d];
+        } else {
+            const uint16_t* __restrict__ hi = (const uint16_t*)ri;
+            const uint16_t* __restrict__ hj = (const uint16_t*)rj;
+            for (int64_t d = 0; d < Kd; ++d)
+                acc += r3d_bf16_to_f32(hi[d]) * r3d_bf16_to_f32(hj[d]);
+        }
+        s_M[p] = (s_b[i] * acc) * r3d_exp_f(s_g[i] - s_g[j]);   /* ref's (bi*dot)*exp, exact order */
+    }
+    __syncthreads();
+
+    /* Phase 2: the inverse, thread j owns column j. col[l] is this thread's own earlier value,
+     * so the substitution needs no cooperation and no barrier inside the loops. */
+    const int64_t jj = (int64_t)threadIdx.x;
+    float* __restrict__ col = s_col + jj * (kKktChunk + 1);
+    for (int64_t i = jj; i < L; ++i) {
+        float v = (i == jj) ? 1.0f : 0.0f;
+        const float* __restrict__ mi = s_M + i * (i - 1) / 2;
+        for (int64_t l = jj; l < i; ++l) v -= mi[l] * col[l];
+        col[i] = v;
+    }
+    __syncthreads();
+
+    /* Full 64-wide A rows, one row per existing token: zeros above the diagonal (ref writes
+     * them too), this column's inverse below it. Threads sweep j, so a row is a coalesced
+     * 64-element store. */
+    for (int64_t i = 0; i < L; ++i)
+        stt2(A + (tb + i) * A_s0b + h * A_s1b, dtA, jj, (i >= jj) ? col[i] : 0.0f);
+}
+
+/* ---- gdn_conv_update ----------------------------------------------------------------------
+ * One block per (sequence, channel): conv_dim blocks per sequence, exactly ref's
+ * REF_PAR_FOR(N * conv_dim) decomposition. Shared holds the three tiny broadcasts ref
+ * keeps per-channel in a stack frame: the history window, the weight taps, the bias.
+ * Block size 64: decode blocks are launch-floored, and a wide block would only idle
+ * more threads at slen == 1. */
+
+constexpr uint32_t kConvThreads = 64;
+constexpr int32_t  kConvHistMax = 16;   /* ref's REF_CONV_HIST_MAX */
 
 __global__ __launch_bounds__(kConvThreads) void gdn_conv_update_kernel(
     const uint8_t* __restrict__ x, uint32_t dtX, int64_t x_pb,
@@ -387,5 +492,75 @@ extern "C" int r3d_rad_gdn_conv_update(const RadArgs* a, RadStream s) {
         (uint8_t*)k->data, k->dtype, rad_dtype_bytes(k->dtype, k_s0), rad_dtype_bytes(k->dtype, k_s1),
         (uint8_t*)v->data, v->dtype, rad_dtype_bytes(v->dtype, v_s0), rad_dtype_bytes(v->dtype, v_s1),
         Hg * Kd, Kd, 2 * Hg * Kd, Vd, w32);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* gdn_kkt_solve: verbatim libref operand list (k, beta, g, cu in; A out). The derivation
+ * rule (H = numel(beta)/T, Hg = numel(k)/(T*head_k)) is ref's, and so is chunk's fallback
+ * to A's trailing shape when the derived parameter is absent. */
+extern "C" int r3d_rad_gdn_kkt_solve(const RadArgs* a, RadStream s) {
+    const RadTensor* k   = rad_arg_in(a, 0);
+    const RadTensor* bt  = rad_arg_in(a, 1);
+    const RadTensor* g   = rad_arg_in(a, 2);
+    const RadTensor* cu  = rad_arg_in(a, 3);
+    const RadTensor* A   = rad_arg_in(a, 4);
+    if (!k || !bt || !g || !cu || !A) return RAD_E_INVAL;
+
+    const auto dt2_ok = [](uint32_t d) { return d == RAD_F32 || d == RAD_BF16; };
+    if (!dt2_ok(k->dtype) || !dt2_ok(bt->dtype) || !dt2_ok(g->dtype) || !dt2_ok(A->dtype))
+        return RAD_E_DTYPE;
+    if (!idx_dt_ok(cu->dtype) || !idx_dense(cu)) return RAD_E_STRIDE;
+
+    long long K_ll = 0;
+    if (!rad_args_geti(a, "head_k", &K_ll)) return RAD_E_SHAPE;
+    const int64_t Kd = K_ll;
+    if (Kd <= 0) return RAD_E_SHAPE;
+
+    /* chunk is RAD_DERIVED: present when the issuer supplies it, else ref reads it from
+     * A's trailing shape. This kernel is LDS-bound at 64 and refuses the rest. */
+    long long ch_ll = 0;
+    if (!rad_args_geti(a, "chunk", &ch_ll))
+        ch_ll = A->rank >= 3 ? A->shape[A->rank - 1] : 0;
+    const int64_t chunk = ch_ll;
+    if (chunk <= 0) return RAD_E_SHAPE;
+    if (chunk != kKktChunk) return RAD_E_UNSUPPORTED;
+
+    const int64_t N = rad_tensor_numel(cu) - 1;
+    if (N <= 0 || N > 0xffff) return RAD_E_SHAPE;
+    /* T from the tensor shape, not cu's last entry: the conv row's established reading. */
+    const int64_t T = k->rank >= 2 ? k->shape[k->rank - 2] : 1;
+    if (T <= 0) return RAD_E_SHAPE;
+    const int64_t H  = rad_tensor_numel(bt) / T;
+    const int64_t Hg = rad_tensor_numel(k) / (T * Kd);
+    if (H <= 0 || Hg <= 0 || H % Hg != 0) return RAD_E_SHAPE;
+    if (rad_tensor_numel(k) < T * Hg * Kd) return RAD_E_SHAPE;
+    if (rad_tensor_numel(bt) < T * H || rad_tensor_numel(g) < T * H) return RAD_E_SHAPE;
+    if (rad_tensor_numel(A) < T * H * chunk) return RAD_E_SHAPE;
+    const int64_t chunks = (T + chunk - 1) / chunk;   /* the x axis: per-seq counts never exceed it */
+    if (chunks > 0xffff || H > 0xffff) return RAD_E_SHAPE;
+
+    /* Strides verbatim ref's views (v3(k, Hg, K), v2(beta, H), v2(g, H), v3(A, H, chunk)):
+     * tensor strides at the matching rank, tight below; the unit-stride axis must be unit. */
+    const int64_t k_s0 = k->rank >= 3 ? k->stride[k->rank - 3] : Hg * Kd;
+    const int64_t k_s1 = k->rank >= 3 ? k->stride[k->rank - 2] : Kd;
+    if (k->rank >= 3 && k->stride[k->rank - 1] != 1) return RAD_E_STRIDE;
+    const int64_t b_s0 = bt->rank >= 2 ? bt->stride[bt->rank - 2] : H;
+    const int64_t b_s1 = bt->rank >= 2 ? bt->stride[bt->rank - 1] : 1;
+    if (b_s1 != 1) return RAD_E_STRIDE;
+    const int64_t g_s0 = g->rank >= 2 ? g->stride[g->rank - 2] : H;
+    const int64_t g_s1 = g->rank >= 2 ? g->stride[g->rank - 1] : 1;
+    if (g_s1 != 1) return RAD_E_STRIDE;
+    const int64_t A_s0 = A->rank >= 3 ? A->stride[A->rank - 3] : H * chunk;
+    const int64_t A_s1 = A->rank >= 3 ? A->stride[A->rank - 2] : chunk;
+    if (A->rank >= 3 && A->stride[A->rank - 1] != 1) return RAD_E_STRIDE;
+
+    gdn_kkt_solve_kernel<<<dim3((uint32_t)chunks, (uint32_t)N, (uint32_t)H),
+                           dim3(kKktThreads), 0, (hipStream_t)(uintptr_t)s>>>(
+        (const uint8_t*)k->data,  k->dtype,  rad_dtype_bytes(k->dtype, k_s0),  rad_dtype_bytes(k->dtype, k_s1),
+        (const uint8_t*)bt->data, bt->dtype, rad_dtype_bytes(bt->dtype, b_s0),
+        (const uint8_t*)g->data,  g->dtype,  rad_dtype_bytes(g->dtype, g_s0),
+        (uint8_t*)A->data, A->dtype, rad_dtype_bytes(A->dtype, A_s0), rad_dtype_bytes(A->dtype, A_s1),
+        cu->data, cu->dtype,
+        H / Hg, Kd);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }

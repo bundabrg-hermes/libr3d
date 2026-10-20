@@ -345,6 +345,20 @@ static const RadOperandSpec oConvUpdate[] = {
     { "k",            RAD_OPD_OUT,    0 },
     { "v",            RAD_OPD_OUT,    0 },
 };
+/* gdn_kkt_solve: verbatim libref (pGdnKktSolve/oGdnKktSolve). chunk is DERIVED with the
+ * seq-chunk role, exactly libr4d's P_CHUNK spelling. */
+static const RadParamSpec pKktSolve[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "head_k", RAD_P_INT, RAD_REQUIRED },
+    { "chunk",  RAD_P_INT, RAD_DERIVED, RAD_PROLE_SEQ_CHUNK },
+};
+static const RadOperandSpec oKktSolve[] = {
+    { "k",    RAD_OPD_IN,  0 },
+    { "beta", RAD_OPD_IN,  0 },
+    { "g",    RAD_OPD_IN,  0 },
+    { "cu",   RAD_OPD_IN,  0 },
+    { "A",    RAD_OPD_OUT, 0 },
+};
 static const RadParamSpec pQuantActFp8[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -580,6 +594,9 @@ static const RadOpSchema kSchemas[] = {
         "rejection is a change of read offset rather than a recompute. `num_accepted` is "
         "REQUIRED, because an op that lets the caller omit it is an op whose rollback "
         "contract is optional (spec \u00a710); a non-speculative decode passes ones." },
+      { "gdn_kkt_solve", pKktSolve, (int)(sizeof(pKktSolve)/sizeof(pKktSolve[0])),
+        oKktSolve, (int)(sizeof(oKktSolve)/sizeof(oKktSolve[0])),
+        "A = (I + strict_lower(diag(beta) K K^T e^dg))^-1 per chunk." },
       { "gather_rows", pMnDtype, (int)(sizeof(pMnDtype)/sizeof(pMnDtype[0])),
         oGather, (int)(sizeof(oGather)/sizeof(oGather[0])),
         "y[i, :] = x[idx[i], :]. A negative index writes a zero row -- the padding convention a "
@@ -742,6 +759,12 @@ static const RadConstraint cConvUpdate[] = {
     { "head_v",     RAD_C_GE, 1, nullptr },
     { "conv_width", RAD_C_GE, 1, nullptr },
 };
+/* kkt_solve: chunk 64 is the kernel's LDS bound (libr4d pins the same value; the derived
+ * parameter resolves from A's shape). head_k stays open -- the dot chain walks any K. */
+static const RadConstraint cKktSolve[] = {
+    { "head_k", RAD_C_GE, 1, nullptr },
+    RAD_CEQ("chunk", 64),
+};
 
 extern "C" int r3d_rad_rmsnorm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_embed_lookup(const RadArgs*, RadStream);
@@ -776,6 +799,7 @@ extern "C" int r3d_rad_sigmoid(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gather_rows(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gdn_gated_rmsnorm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gdn_conv_update(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gdn_kkt_solve(const RadArgs*, RadStream);
 extern "C" int r3d_rad_silu_mul(const RadArgs*, RadStream);
 extern "C" int r3d_rad_quant_act_i8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_row_topk(const RadArgs*, RadStream);
@@ -1150,6 +1174,20 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cConvUpdate, 3, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gdn_conv_update },
+
+{ "gdn_kkt_solve_bf16", "gdn_kkt_solve", "gdn",
+  "chunk preamble A = (I + strict_lower(diag(beta) K K^T e^dg))^-1, one block per "
+  "(chunk, sequence, v head); the inverse is ref's forward substitution with threads "
+  "owning columns, so every f32 chain runs in ref's order",
+  "chunk 64 (LDS bound; the derived parameter resolves from A's shape, other chunks are "
+  "refused); any head_k; k/A dense last stride with a wider row pitch fine; beta/g dense "
+  "within the row; cu fully dense; blocks past a sequence's end exit empty",
+  "f32/bf16 k and A out, f32-or-bf16 beta/g read as stored; the gram dot is a d-ascending "
+  "f32 chain over exact widening and the substitution an l-ascending one -- bit-exact by "
+  "construction, the scalar sibling of libr4d's WMMA blocked merge",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cKktSolve, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gdn_kkt_solve },
 
 /* ---- the three bands MiniCPM5-2B's graph names at resolve (see r3d_more.hip). The
  * engine refused to START without them: weightless device bands have no host stand-in. */
