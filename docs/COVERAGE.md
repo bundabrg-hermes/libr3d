@@ -537,3 +537,53 @@ Serve lesson for the day, worth keeping: the probe's first pair after a serve
 start can read -518 tok/s (t8 > t108 while the engine warms its KV pool);
 the tool reports every pair, and medians hide the sign of the nonsense rather
 than deleting it. Discard cold-start pairs by eye, not by averaging.
+
+## 2026-10-20: prefill v2 tile schedule — refuted, kept dormant as R3D_ATTN_V2
+
+Direction (2) from the ranking above got its first attempt: `r3d_attn_wmma_body2.inc`
+re-schedules the same tile — 256 threads (8 waves) instead of 128, global->register
+prefetch of the next K/V slice overlapping the MMA step (the gemm DBUF lesson),
+barriers cut from 4+6 per two passes to 2+3, bad-byte accounting moved strictly
+after barriers. The refactor also moved the v1 body into the shared
+`r3d_attn_wmma_body.inc` so both schedules and both bands (prefill, split-KV
+decode) instantiate from one source.
+
+Arithmetic identity held exactly as a schedule change must: the oracle sweep
+(`tools/attn_oracle_sweep.hip`, 7 geometries x GQA/window/unmapped-edge variants)
+prints identical rel_l2 AND identical worst-case bit distances per case on both
+arms, the split-KV probe passes splits 2/8/64 on both arms, and `tools/attn_bench.hip`
+hashes v1 and v2 outputs bit-identically on all five serve-shaped geometries.
+
+The perf hypothesis did not. Same card, same binary, min over 15 reps:
+
+| hd/qlen/ctx    | v1 us | v2 us | v2/v1 |
+|----------------|-------|-------|-------|
+| 128/64/1024    | 763   | 959   | 0.80x |
+| 128/128/2048   | 1433  | 1853  | 0.77x |
+| 128/981/8192   | 12010 | 21065 | 0.57x |
+| 128/512/4096   | 2930  | 6859  | 0.43x |
+| 64/512/4096    | 2002  | 2099  | ~1.0x |
+
+Read: barrier COUNT is not the serialization term. The v2 block (256 threads,
+40.75 KB LDS at hd=128) packs 1 block/CU, so every barrier stalls the whole CU
+with nothing else resident; v1's narrower blocks put two independent barrier
+chains per CU, and their overlap was worth more than the barriers v2 removed.
+Register-prefetching the slice also trades LDS pressure for VGPR pressure at
+256 VGPR — no headroom left to hide latency either way. The occupancy axis is
+the same one the split-KV win rode; making the BLOCK bigger is the wrong end of
+it. v1 stays the default; `R3D_ATTN_V2=1` runs v2 in the same .so for postmortem
+(the promotion pattern inverted: opt-in instead of opt-out).
+
+What direction (2) still needs, unchanged by this result: more BLOCKS at deep
+prefill, not fatter ones — kBN 128+ slices and per-head_dim occupancy budgets,
+ideally splitting query tiles across blocks the way decode split its KV.
+
+Two harness bugs worth remembering, both caught the sweep before the kernel
+ever ran: absent optional operands are value-initialized `RadTensor`s whose
+`data` is NULL inside the full positional array (a garbage `rank` from an
+uninitialized descriptor makes numel helpers walk past the struct — the bench's
+host-side segfault — and a garbage descale pointer poisons every score, faking
+a geometry-dependent kernel failure that was really stack reuse); and the sweep
+gate must be rel_l2-based like kbench's, with bit-distance as diagnostic only —
+the oracle sums in double, so cancellation-heavy near-zero elements legitimately
+sit thousands of bit-lines apart.
