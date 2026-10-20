@@ -35,6 +35,10 @@ start_serve() {
   local extra_env="$1"
   local eargs=()
   [ -n "$extra_env" ] && eargs=(-e "$extra_env")
+  local extra_args=()
+  # SERVE_EXTRA_ARGS: space-separated engine flags for diagnostic relaunches
+  # (e.g. "--profile-ops --debug-placement") without forking the recipe.
+  [ -n "${SERVE_EXTRA_ARGS:-}" ] && read -ra extra_args <<< "$SERVE_EXTRA_ARGS"
   docker run -d --name "$NAME" --shm-size 4g \
     -e ROCR_VISIBLE_DEVICES=0 "${eargs[@]}" \
     -v /srv/models/rad:/models \
@@ -46,7 +50,7 @@ start_serve() {
       --radiance-home /rhome:/opt/radiance/share/radiance \
       --num-speculative-tokens 0 --max-model-len 16384 \
       --max-num-seqs 8 \
-      --host 0.0.0.0 --port 9005 --live
+      --host 0.0.0.0 --port 9005 --live "${extra_args[@]}"
   echo "waiting for $NAME ($extra_env) ..."
   for i in $(seq 1 120); do
     if curl -sf http://localhost:9005/v1/models >/dev/null; then echo "up after ${i} polls"; return 0; fi
