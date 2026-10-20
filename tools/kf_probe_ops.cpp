@@ -49,6 +49,18 @@ int main(int argc, char** argv) {
                     numel *= (long long)d.shape[i];
                 }
                 printf("] numel=%lld%s\n", numel, d.has_enc ? " ENCODED" : "");
+                if (d.has_enc) {
+                    printf("      enc scheme=%s transform=%s n_planes=%d sel=[",
+                           d.enc.scheme, d.enc.transform, (int)d.enc.n_planes);
+                    for (size_t j = 0; j < d.sel.size(); ++j)
+                        printf("%s%d", j ? "," : "", d.sel[j]);
+                    printf("] planes=[");
+                    for (size_t j = 0; j < d.sel.size(); ++j)
+                        printf("%s%s %lldx%lld", j ? "; " : "",
+                               dt_name(d.enc.plane[d.sel[j]].dtype),
+                               (long long)d.sel_rows[j], (long long)d.sel_cols[j]);
+                    printf("]\n");
+                }
             }
     }
     printf("distinct: %zu\n", done.size());
