@@ -42,6 +42,7 @@ start_serve() {
       --model /models/minicpm5-2b-bf16.rad \
       --radiance-home /rhome:/opt/radiance/share/radiance \
       --num-speculative-tokens 0 --max-model-len 16384 \
+      --max-num-seqs 8 \
       --host 0.0.0.0 --port 9005 --live
   echo "waiting for $NAME ($extra_env) ..."
   for i in $(seq 1 120); do
@@ -52,6 +53,18 @@ start_serve() {
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# SERVE_ONLY=1: (re)create the deployment container and stop. Keeps the birth
+# recipe single-sourced here instead of in someone's shell history.
+# --max-num-seqs 8 is deliberate: radiance has no graceful preemption, so
+# admitting 256 sequences against a pool that holds ~28 full-length sessions
+# is the V3/V4 overload trap. 8 is admission safety, not a KV-size knob
+# (the pool is VRAM leftover either way).
+if [ "${SERVE_ONLY:-0}" = "1" ]; then
+  stop_serve
+  start_serve "${SERVE_ENV:-}"
+  exit 0
+fi
 
 # arm A: the base (scalar tile)
 stop_serve
