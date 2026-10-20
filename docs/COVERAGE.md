@@ -317,3 +317,22 @@ Lessons, kept because they were paid for:
   identity is not verified.
 - A GPU container's `docker rm -f` can lag its kill by seconds (device teardown); `docker
   run` in the next breath conflicts. Wait for `docker inspect` to report the name gone.
+
+## Serve admission cap: --max-num-seqs 8 (2026-10-20)
+
+The serve recipe ran with radiance's default `--max-num-seqs 256` against a KV pool that
+backs 27.9 full-length sessions, and radiance does not preempt gracefully (V3/V4 overload
+wedged the engine + GPU). Capping admission at 8 was meant as pure safety. It moved real
+memory and real speed:
+
+- KV worst case: 11% backing (256 x 16384) -> **100% backing** (8 x 16384); oversubscription
+  is now structurally impossible. The 18.31 GiB pool itself is VRAM leftover and unchanged.
+- Per-step fixed structures scale with seq slots: pinned host staging ring 51.83 -> 2.27
+  MiB; device slab 17.24 MiB -> 772.5 KiB (block tables 17.0 -> 0.5 MiB).
+- **Decode: 11.1 -> 23.6-27.4 tok/s** sustained (500/369-token greedy probes; the 40-token
+  probe read 58.9, short runs flatter). Decode cost had been dominated by per-step fixed
+  work scaling with the step-batch arena, not by the GEMMs — a second confirmation of the
+  M-parameter lesson: arena capacity leaks into timings wherever the engine trusts it.
+
+`SERVE_ONLY=1 bash tools/kldgate/run.sh` now single-sources the birth recipe. Note when
+benchmarking old numbers: anything measured before this flag carries a ~2x decode handicap.
