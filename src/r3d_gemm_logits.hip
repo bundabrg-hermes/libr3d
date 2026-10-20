@@ -72,7 +72,7 @@ template <int MT>
 __global__ __launch_bounds__(256)
 void logits_e4m3_kernel(const uint16_t* __restrict__ X, int64_t x_pitch,
                         const uint8_t* __restrict__ codes, int64_t code_pitch,
-                        const uint8_t* __restrict__ scale, int scols, int64_t br, uint32_t sdt,
+                        const uint8_t* __restrict__ scale, int scols, int br, uint32_t sdt,
                         float* __restrict__ Y, int64_t y_pitch,
                         int N, int K, int M, int m_base)
 {
