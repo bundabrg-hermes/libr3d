@@ -14,3 +14,7 @@ docs/isa/isa.db
 *.lto.s
 *.resolution.txt
 *.tmp.bc
+
+# test-host droppings (diagnostic scratch, python caches)
+diagb/
+__pycache__/
