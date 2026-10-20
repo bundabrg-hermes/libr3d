@@ -553,9 +553,9 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_recurrent_update_kernel(
     const float alog = alog_t ? ldt2(alog_t + h * al_s1b, dtAL, 0) : 0.0f;
     const float dtb  = dtb_t  ? ldt2(dtb_t  + h * db_s1b, dtDB, 0) : 0.0f;
     /* norm_w rows are V wide while the block runs 128 threads: the idle tail reads column 0
-     * instead of walking off the row (its value is discarded). q/k/v rows never bound this
-     * read; v's per-token read is clamped the same way in the loop. */
-    const float nwv  = nw ? ldt2(nw + e * w_s1b, dtW, own ? e : 0) : 1.0f;
+     * instead of walking off the row (its value is discarded). One offset only -- the byte
+     * shift OR the ldt2 index, never both, or the row reads element 2e (proved the hard way). */
+    const float nwv  = nw ? ldt2(nw + (own ? e : 0) * w_s1b, dtW, 0) : 1.0f;
 
     __shared__ float s_q[kRecK], s_kn[kRecK];         /* staged q/k, then normalised in place */
     __shared__ float s_orow[kRecThreads];             /* e-ascending squares for the serial rms */
