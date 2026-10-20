@@ -366,3 +366,45 @@ It also retroactively explains the WMMA-vs-scalar GEMM tie: a tile swap inside t
 
 Baseline for the FA work: 2.85 s @ 981 tok (fresh context; a prefix-cached repeat is
 not a valid prefill baseline).
+
+## WMMA flash-attention shipped: 2.1-3.1x prefill (2026-10-20)
+
+The two-pass WMMA tile (`r3d_attn_paged_wmma.hip`) is live on the serve. Measured
+fresh-context TTFT, same seqs8 recipe:
+
+| prompt tokens | v1 scalar | WMMA tile | speedup |
+|---|---|---|---|
+| 981  | 2.85 s  | 1.33 s | 2.14x |
+| 1961 | 10.68 s | 3.46 s | 3.09x |
+
+Decode also moved 24-27 -> ~37 tok/s (the tile serves M==1 rows too: same bytes,
+tensor cores make the wasted FMAs free). kbench attn 138/138 worst rel_l2 3.135e-03
+(v1 arm unchanged at 0.000e+00); full sweep 1102/1102, 7 budget-skips, no collateral.
+
+### The bug that hid the tile for two sessions: numeric bf16 staging
+
+`bf16(uint16_t)` on `rocwmma::bfloat16_t` CONVERTS the integer instead of reinterpreting
+its bits: the fp8 decode of code 0xf1 (-144, bits 0xc310) staged as bf16(49936) = 49920.
+Every Q/K/V/P fragment staging site poisoned its own tile; scores hit 1e11, outputs 8e8.
+Sibling of the known trap (casting a bf16 fragment TO short truncates numerically).
+Rule: fragment staging writes raw BIT patterns (`bf16_store`), never a constructed bf16.
+Checked the gemm m64 TU: it stages uint16 directly, clean.
+
+### Why the failures read as "passes" for so long: the vacuous fallback
+
+Two layers of silence stacked up:
+
+1. A debug build added device `printf` to this kernel; printf + a 41 KB static-LDS
+   launch fails with hipErrorIllegalState(401) on ROCm 10.1 (probe: launch alone is
+   fine at 41 KB; adding printf alone makes it 401). The launcher turned the launch
+   error into RAD_E_DEVICE, the entry fell back to v1, every case served bit-exact --
+   a "pass" that never ran the tile. Device printf is not usable in big-LDS kernels;
+   stage intermediates to a global dump buffer instead (repro `REPRO_DBG=1` arm).
+2. In kbench the fp8 rows failed while the bf16 rows "passed" -- but head_dim=256
+   fixtures are refused by the tile gate (v1 serves them, rel 0.000), so a bf16 pass
+   in the report does not prove the WMMA tile ran. Check for nonzero rel_l2 in the
+   WMMA arm vs 0.000 in the R3D_NO_WMMA arm before believing a WMMA pass.
+
+Triage tools added: `tools/probe_l401*.hip` (launch-state bisect by build axis:
+arch list / dlopen / LDS size) and `tools/probe_fa_main.cpp` (launch the real tile
+through its own launcher, standalone).
