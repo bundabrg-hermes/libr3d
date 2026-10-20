@@ -527,8 +527,11 @@ extern "C" int r3d_rad_gdn_kkt_solve(const RadArgs* a, RadStream s) {
 
     const int64_t N = rad_tensor_numel(cu) - 1;
     if (N <= 0 || N > 0xffff) return RAD_E_SHAPE;
-    /* T from the tensor shape, not cu's last entry: the conv row's established reading. */
-    const int64_t T = k->rank >= 2 ? k->shape[k->rank - 2] : 1;
+    /* T = the token axis: k->shape[rank-3] at rank >= 3 (v3's token stride), shape[0] on a
+     * rank-2 flattening. NOT shape[rank-2], which is the HEAD axis here -- the conv row's
+     * reading is rank-2-specific, and kbench's guard allocations caught the mixup as a 256 B
+     * write past A on the first L==chunk cases. */
+    const int64_t T = k->rank >= 3 ? k->shape[k->rank - 3] : (k->rank >= 2 ? k->shape[0] : 1);
     if (T <= 0) return RAD_E_SHAPE;
     const int64_t H  = rad_tensor_numel(bt) / T;
     const int64_t Hg = rad_tensor_numel(k) / (T * Kd);
