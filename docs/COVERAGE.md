@@ -336,3 +336,33 @@ memory and real speed:
 
 `SERVE_ONLY=1 bash tools/kldgate/run.sh` now single-sources the birth recipe. Note when
 benchmarking old numbers: anything measured before this flag carries a ~2x decode handicap.
+
+## Prefill bottleneck is attention, not GEMM (2026-10-20, two-probe fit)
+
+Measured on the live serve, fresh (unwarmed) prompts, `max_tokens=1`, seqs8 build:
+
+| prompt tokens | TTFT |
+|---|---|
+| 981  | 2.85 s |
+| 1961 | 10.68 s |
+
+The 3.75x for a 2x prompt is the quadratic signature. Fit `T = a*M + b*M^2`:
+a = 0.365 ms/token (linear), b = 2.59 us/token^2 (quadratic). At M=981 that splits
+2.49 s quadratic / 0.36 s linear -- 87% of prefill is the attention term, and the
+linear term (all GEMMs, ~3.9 TFLOP) already runs at ~11 TFLOP/s effective. The
+quadratic term runs at ~133 GFLOP/s: our `attn_paged` device kernel is correctness-
+first scalar FMA (grid = row x head blocks of head_dim threads, each block rescans
+the whole KV history, no tiling, no tensor units).
+
+Rejected hypotheses, in order: (1) host AVX attention was ruled out by `docker stats`
+during a 10.7 s prefill: 0.4-0.8% CPU. (2) The engine's `--profile-ops` dumps nothing
+to docker logs (table goes elsewhere) and its synchronisation distorts what it does
+measure; the two-point scaling fit settles shape questions in 30 s with zero rebuilds.
+
+Consequences for the queue: WMMA flash-attention moves to first (it was third); the
+GEMM staging pipeline drops to second -- it optimizes the term that is 13% at 1k ctx.
+It also retroactively explains the WMMA-vs-scalar GEMM tie: a tile swap inside the
+13% term cannot move a total dominated by the 87% term.
+
+Baseline for the FA work: 2.85 s @ 981 tok (fresh context; a prefix-cached repeat is
+not a valid prefill baseline).
