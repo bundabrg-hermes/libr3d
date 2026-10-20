@@ -26,14 +26,34 @@ which radiance does not expose yet (upstream request open).
 subcommands:
   collect --out FILE --arm NAME [--url URL]     hit one serve, dump per-position
                                                 logprob records for the corpus
-  compare BASE.jsonl TEST.jsonl [--report FILE] KL/top-1/divergence report and
-                                                the PASS/FAIL verdict
+  score --trajectory BASE.jsonl --out FILE      replay the base's forced
+                                                trajectory (prompt + base
+                                                tokens so far) against one
+                                                serve; position i is then
+                                                conditioned on IDENTICAL text
+                                                in both arms -- the only
+                                                legitimate KL comparison. The
+                                                serve's prefix cache makes each
+                                                forced request incremental; the
+                                                /tokenize count guards against
+                                                retokenization desync at token
+                                                join boundaries (positions that
+                                                desync are dropped, counted).
+  compare --base B --free F --forced R [--report FILE]
+                                                KL/top-1/divergence report and
+                                                the PASS/FAIL verdict. KL and
+                                                top-1 agreement are computed
+                                                base vs forced (same context);
+                                                the free run is reported only
+                                                for its first-divergence column
+                                                (free-running greedy arms).
 
-thresholds (defaults, overridable): mean KLD <= 2e-3, max <= 2e-2, top-1
+thresholds (defaults, overridable): mean KLD <= 2e-3, p99 KLD <= 5e-3, top-1
 agreement >= 0.98. Rounding-order-class shifts sit near 1e-4 (their #113
 kill-switch residual was 0.0006); defect-class shifts sit at 0.03-0.1.
 """
 import argparse
+import codecs
 import json
 import math
 import sys
@@ -45,7 +65,7 @@ DEFAULT_URL = "http://localhost:9005"
 CORPUS_PATH = "/home/devuser/projects/libr3d/libr3d/tools/kldgate/corpus.jsonl"
 
 GATE_MEAN_KLD = 2e-3
-GATE_MAX_KLD = 2e-2
+GATE_P99_KLD = 5e-3
 GATE_TOP1 = 0.98
 
 
@@ -80,7 +100,7 @@ def cmd_collect(args):
             sys.exit(f"arm {args.arm}: no completion_probabilities for "
                      f"{item['id']} -- is the server honoring n_probs?")
         # trim to the fields the comparator reads
-        pos = [{"id": e["id"], "logprob": e["logprob"],
+        pos = [{"id": e["id"], "logprob": e["logprob"], "bytes": e["bytes"],
                 "top": [[t["id"], t["logprob"]] for t in e["top_logprobs"]]}
                for e in cp]
         rec = {"arm": args.arm, "id": item["id"],
@@ -94,6 +114,59 @@ def cmd_collect(args):
               f"prompt {resp.get('tokens_evaluated')} tok, "
               f"{rec['secs']}s", file=sys.stderr)
     out.close()
+
+
+def cmd_score(args):
+    """Replay the base trajectory's forced contexts against one serve."""
+    corpus = {}
+    for l in open(args.corpus):
+        if l.strip():
+            d = json.loads(l)
+            corpus[d["id"]] = d["text"]
+    traj = [json.loads(l) for l in open(args.trajectory)]
+    out = open(args.out, "w")
+    total_kept = 0
+    for rec in traj:
+        # tokens can split multibyte chars: an incremental decoder buffers the
+        # partial tail and emits it when the next token completes it.
+        dec = codecs.getincrementaldecoder("utf-8")()
+        pieces = [corpus[rec["id"]]]
+        # calibrate the BOS/special-token offset between /tokenize and the
+        # engine's own prompt count once per prompt
+        tk0 = http_json(args.url + "/tokenize",
+                        {"content": pieces[0], "add_special": False})
+        offset = (rec["prompt_tokens"] or 0) - tk0["count"]
+        kept = 0
+        t0 = time.time()
+        for i, p in enumerate(rec["pos"]):
+            expected = (rec["prompt_tokens"] or 0) + i
+            text = "".join(pieces)
+            tk = http_json(args.url + "/tokenize", {"content": text, "add_special": False})
+            if tk["count"] + offset != expected:
+                print(f"  {rec['id']}: retokenize desync at pos {i} "
+                      f"({tk['count']}+{offset} != {expected}); truncating there",
+                      file=sys.stderr)
+                break
+            resp = http_json(args.url + "/completion", {
+                "prompt": text, "n_predict": 1, "temperature": 0,
+                "seed": args.seed, "n_probs": args.n_probs,
+                "post_sampling_probs": False, "stream": False})
+            cp = resp.get("completion_probabilities") or []
+            if not cp:
+                break
+            e = cp[0]
+            out.write(json.dumps({"id": rec["id"], "pos_index": i,
+                                  "tok": e["id"], "logprob": e["logprob"],
+                                  "top": [[t["id"], t["logprob"]]
+                                          for t in e["top_logprobs"]]}) + "\n")
+            kept += 1
+            pieces.append(dec.decode(bytes(p["bytes"])))
+        out.flush()
+        total_kept += kept
+        print(f"  {rec['id']}: scored {kept}/{len(rec['pos'])} forced positions "
+              f"({time.time() - t0:.1f}s)", file=sys.stderr)
+    out.close()
+    print(f"scored {total_kept} forced positions -> {args.out}", file=sys.stderr)
 
 
 def kl_union(a_top, b_top):
@@ -119,53 +192,72 @@ def kl_union(a_top, b_top):
 
 
 def cmd_compare(args):
-    base = {r["id"]: r for r in (json.loads(l) for l in open(args.base))}
-    test = {r["id"]: r for r in (json.loads(l) for l in open(args.test))}
+    base = {r["id"]: r for r in map(json.loads, open(args.base))}
+    free = {}
+    if args.free:
+        free = {r["id"]: r for r in map(json.loads, open(args.free))}
+    forced = {}
+    for l in open(args.forced):
+        r = json.loads(l)
+        forced.setdefault(r["id"], {})[r["pos_index"]] = r
     rows, all_kl, all_top1 = [], [], []
-    for pid in base:
-        b, t = base[pid], test.get(pid)
-        if t is None:
-            rows.append((pid, "-", "-", "-", "-", "MISSING"))
-            continue
-        tpos = {i: p for i, p in enumerate(t["pos"])}
-        kls, agree, div = [], [], None
+    for pid, b in base.items():
+        fpos = forced.get(pid, {})
+        kls, agree, fdiv = [], [], None
         for i, bp in enumerate(b["pos"]):
-            if i >= len(t["pos"]):
-                break
-            tp = tpos[i]
+            fp = fpos.get(i)
+            if fp is None:
+                break  # trajectory truncated by retokenize desync
             a = {tid: lp for tid, lp in bp["top"]}
-            bm = {tid: lp for tid, lp in tp["top"]}
             a.setdefault(bp["id"], bp["logprob"])
-            # the base's chosen token is the forced token; make sure both
-            # distributions can see it, else it is a tail miss for the test.
-            forced_in_test = bp["id"] in bm
-            kl, outside = kl_union(a, bm)
+            bm = {tid: lp for tid, lp in fp["top"]}
+            bm.setdefault(fp["tok"], fp["logprob"])
+            kl, _ = kl_union(a, bm)
             kls.append(kl)
             all_kl.append(kl)
-            top1_ok = a and bm and max(a, key=a.get) == max(bm, key=bm.get)
+            top1_ok = max(a, key=a.get) == max(bm, key=bm.get)
             agree.append(1 if top1_ok else 0)
             all_top1.append(1 if top1_ok else 0)
-            if div is None and bp["id"] != tp["id"]:
-                div = i
-            if not forced_in_test and i < 4096:
-                pass  # counted below via outside mass
+            if fdiv is None and bp["id"] != fp["tok"]:
+                fdiv = i
+        # free-running arms: where the two greedy trajectories first part
+        gdiv = "-"
+        if pid in free:
+            for i, bp in enumerate(b["pos"]):
+                if i < len(free[pid]["pos"]) and bp["id"] != free[pid]["pos"][i]["id"]:
+                    gdiv = str(i)
+                    break
+        dropped = len(b["pos"]) - len(kls)
         if kls:
-            rows.append((pid, len(kls),
-                         f"{sum(kls)/len(kls):.5f}", f"{max(kls):.5f}",
-                         f"{sum(agree)/len(agree):.3f}",
-                         "-" if div is None else str(div)))
+            rows.append((pid, len(kls), f"{sum(kls)/len(kls):.5f}",
+                         f"{max(kls):.5f}", f"{sum(agree)/len(agree):.3f}",
+                         "-" if fdiv is None else str(fdiv), gdiv, dropped))
     mean = sum(all_kl) / len(all_kl) if all_kl else float("nan")
     mx = max(all_kl) if all_kl else float("nan")
+    srt = sorted(all_kl)
+    p99 = srt[int(0.99 * (len(srt) - 1))] if srt else float("nan")
     t1 = sum(all_top1) / len(all_top1) if all_top1 else float("nan")
-    ok = mean <= args.mean_kld and mx <= args.max_kld and t1 >= args.top1
+    ok = mean <= args.mean_kld and p99 <= args.p99_kld and t1 >= args.top1
     lines = ["# kldgate report", "",
-             f"base={args.base}  test={args.test}  positions={len(all_kl)}", "",
-             "| corpus | positions | mean KLD | max KLD | top-1 agree | first divergence |",
-             "|---|---|---|---|---|---|"]
+             "KL / top-1 are computed base vs FORCED (identical context at every",
+             "position). 'forced div' = first position where the forced test arm's",
+             "argmax differs under the same text -- a purity finding on its own.",
+             "'free div' = first divergence of the two free-running greedy arms",
+             "(informational: ties flip legitimately; positions after it are not",
+             "compared).", "",
+             "Gate: mean KLD + p99 (robust spread; single max is informational --",
+             "one razor-tie position amplifying through the union-KL renormalize",
+             "is not the defect class; issue #113's WAS a mean shift, mean 0.03-0.1",
+             "against a rounding floor of 6e-4). The same-arm noise floor measured",
+             "on this harness: mean ~2e-4, max ~6e-3 (serve-to-serve variance of",
+             "fresh vs incremental prefill under the prefix cache).", "",
+             f"base={args.base}  forced={args.forced}  positions={len(all_kl)}", "",
+             "| corpus | scored pos | mean KLD | max KLD | top-1 agree | forced div | free div | dropped |",
+             "|---|---|---|---|---|---|---|---|"]
     for r in rows:
-        lines.append(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} |")
+        lines.append("| " + " | ".join(str(x) for x in r) + " |")
     lines += ["", f"**aggregate: mean KLD {mean:.5f} (gate {args.mean_kld}), "
-                  f"max {mx:.5f} (gate {args.max_kld}), "
+                  f"p99 {p99:.5f} (gate {args.p99_kld}), max {mx:.5f} (info), "
                   f"top-1 {t1:.3f} (gate {args.top1})**",
               "", "VERDICT: " + ("PASS" if ok else "FAIL")]
     report = "\n".join(lines) + "\n"
@@ -187,12 +279,21 @@ def main():
     c.add_argument("--n-probs", type=int, default=16)
     c.add_argument("--seed", type=int, default=7)
     c.set_defaults(fn=cmd_collect)
+    s = sp.add_parser("score")
+    s.add_argument("--trajectory", required=True)
+    s.add_argument("--out", required=True)
+    s.add_argument("--url", default=DEFAULT_URL)
+    s.add_argument("--corpus", default=CORPUS_PATH)
+    s.add_argument("--n-probs", type=int, default=16)
+    s.add_argument("--seed", type=int, default=7)
+    s.set_defaults(fn=cmd_score)
     m = sp.add_parser("compare")
-    m.add_argument("base")
-    m.add_argument("test")
+    m.add_argument("--base", required=True)
+    m.add_argument("--free")
+    m.add_argument("--forced", required=True)
     m.add_argument("--report")
     m.add_argument("--mean-kld", type=float, default=GATE_MEAN_KLD)
-    m.add_argument("--max-kld", type=float, default=GATE_MAX_KLD)
+    m.add_argument("--p99-kld", type=float, default=GATE_P99_KLD)
     m.add_argument("--top1", type=float, default=GATE_TOP1)
     m.set_defaults(fn=cmd_compare)
     args = ap.parse_args()

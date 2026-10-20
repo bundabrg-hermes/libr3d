@@ -18,7 +18,15 @@ NAME=libr3d-serve
 OUT=/tmp/kldgate-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 
-stop_serve() { docker rm -f "$NAME" >/dev/null 2>&1 || true; sleep 3; }
+stop_serve() {
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  # a GPU container's removal can lag its kill (device teardown); wait until
+  # the name is actually free, or the next docker run conflicts
+  for i in $(seq 1 30); do
+    docker inspect "$NAME" >/dev/null 2>&1 || break
+    sleep 2
+  done
+}
 
 start_serve() {
   local extra_env="$1"
@@ -54,10 +62,12 @@ python3 "$SCRIPT_DIR/kldgate.py" collect --arm scalar-base --out "$OUT/base.json
 stop_serve
 start_serve ""
 python3 "$SCRIPT_DIR/kldgate.py" collect --arm wmma --out "$OUT/test.jsonl"
+python3 "$SCRIPT_DIR/kldgate.py" score --trajectory "$OUT/base.jsonl" --out "$OUT/forced.jsonl"
 
 # compare (gate verdict is the exit code)
 set +e
-python3 "$SCRIPT_DIR/kldgate.py" compare "$OUT/base.jsonl" "$OUT/test.jsonl" \
+python3 "$SCRIPT_DIR/kldgate.py" compare --base "$OUT/base.jsonl" \
+  --free "$OUT/test.jsonl" --forced "$OUT/forced.jsonl" \
   --report "$OUT/report.md" | tee "$OUT/verdict.txt"
 rc=$?
 set -e

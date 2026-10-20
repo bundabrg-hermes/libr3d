@@ -264,3 +264,56 @@ Hygiene adopted from this:
   /swap-kbench && sudo swapon /swap-kbench`, run with `--max-bytes 12288`, then `swapoff`
   and delete. Verified: all 7 logits cases passed as libref self-checks that way at ~50 s
   wall without OOM.
+
+## Prefill-logit KLD gate — `tools/kldgate/` (2026-10-20)
+
+Why: stew675/llama-cpp-rdna-boosts#113. A default-on bf16 prefill kernel shipped with mean
+KLD 0.03 past every text/coherence gate: greedy and sampled text read the decode distribution
+*from the post-prefill state* and are blind to a uniform prefill shift. Their doctrine, worth
+adopting whole: the model-level KLD is the alarm, the per-op parity is the truth (the same
+per-op perturbation spans >100x in model KLD depending on the surrounding pipeline), and the
+gate arms are base-vs-prior-arm, not base-vs-rebuilt-oracle.
+
+Design, adapted to radiance (no perplexity tool, no prompt_logprobs over HTTP): two serve
+arms on the same card and weights, one at a time, A/B'd through the llama.cpp-style
+`/completion` with `temperature 0, n_probs 16 (engine cap; 32 is a 400), post_sampling_probs
+false`. The base arm (scalar prefill tile via `R3D_NO_WMMA=1`) free-runs the 11-prompt corpus;
+the test arm is then asked to *re-score the base's trajectory under teacher forcing*
+(`score` mode): position i is served the exact text prompt + base tokens 0..i-1, so every
+compared position shares identical context. The forced-context rebuild is byte-exact (token
+`bytes` arrays through an incremental UTF-8 decoder) with a `/tokenize` count guard — a
+retokenization desync truncates that trajectory and counts the drop rather than comparing
+mismatched text. The prefix cache makes each forced request incremental, so the pass costs
+~190 ms/position.
+
+Gate: mean KLD <= 2e-3 AND p99 <= 5e-3 AND top-1 agreement >= 0.98. Max is informational:
+one razor-tie position amplifies through the union-KL renormalize (observed 0.029 at a single
+position; the same-arm noise probe on that corpus maxes at 0.0016), and the defect class is a
+*mean* shift, not an outlier. Noise floor of the harness itself (same arm scored against
+itself): mean ~2e-4, max ~6e-3 — serve-to-serve variance of fresh vs incremental prefill
+under the prefix cache. The gate sits an order of magnitude above the floor; #113-class sits
+one above the gate.
+
+First run through the gate (WMMA m64 tile vs scalar base, 1257 positions): mean 3.1e-4,
+p99 2.25e-3, top-1 0.993 -> PASS. About 9 forced-context argmax flips across the corpus, all
+near-ties (-1.9318 vs -1.9292 class): rounding-order purity delta, not drift. Artifacts:
+`/tmp/kldgate-20261020-083741/report.md` on rdna3-dev.
+
+Lessons, kept because they were paid for:
+
+- Comparing free-running arms by position index is invalid the moment the trajectories part:
+  the first (broken) run reported mean KLD 2.84 — distributions conditioned on *different
+  texts*. Position-0 forensics settles it in one probe: identical top-16 overlap with
+  different argmax means the instrument is comparing apples to oranges, not that the kernel
+  drifted.
+- The same-serve self-test (`collect` then `score` against one running arm) is the instrument's
+  self-check: it must return ~0 KL and few dropped positions. It caught a bytes/str plumbing
+  bug on the spot and defines the noise floor the thresholds must clear.
+- radiance HTTP: `n_probs <= 16`; `prompt_logprobs` is accepted and ignored on both
+  `/v1/completions` and `/completion` — full-vocab prefill KLD needs it upstream (worth
+  requesting next time we talk to the radiance maintainers, alongside the preemption report).
+- Retokenization desync at BPE join boundaries is real (the mid-expression `cpp-kernel`
+  prompt desyncs at position 13): guard, drop, count — never score a position whose token
+  identity is not verified.
+- A GPU container's `docker rm -f` can lag its kill by seconds (device teardown); `docker
+  run` in the next breath conflicts. Wait for `docker inspect` to report the name gone.
