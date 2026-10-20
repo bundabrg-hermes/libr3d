@@ -1,0 +1,5 @@
+# 5.3. Send Message Types
+
+_(pages 50-50)_
+
+S_SENDMSG is used to send messages to fixed function hardware, the host, or to request that a value be returned to the wave. S_SENDMSG encodes the message type in the SIMM16 field and the message payload in M0. S_SENDMSG_RTN encodes the message type in the SSRC0 field (does not read an SGPR), the payload (if any) in M0, and the destination SGPR in SDST. Completion is tracked with LGKMcnt. The table below lists the messages that can be generated using the S_SENDMSG command. S_SENDMSG_RTN_B* instructions return data to the shader: increment LGKMcnt by 2, and then decrement by 1 when the messages goes out, and by another 1 when the data returns. This allows the user to simply use "s_waitcnt LGKMcnt==0" to wait for the data to be returned. All message codes not listed are reserved (illegal). Table 15. S_SENDMSG Messages S_SENDMSG_RTN is used to send messages that return a value to the wave. The instruction specifies which SGPR receives the data in SDST field. The message is encoded in SSRC0 (in the instruction field, not in an SGPR). Table 16. S_SENDMSG_RTN Messages

@@ -1,0 +1,5 @@
+# 9.1. Buffer Instructions
+
+_(pages 89-93)_
+
+Buffer instructions (MTBUF and MUBUF) allow the shader program to load from, and store to, linear buffers in memory. These operations can operate on data as small as one byte, and up to four DWORDs per work-item. Atomic operations take data from VGPRs and combine them arithmetically with data already in memory. Optionally, the value that was in memory before the operation took place can be returned to the shader. The D16 instruction variants of buffer ops convert the results to and from packed 16-bit values. For example, BUFFER_LOAD_D16_FORMAT_XYZW stores two VGPRs with 4 16-bit values. Table 36. Buffer Instructions Table 37. Microcode Formats Table 38. MTBUF Instructions • TBUFFER*_FORMAT instructions include a data-format conversion specified in the instruction. Table 39. MUBUF Instructions • BUFFER*_FORMAT instructions include a data-format conversion specified in the resource constant (V#). • In the table above, "D16" means the data in the VGPR is 16-bits, not the usual 32 bits. "D16_HI" means that the upper 16-bits of the VGPR is used instead of "D16" that uses the lower 16 bits.

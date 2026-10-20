@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# isa — RDNA3 ISA search CLI. Uses the corpus-local venv.
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+exec "$DIR/.venv/bin/python" "$DIR/scripts/isa_cli.py" "$@"

@@ -1,0 +1,12 @@
+---
+mnemonic: V_MIN3_U16
+section: "16.12. VOP3 & VOP3SD Instructions"
+format: VOP3
+opcode: "587"
+pages: [428]
+source: RDNA3 ISA PDF p.428-428
+---
+
+# V_MIN3_U16 (opcode 587)
+
+Return minimum unsigned short value of three inputs.

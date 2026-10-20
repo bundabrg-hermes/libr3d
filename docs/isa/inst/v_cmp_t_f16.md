@@ -1,0 +1,16 @@
+---
+mnemonic: V_CMP_T_F16
+section: "16.9. VOPC Instructions"
+format: VOPC
+opcode: "15"
+pages: [309]
+source: RDNA3 ISA PDF p.309-309
+---
+
+# V_CMP_T_F16 (opcode 15)
+
+Return 1.
+
+### Notes
+
+Signal 'invalid' on sNAN's, and also on qNAN's if clamp is set.

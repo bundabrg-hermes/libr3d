@@ -2,3 +2,6 @@ build/
 .cache/
 compile_commands.json
 build*/
+docs/isa/.venv/
+docs/isa/isa.db
+

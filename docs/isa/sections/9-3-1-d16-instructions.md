@@ -1,0 +1,5 @@
+# 9.3.1. D16 Instructions
+
+_(pages 96-96)_
+
+Load-format and store-format instructions also come in a "D16" variant. The D16 buffer instructions allow a shader program to load or store just 16 bits per work-item between VGPRs and memory. For stores, each 32bit VGPR holds two 16bit data elements that are passed to the texture unit which in turn, converts to the texture format before writing to memory. For loads, data returned from the texture unit is converted to 16 bits and a pair of data are stored in each 32bit VGPR (LSBs first, then MSBs). Control over int vs. float is controlled by FORMAT. Conversion of float32 to float16 uses truncation; conversion of other input data formats uses round- to-nearest-even. There are two variants of these instructions: • D16 loads data into or stores data from the lower 16 bits of a VGPR. • D16_HI loads data into or stores data from the upper 16 bits of a VGPR. For example, BUFFER_LOAD_D16_U8 loads a byte per work-item from memory, converts it to a 16-bit integer, then loads it into the lower 16 bits of the data VGPR.
