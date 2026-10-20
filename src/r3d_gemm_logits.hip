@@ -88,7 +88,6 @@ void logits_e4m3_kernel(const uint16_t* __restrict__ X, int64_t x_pitch,
     const uint8_t* crow = codes + (int64_t)r * code_pitch;
 
     __shared__ uint16_t xs[MT * 128];          /* one 128-column block of x */
-    __shared__ float    s_uni;                 /* the block's scale, staged once */
 
     float acc[MT];
 #pragma unroll
@@ -97,20 +96,21 @@ void logits_e4m3_kernel(const uint16_t* __restrict__ X, int64_t x_pitch,
     const int nfull = K >> 7;
     const int tail  = K & 127;
 
+    /* The scale element for THIS warp's row and the current column block: one
+     * address across the warp, so it is a single uniform load -- an LDS
+     * broadcast staged by thread 0 would be thread 0's WARP's row only. */
+    const int64_t sbase = rblk * (int64_t)scols;
+
     for (int jb = 0, jn = nfull + (tail ? 1 : 0); jb < jn; ++jb) {
         const int kbase = jb << 7;
-        /* Stage the x block (zero past K) and the scale; two syncs per block,
-         * and the staging itself is a perfect 128 B/thread-row walk. */
+        /* Stage the x block (zero past K); a perfect 128 B/thread-row walk. */
         const int elems = (jb == jn - 1 && tail) ? tail : 128;
         for (int i = threadIdx.x; i < live * elems; i += 256) {
             const int m = i / elems, k = i - m * elems;
             xs[m * 128 + k] = X[(int64_t)(mb + m) * x_pitch + kbase + k];
         }
-        if (threadIdx.x == 0)
-            s_uni = ld_scale(scale, rblk * (int64_t)scols + jb, sdt);
+        const float s = ld_scale(scale, sbase + jb, sdt);
         __syncthreads();
-
-        const float s = s_uni;
         const int kl = (jb == jn - 1 && tail) ? tail : 128;
 #pragma unroll
         for (int t = 0; t < 4; ++t) {
