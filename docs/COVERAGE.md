@@ -587,3 +587,53 @@ a geometry-dependent kernel failure that was really stack reuse); and the sweep
 gate must be rel_l2-based like kbench's, with bit-distance as diagnostic only —
 the oracle sums in double, so cancellation-heavy near-zero elements legitimately
 sit thousands of bit-lines apart.
+
+## 2026-10-20: prefill v3 thin block — refuted; staging is instruction-rate-bound (vectorized: 1.2-1.64x)
+
+Two experiments rode one commit window. (a) `r3d_attn_wmma_body3.inc` (opt-in
+`R3D_ATTN_V3=1`) tested the recorded direction directly: 32-row query tiles,
+64 threads, 24,880 B LDS -> 2 blocks/CU at hd=128 where v1's 41 KB carve fits
+one. Per-row arithmetic verbatim from v1; the FNV gate confirmed bit-identical
+outputs on all five geometries. Timing: 0.35-0.80x -- deep cases 2.57x SLOWER
+(11948 -> 30735 us at 128/981/8192). Reading the columns: v3 moved 2x the KV
+bytes (half the rows share each K walk) at ~78% of v1's effective byte rate;
+the occupancy bought nothing. The v2 post-mortem's "occupancy is the axis" was
+overstated: BOTH fatter (v2) and thinner (v3) blocks leave the binding term
+untouched, and v3's rate loss per doubled byte shows what it is -- the
+2-byte-at-a-time gather. 4096 scalar global loads + 4096 scalar LDS stores per
+K tile at hd=128; the tile runs its deep cases at ~90 GB/s because the copy
+loop issues 2 bytes per instruction, not because it stalls.
+
+(b) `stage_kv_tile` walks EIGHT bf16 per `uint4` load/store when the copy is
+provably bit-identical: bf16 KV, contiguous rows (`kv_sd == 1`), 16B-aligned
+bases, 8-aligned live row bases; the original scalar loop serves everything
+else, and fp8 stays scalar (per-byte decode). Q staging same treatment. LDS
+pitches D+4 -> D+8 so 16B LDS stores stay legal at every row (41776 B total at
+hd=128, still under the static ceiling). A copy cannot round differently --
+the bench's hashes ARE the gate: all five geometries hash byte-identical to
+the scalar arm's runs, which is also what exempts this from a KLD run
+(schedule-class change with identity evidence).
+
+| hd/qlen/ctx   | v1 scalar us | vec us | speedup |
+|---------------|--------------|--------|---------|
+| 128/64/1024   | 761          | 510    | 1.49x   |
+| 128/128/2048  | 1463         | 893    | 1.64x   |
+| 128/981/8192  | 11948        | 7368   | 1.62x   |
+| 128/512/4096  | 2935         | 2043   | 1.44x   |
+| 64/512/4096   | 2020         | 1671   | 1.21x   |
+
+Effective KV rates rise to 143-146 GB/s deep-ctx (still ~3.5x under the card).
+The decode rows share the body and share the win's mechanism: split-KV probe
+passes on splits 1/2/8/64 (device arm and host re-merge, 0 bad cells, 0 NaN
+slots), oracle sweep PASS 7/7 including the window and unmapped-edge cases,
+full kbench sweep (both fixtures, `--all-rows`, coverage ratchet) 1083/1083
+worst 3.135e-03 unchanged, exit 0 -- with the serve container up and idle
+(both sweep arms this session ran without the card to themselves and stayed
+fault-free; contention false-fails remain a reason to distrust FAILs, not
+passes).
+
+Kept: v3 stays behind `R3D_ATTN_V3=1` (same opt-in postmortem pattern as v2).
+Open next: serve-side A/B (the engine path, restart pending); the gemm DBUF
+lesson (prefetch the next slice during this tile's mma) is now the untried
+axis for attention -- at 143 GB/s there is ~3.5x of card left on the staging
+path alone.
