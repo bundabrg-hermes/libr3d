@@ -14,14 +14,14 @@ position we compare the two arms' distributions, so a drift that compounds
 through real prefill activations shows up as KL divergence per position, before
 the argmax ever flips.
 
-Approximation, stated plainly: we see each arm's top-N support, not the full
-130k-row softmax. KL is computed on the union of the two supports plus the
-forced token; mass outside is bounded by the smallest retained logprob and
-counted (a position where the forced token falls outside the test arm's top-N
-is flagged). For coherent distributions at temp 0 that mass is negligible, and
-a tail-only shift under it is below this instrument's resolution -- full-vocab
-KLD needs prompt_logprobs in the engine, which radiance does not expose yet
-(upstream request open).
+Approximation, stated plainly: we see each arm's top-N support (N = 16, the
+engine's n_probs cap), not the full 130k-row softmax. KL is computed on the
+union of the two supports plus the forced token; mass outside is bounded by
+the smallest retained logprob and counted (a position where the forced token
+falls outside the test arm's top-N is flagged). For coherent distributions at
+temp 0 that mass is negligible, and a tail-only shift under it is below this
+instrument's resolution -- full-vocab KLD needs prompt_logprobs in the engine,
+which radiance does not expose yet (upstream request open).
 
 subcommands:
   collect --out FILE --arm NAME [--url URL]     hit one serve, dump per-position
@@ -38,6 +38,7 @@ import json
 import math
 import sys
 import time
+import urllib.error
 import urllib.request
 
 DEFAULT_URL = "http://localhost:9005"
@@ -52,8 +53,11 @@ def http_json(url, payload, timeout=300):
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        sys.exit(f"HTTP {e.code} from {url}: {e.read().decode()[:400]}")
 
 
 def cmd_collect(args):
@@ -180,7 +184,7 @@ def main():
     c.add_argument("--url", default=DEFAULT_URL)
     c.add_argument("--corpus", default=CORPUS_PATH)
     c.add_argument("--n-predict", type=int, default=128)
-    c.add_argument("--n-probs", type=int, default=64)
+    c.add_argument("--n-probs", type=int, default=16)
     c.add_argument("--seed", type=int, default=7)
     c.set_defaults(fn=cmd_collect)
     m = sp.add_parser("compare")
