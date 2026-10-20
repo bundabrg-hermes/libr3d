@@ -8,6 +8,8 @@
  */
 
 #include "rad_abi.h"
+#include <cstdlib>   // getenv, for the R3D_NO_GDN registration filter
+#include <cstring>   // strcmp, same
 
 extern "C" {
 
@@ -1356,14 +1358,40 @@ static const RadKernelInfo kRows[] = {
 
 };
 
-int rad_kernel_schema_count(void) { return (int)(sizeof(kSchemas) / sizeof(kSchemas[0])); }
-const RadOpSchema* rad_kernel_schema_at(int i) {
-    return (i >= 0 && i < rad_kernel_schema_count()) ? &kSchemas[i] : nullptr;
+/* R3D_NO_GDN=1 withdraws the five GDN rows/schemas from the registration, which is the
+ * serve's A/B lever for "GDN arithmetic on the host" without rebuilding a second binary:
+ * the same .so, one env difference between arms. The band planner then places those bands
+ * on the host exactly as it does for gdn_conv_prep today (they have weights), so startup
+ * still completes. Unset is untouched behaviour. */
+static bool r3d_gdn_hidden(void) { static const int v = []{ return getenv("R3D_NO_GDN") ? 1 : 0; }(); return v != 0; }
+static bool r3d_row_hidden(const char* op) {
+    if (!r3d_gdn_hidden() || !op) return false;
+    static const char* const kGdn[] = { "gdn_gated_rmsnorm", "gdn_conv_update", "gdn_kkt_solve",
+                                        "gdn_chunk_scan", "gdn_recurrent_update" };
+    for (const char* n : kGdn) if (strcmp(op, n) == 0) return true;
+    return false;
 }
 
-int rad_kernel_count(void) { return (int)(sizeof(kRows) / sizeof(kRows[0])); }
+int rad_kernel_schema_count(void) {
+    int n = 0;
+    for (const RadOpSchema& s : kSchemas) if (!r3d_row_hidden(s.op)) ++n;
+    return n;
+}
+const RadOpSchema* rad_kernel_schema_at(int i) {
+    if (i < 0) return nullptr;
+    for (const RadOpSchema& s : kSchemas) if (!r3d_row_hidden(s.op) && i-- == 0) return &s;
+    return nullptr;
+}
+
+int rad_kernel_count(void) {
+    int n = 0;
+    for (const RadKernelInfo& k : kRows) if (!r3d_row_hidden(k.op)) ++n;
+    return n;
+}
 const RadKernelInfo* rad_kernel_at(int i) {
-    return (i >= 0 && i < rad_kernel_count()) ? &kRows[i] : nullptr;
+    if (i < 0) return nullptr;
+    for (const RadKernelInfo& k : kRows) if (!r3d_row_hidden(k.op) && i-- == 0) return &k;
+    return nullptr;
 }
 
 } /* extern "C" */
