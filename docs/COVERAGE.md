@@ -932,3 +932,49 @@ conv state, one plane), `gdn_kkt_solve`, `gdn_chunk_scan` (both head_k 128, M to
 which a device row cannot consume without a layout hook. The two unrecorded ops
 (`gdn_conv_prep`, `gdn_conv_recurrent_update`) wait on the dt_bias dtype fix
 upstream or on `--record-rows` once their siblings' kernels exist.
+
+## gdn_conv_update_bf16 -- the second GDN row, bit-exact across the whole 27B decode band (2026-10-20)
+
+The decode-band convolution over the rolling window (ref_ops.h spec 10): one
+block per (sequence, channel), ref's `REF_PAR_FOR(N * conv_dim)` decomposition
+verbatim. The fixture pack records q_len 1..512 at head_k=head_v=128,
+conv_width=4, conv_dim 10240 (16 q/k + 48 v heads), all bf16, bias absent,
+state rank-3 [S, conv_dim, width-2+M] -- a spec-decode band, not just plain
+decode: `num_accepted` picks the read offset so a rejection is a read-offset
+change, never a recompute.
+
+The arithmetic came out exactly as the gemm doctrine predicts: a width-tap f32
+chain in ref's ascending-j order over exact bf16 loads (bf16xbf16 products are
+exact in f32), silu on the double-rounded sigmoid `sigmoid_act` already proved
+bit-identical. Every check on every sweep: **rel_l2 0.000e+00**, including the
+rewritten INOUT `conv_state` -- four output operands per case, none diverging.
+
+Gates (all on the real packs, serve untouched -- the row is inert for MiniCPM):
+
+| sweep | result |
+|---|---|
+| nodraft 27B pack, `--op gdn_conv_update` | 80/80, worst 0.000e+00, per-case table attributes `gdn_conv_update_bf16 \| libr3d \| device` |
+| stock kernels.rkb, all libraries | 1877/1877 (24 named budget-skips as ever), worst rel_l2 unchanged at 3.135e-03, coverage ratchet re-locked at 30 libr3d rows |
+| full mxfp4 pack (drafter + vision) | 4553/4553 -- up from 4513 checked, the +40 being the conv_update cases that now run device-side |
+
+Design calls worth keeping:
+
+* **ref's op-wide window guards became per-sequence skips.** `off + width - 1 >
+  state_len` reads device data on the launch side; ref can fail the whole call,
+  a plugin block can only abstain. A failing guard leaves that sequence's state
+  exactly as it was -- visible in the INOUT diff if a caller ever trips it.
+* **`offlin` is the flat identity on DENSE index tensors** -- for a rank-2
+  [S, M] `state_idx` the ref reads element `n` flat, NOT `n*M`. The row demands
+  dense index tensors (then agrees with ref by construction) and refuses
+  strided ones rather than reimplementing the decomposition.
+* **T comes from `x->shape`, not `cu`.** ref reads `cu[N]` host-side because it
+  is host code; every valid call has cu's last entry equal to x's row count, and
+  the tensor shape is the only one a launcher can see without a sync.
+* The probe `tools/kf_probe_ops.cpp` (dump any op's recorded geometries without
+  a card, one sample per param digest) is the right first move for any new row:
+  it cost one container run and settled geometry, dtype, optionality, and
+  rank before a line of kernel code.
+
+GDN holes left for the 27B trunk: `gdn_kkt_solve`, `gdn_chunk_scan`,
+`gdn_recurrent_update` (three encoded planes, needs the layout hook), plus the
+two unrecorded ops.
