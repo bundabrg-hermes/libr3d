@@ -1150,3 +1150,53 @@ GDN holes for the 27B trunk: NONE -- the graph is whole. What remains in the fam
 the two unrecorded ops (`gdn_conv_recurrent_update` and the conv-prep sibling, blocked by
 the upstream ssm-dt dtype quirk, harness-side) and the anchor-form row the drafter needs
 (already libr4d's; the constraint keeps both libraries honest).
+
+## logits_gemm_e4m3 — the head GEMV on joined planes; 27B placement chain mapped (2026-10-20)
+
+The 27B container stores `output.weight` as fp8_e4m3 codes + a bf16 scale grid
+(`rad.planes`, block 128x128). No libr3d row could claim it: hookless device rows
+are declined for multi-plane weights, and the host kernels get refused placement
+for mapped-eligible tiers ("stored form is not the container's"). Startup died at
+`logits_gemm -> [host:libavx]` on the 27B config.
+
+* New TU `src/r3d_gemm_logits.hip` (`logits_gemm_e4m3`): reads the planes header
+  verbatim from the ABI (magic PLNS), decodes codes+scale in-register. WMMA
+  rejected on math grounds — decoded e4m3 x bf16 needs >11 mantissa bits, an
+  f16-rounded product sits ~2e-3 off, and the head is the tolerance-critical op.
+  Bandwidth-bound GEMV instead: warp per (row-block, m-group), xs staged per m,
+  uint4 codes walk + 8-byte scale walk (br=128) or scalar walk (br=1), f32
+  accumulation in the reference's ascending k order. MT in {1,2,4,8} from M.
+* Two bugs, both caught ONLY by the standalone unit test
+  (`tools/test_logits_e4m3.cpp`, card + CPU oracle, 8 cases: 8/8 after fix):
+  1. The block-staged "uniform" scale was thread 0's *warp's* row — every other
+     warp silently used the wrong head row's scale (br=1 exposed it; br=128 with
+     rblk = r/128 made the whole block genuinely share a scale row, masking it).
+  2. Row ordering: declaring this row *before* `logits_gemm_bf16` steals the
+     plain bf16 band, because a hook answer of "unsupported" means *store as is*,
+     not "decline". It would then refuse those at launch and serve would fall to
+     host logits every token. bf16 row first; the encoded band declines the
+     hookless bf16 row at declare time anyway.
+* Attribution: the 27B serve startup line no longer lists
+  `logits_gemm -> [host:libavx]` — the row claims the band. The stock/full pack
+  sweeps budget-skip all logits_gemm cases (7.1-14.2 GiB against the co-tenant's
+  RAM), so the unit test is the correctness evidence, plus serve adoption.
+
+## 27B serve placement chain — two walls remain, both beyond libr3d rows
+
+With GDN + imrope + logits all claimed, the 27B startup walks one wall per
+restart (each fix exposes the next):
+
+1. `blk.N.attn.gate_up_proj/gate_proj/down_proj` (fp8_e4m3, 128x32): any host row
+   (`gemm_mma`/`gemm_rt`) triggers mapped-tier widening of the fp8 codes ->
+   "stored form is not the container's". Fix = an fp8 GEMM row with planes +
+   swizzled-scale (TMA) handling. Same scale-grid decode as here; bigger job.
+2. `blk.0.attn_norm.weight` (+10 more): RAD_F32 tensors on a bf16-eligible band
+   placed on the mapped tier — the engine *requires* the consumer to declare
+   `RAD_WEIGHT_WIDENING`; that knob is undocumented in `rad_abi.h`/`rad_block.h`.
+   Possibly resolved for free by the fp8-GEMM fix changing the band's eligibility;
+   untested.
+
+Incident: the first serve27 attempt OOM-killed `libr3d-serve` (MiniCPM demo,
+exit 137) — 27B host-side mapping on a box holding co-tenant serve + one serve has
+~2.6 GB headroom. Do not run serve27 while minicpm serve is up; minicpm serve
+was restored after staging (health 200, 564/564 device bands).
