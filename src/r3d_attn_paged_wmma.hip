@@ -123,7 +123,7 @@ using bf16 = roCW::bfloat16_t;
         * launcher's gcnArchName gate below never dispatches it on such a chip. */
 
 namespace {
-template <int D, int KVDT, int SPLITK>
+template <int D, int KVDT, int SPLITK, int DBUF = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams) {}
 template <int D, int KVDT, int SPLITK>
 __global__ __launch_bounds__(kT) void attn_paged_wmma_kernel2(R3dAttnParams) {}
@@ -193,6 +193,21 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
      * reachable only without v3). */
     static int v3 = -1;
     if (v3 < 0) v3 = getenv("R3D_ATTN_V3") ? 1 : 0;
+    /* DBUF: register-prefetched KV staging on v1's geometry (body.inc's DBUF branch).
+     * Bit-identical schedule change (same fragments, same order, same LDS slots).
+     * Default-on since the paired card bench (build8, 2026-10-20): 1.19-1.27x on all
+     * five bench geometries, hashes identical to the old arm, deep-ctx KV rate
+     * 141->171 GB/s. Kill switch R3D_ATTN_NO_DBUF=1 keeps the old arm reachable for
+     * serve A/B and postmortem. The vec-path gate must hold (bf16, contiguous rows,
+     * 16B base) or the pipelined gather has nothing vector to walk -- odd shapes
+     * stay on the historical arm. R3D_DBG (forensics) builds always take the
+     * instrumented loop. */
+    static int dbuf = -1;
+#ifdef R3D_DBG
+    dbuf = 0;
+#else
+    if (dbuf < 0) dbuf = getenv("R3D_ATTN_NO_DBUF") ? 0 : 1;
+#endif
 
     const unsigned bm = v3 ? (unsigned)kBM3 : (unsigned)kBM;
     const unsigned tiles = (unsigned)((P.rows + bm - 1) / bm);
@@ -215,9 +230,21 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
         else if (d128 && !kvbf) R3D_LAUNCH3(K, 128, RAD_F8E4M3);               \
         else if (!d128 &&  kvbf) R3D_LAUNCH3(K, 64, RAD_BF16);                 \
         else                     R3D_LAUNCH3(K, 64, RAD_F8E4M3);
-    if (v3)      { R3D_ARMS3(attn_paged_wmma_kernel3) }
-    else if (v2) { R3D_ARMS(attn_paged_wmma_kernel2) }
-    else         { R3D_ARMS(attn_paged_wmma_kernel)  }
+    /* DBUF arm: same vec gate the kernel's kvvec flag computes (r3d_attn.h fields,
+     * same expression as the body's kvvec derivation). */
+    const bool dbuf_ok = dbuf && kvbf && (P.kv_sd == 1) && ((((uintptr_t)P.kv) & 15) == 0);
+    #define R3D_LAUNCH4(K, D, KV, SK, DB) hipLaunchKernelGGL((K<D, KV, SK, DB>), grid, block, 0, stream, P)
+    #define R3D_ARMS4(K, SK, DB)                                                      \
+        if      (d128 && kvbf) R3D_LAUNCH4(K, 128, RAD_BF16, SK, DB);                 \
+        else if (d128 && !kvbf) R3D_LAUNCH4(K, 128, RAD_F8E4M3, SK, DB);              \
+        else if (!d128 && kvbf) R3D_LAUNCH4(K, 64, RAD_BF16, SK, DB);                 \
+        else                     R3D_LAUNCH4(K, 64, RAD_F8E4M3, SK, DB);
+    if (v3)             { R3D_ARMS3(attn_paged_wmma_kernel3) }
+    else if (v2)        { R3D_ARMS(attn_paged_wmma_kernel2)  }
+    else if (dbuf_ok)   { R3D_ARMS4(attn_paged_wmma_kernel, 0, 1) }
+    else                { R3D_ARMS(attn_paged_wmma_kernel)   }
+    #undef R3D_ARMS4
+    #undef R3D_LAUNCH4
     #undef R3D_ARMS3
     #undef R3D_LAUNCH3
     #undef R3D_ARMS

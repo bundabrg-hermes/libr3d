@@ -36,10 +36,12 @@ __device__ __forceinline__ void bf16_store(bf16* p, uint16_t bits) {
  *   P   64 x 36    bf16   exp'd probabilities, pass two only
  *   KV  32 x (D+8) bf16   key tile, THEN the value tile (aliased: V stages after the
  *                         tile's S-fragments have left the LDS, one sync apart)
- *   meta m/l f32[64], rowbase i64[32], colbad u8[32]
+ *   meta m/l f32[64], rowbase i64[32], colbad u8[32]; the DBUF arm keeps a SECOND
+ *        rowbase/colbad pair so tile t+1's addressing can run while tile t computes.
  * O-store staging (32 x (D+8) f32, halves of the output) aliases Q+S after pass two's
- * last fragment read. D=128 total: 41776 B static -- under the 48 KiB static ceiling,
- * no hipFuncSetAttribute dance. */
+ * last fragment read. D=128 total: 41776 B static (DBUF +304 B) -- under the 48 KiB
+ * static ceiling, no hipFuncSetAttribute dance; the +304 B does not change blocks/CU
+ * at either head_dim (that is the m64 B-buffer lesson honored: no LDS double buffer). */
 template <int D> struct Carve {
     static constexpr int kQP = D + 8, kVP = D + 8, kSP = kBN + 8, kPP = kBN + 4;
     static constexpr int kOP = D + 8;
@@ -50,7 +52,9 @@ template <int D> struct Carve {
     static constexpr int offM  = (offKV + kBN * kVP * 2 + 15) & ~15;   /* + m[64] l[64] */
     static constexpr int offRB = offM + 2 * kBM * 4;
     static constexpr int offCB = offRB + kBN * 8;
-    static constexpr int total = offCB + kBN + 16;
+    static constexpr int offRB2 = offCB + kBN;         /* DBUF addressing pair (8-aligned) */
+    static constexpr int offCB2 = offRB2 + kBN * 8;
+    static constexpr int total = offCB2 + kBN + 16;
 };
 
 /* Gather the 32 key rows RB[] (bad rows zero-filled) into LDS at pitch kVP. The
@@ -97,7 +101,55 @@ __device__ __forceinline__ void stage_kv_tile(bf16* KVp, const int64_t* RB,
     }
 }
 
-template <int D, int KVDT, int SPLITK>
+/* Register-prefetch staging for the DBUF arm (see the kernel's DBUF branch).
+ * ld walks the tile's uint4 items GLOBAL -> REGISTERS (the array is the in-flight
+ * buffer); st walks REGISTERS -> LDS with the same e->(r,d) mapping stage_kv_tile's
+ * vector path uses, so the bytes land in identical slots. The per-item alignment
+ * gate is thread-local (RB[r]&7), so no block agreement is needed mid-pipeline;
+ * misaligned rows walk scalars into the same registers (bit-identical, never hit
+ * by serve layouts -- kv_sd==1 is a launcher gate for this arm). DBUF arm is
+ * bf16-only: fp8 unpacks per byte and stays on the scalar arm. */
+template <int D, int KVDT>
+__device__ __forceinline__ void ld_kv_regs(uint4* dst, const int64_t* RB,
+                                           const R3dAttnParams& P, int64_t koff,
+                                           bool vec) {
+    constexpr int DSH = (D == 128) ? 7 : 6;
+    constexpr int KNU = kBN * D / 8 / kThreads;
+    (void)vec;    /* DBUF launches only with the vec gate true; kept for symmetry */
+    #pragma unroll
+    for (int i = 0; i < KNU; ++i) {
+        const int e = threadIdx.x + i * kThreads;
+        const int r = e >> (DSH - 3), d = (e & ((1 << (DSH - 3)) - 1)) << 3;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (RB[r] >= 0) {
+            if (((RB[r] + koff + d) & 7) == 0) {
+                v = *reinterpret_cast<const uint4*>((const uint16_t*)P.kv + RB[r] + koff + d);
+            } else {                                  /* rare: odd slot base */
+                uint16_t t8[8];
+                #pragma unroll
+                for (int u = 0; u < 8; ++u)
+                    t8[u] = ((const uint16_t*)P.kv)[RB[r] + koff + d + u];
+                v = *reinterpret_cast<const uint4*>(t8);
+            }
+        }
+        dst[i] = v;
+    }
+}
+
+template <int D>
+__device__ __forceinline__ void st_kv_regs(const uint4* src, bf16* KVp) {
+    constexpr int DSH = (D == 128) ? 7 : 6;
+    constexpr int KNU = kBN * D / 8 / kThreads;
+    typedef Carve<D> C;
+    #pragma unroll
+    for (int i = 0; i < KNU; ++i) {
+        const int e = threadIdx.x + i * kThreads;
+        const int r = e >> (DSH - 3), d = (e & ((1 << (DSH - 3)) - 1)) << 3;
+        *reinterpret_cast<uint4*>(KVp + r * C::kVP + d) = src[i];
+    }
+}
+
+template <int D, int KVDT, int SPLITK, int DBUF = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams P) {
     constexpr int DSH = (D == 128) ? 7 : 6, DM1 = D - 1;
     typedef Carve<D> C;
@@ -111,6 +163,8 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
     float*  LSP = MSP + kBM;
     int64_t* RB = reinterpret_cast<int64_t*>(raw + C::offRB);
     unsigned char* CB = raw + C::offCB;
+    int64_t* RB2 = reinterpret_cast<int64_t*>(raw + C::offRB2);
+    unsigned char* CB2 = raw + C::offCB2;
 #ifdef R3D_DBG
     /* Debug wire: kdes carries a double[64] dump buffer (the repro's REPRO_DBG=1 arm);
      * descales are forced off on such runs (REPRO_NOP=1 pairs with it). Device printf is
@@ -166,6 +220,23 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             if (causal ? (d >= window) : (d >= window || d <= -window)) return false;
         }
         return true;
+    };
+
+    /* Gather the 32 key rows for tile t into an addressing slot. One text for the
+     * DBUF arm's prologue and loop tail (the non-DBUF arm keeps its historical
+     * inline copy: the arithmetic here is that copy, moved verbatim). */
+    auto address_tile = [&](int t, int64_t* RBx, unsigned char* CBx) {
+        if (tid < kBN) {
+            const int64_t j = (int64_t)t * kBN + tid;
+            int64_t rb = -1;
+            if (j < jend) {
+                const int64_t blk = (int64_t)ldi_w(P.bt_dt, P.bt,
+                                                   s * P.bt_rs + (j / P.block_size) * P.bt_cs);
+                if (blk >= 0)
+                    rb = blk * P.kv_sb + kh * P.kv_sh + (j % P.block_size) * P.kv_so;
+            }
+            RBx[tid] = rb; CBx[tid] = (rb < 0) ? 1 : 0;
+        }
     };
 
     /* Tile range that any row can see (skip the dead head of a window, stop past the
@@ -244,6 +315,135 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
     roCW::fragment<roCW::matrix_b, 16, 16, 16, bf16, roCW::col_major> fb0, fb1;
     roCW::fragment<roCW::accumulator, 16, 16, 16, float> a0, a1;
 
+    /* DBUF in-flight staging registers: kx carries the next tile's K rows while the
+     * current tile computes; vc carries the current tile's V rows, reloaded to the
+     * next tile's V right after its store (one in-flight V per thread block, and K
+     * is consumed same-iteration so it needs no swap). */
+    constexpr int KNU = kBN * D / 8 / kThreads;
+    uint4 kx[KNU], vc[KNU];
+
+    /* The O accumulators live above the arm branch: both schedules fill them the
+     * same way, and the shared tail normalizes them into out/partials. */
+    roCW::fragment<roCW::accumulator, 16, 16, 16, float> oa[D / 16];
+    #pragma unroll
+    for (int i = 0; i < D / 16; ++i) roCW::fill_fragment(oa[i], 0.0f);
+
+    if (DBUF) {
+        /* ---- DBUF schedule (gemm m64's lesson, applied to paged attention): the
+         * next tile's global gather is issued BEFORE the current tile's WMMA and
+         * lands in registers, then walks to LDS when the single KV buffer frees.
+         * Barriers per tile drop pass one 4->3, pass two 6->4: addressing runs one
+         * tile ahead in the double-buffered RB/CB pair, staging runs inside the
+         * compute window. Arithmetic is v1's verbatim (same fragments, same order,
+         * same LDS slots), so outputs are bit-identical and the arm needs no KLD. */
+        int64_t* RBc = RB; int64_t* RBn = RB2;
+        unsigned char* CBc = CB; unsigned char* CBn = CB2;
+
+        /* pass one, pipelined */
+        address_tile(et0, RBc, CBc);
+        address_tile(et0 + 1, RBn, CBn);
+        __syncthreads();
+        stage_kv_tile<D, KVDT>(KVp, RBc, P, 0, kvvec);
+        __syncthreads();
+        for (int t = et0; t < et1; ++t) {
+            const int64_t jb = (int64_t)t * kBN;
+            ld_kv_regs<D, KVDT>(kx, RBn, P, 0, kvvec);       /* K(t+1) in flight */
+            roCW::fill_fragment(a0, 0.0f);
+            roCW::fill_fragment(a1, 0.0f);
+            for (int k0 = 0; k0 < D; k0 += 16) {
+                roCW::load_matrix_sync(fa,  Qsp + (w * 16) * C::kQP + k0, C::kQP, roCW::mem_row_major);
+                roCW::load_matrix_sync(fb0, KVp + k0, C::kVP);
+                roCW::load_matrix_sync(fb1, KVp + 16 * C::kVP + k0, C::kVP);
+                roCW::mma_sync(a0, fa, fb0, a0);
+                roCW::mma_sync(a1, fa, fb1, a1);
+            }
+            roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP,      a0, C::kSP, roCW::mem_row_major);
+            roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP + 16, a1, C::kSP, roCW::mem_row_major);
+            __syncthreads();                                   /* K(t)'s fragments have left */
+            if (tid < kBM && tid < valid) {
+                const int64_t rowpos = pos_base + tid;
+                const float* srow = Ssp + tid * C::kSP;
+                float mx = MSP[tid];
+                for (int jj = 0; jj < kBN; ++jj) {
+                    if (CBc[jj] || !visible(rowpos, jb + jj)) continue;
+                    const float v = srow[jj] * scale2;
+                    if (v > mx) mx = v;
+                }
+                if (mx != -INFINITY) {
+                    if (mx > MSP[tid]) {
+                        if (MSP[tid] != -INFINITY) LSP[tid] *= exp2f(MSP[tid] - mx);
+                        MSP[tid] = mx;
+                    }
+                    float sum = 0.0f;
+                    for (int jj = 0; jj < kBN; ++jj) {
+                        if (CBc[jj] || !visible(rowpos, jb + jj)) continue;
+                        sum += exp2f(srow[jj] * scale2 - mx);
+                    }
+                    LSP[tid] += sum;
+                }
+            }
+            __syncthreads();                                   /* CBc reads complete */
+            st_kv_regs<D>(kx, KVp);                            /* K(t+1) -> LDS */
+            address_tile(t + 2, RBc, CBc);                     /* refill the freed slot */
+            { int64_t* tmp = RBc; RBc = RBn; RBn = tmp; }
+            { unsigned char* tmp = CBc; CBc = CBn; CBn = tmp; }
+            __syncthreads();
+        }
+
+        /* pass two, pipelined */
+        address_tile(et0, RBc, CBc);
+        address_tile(et0 + 1, RBn, CBn);
+        __syncthreads();
+        stage_kv_tile<D, KVDT>(KVp, RBc, P, 0, kvvec);         /* K(t0) */
+        ld_kv_regs<D, KVDT>(vc, RBc, P, D, kvvec);             /* V(t0) in flight */
+        __syncthreads();
+        for (int t = et0; t < et1; ++t) {
+            const int64_t jb = (int64_t)t * kBN;
+            ld_kv_regs<D, KVDT>(kx, RBn, P, 0, kvvec);         /* K(t+1) in flight */
+            roCW::fill_fragment(a0, 0.0f);
+            roCW::fill_fragment(a1, 0.0f);
+            for (int k0 = 0; k0 < D; k0 += 16) {
+                roCW::load_matrix_sync(fa,  Qsp + (w * 16) * C::kQP + k0, C::kQP, roCW::mem_row_major);
+                roCW::load_matrix_sync(fb0, KVp + k0, C::kVP);
+                roCW::load_matrix_sync(fb1, KVp + 16 * C::kVP + k0, C::kVP);
+                roCW::mma_sync(a0, fa, fb0, a0);
+                roCW::mma_sync(a1, fa, fb1, a1);
+            }
+            roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP,      a0, C::kSP, roCW::mem_row_major);
+            roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP + 16, a1, C::kSP, roCW::mem_row_major);
+            __syncthreads();                                   /* b1: K(t)'s fragments left; S visible */
+            for (int e = tid; e < kBM * kBN; e += kThreads) {  /* S -> P, all four waves */
+                const int r = e >> 5, jj = e & 31;
+                float pv = 0.0f;
+                if (r < valid && !CBc[jj] && visible(pos_base + r, jb + jj)) {
+                    const float m = MSP[r];
+                    if (m != -INFINITY) pv = exp2f(Ssp[r * C::kSP + jj] * scale2 - m);
+                }
+                bf16_store(Psp + r * C::kPP + jj, f32_bf16_w(pv));
+            }
+            st_kv_regs<D>(vc, KVp);                            /* V(t) -> LDS (K(t) dead per b1) */
+            ld_kv_regs<D, KVDT>(vc, RBn, P, D, kvvec);         /* V(t+1) in flight */
+            __syncthreads();                                   /* b2: Psp + V(t) visible */
+            for (int jk = 0; jk < kBN / 16; ++jk) {
+                roCW::fragment<roCW::matrix_a, 16, 16, 16, bf16, roCW::row_major> fap;
+                roCW::load_matrix_sync(fap, Psp + (w * 16) * C::kPP + jk * 16, C::kPP,
+                                       roCW::mem_row_major);
+                #pragma unroll
+                for (int d0 = 0; d0 < D / 16; ++d0) {
+                    roCW::fragment<roCW::matrix_b, 16, 16, 16, bf16, roCW::row_major> fbv;
+                    roCW::load_matrix_sync(fbv, KVp + (jk * 16) * C::kVP + d0 * 16, C::kVP,
+                                           roCW::mem_row_major);
+                    roCW::mma_sync(oa[d0], fap, fbv, oa[d0]);
+                }
+            }
+            __syncthreads();                                   /* b3: V(t)'s fragments left */
+            st_kv_regs<D>(kx, KVp);                            /* K(t+1) -> LDS */
+            address_tile(t + 2, RBc, CBc);
+            { int64_t* tmp = RBc; RBc = RBn; RBn = tmp; }
+            { unsigned char* tmp = CBc; CBc = CBn; CBn = tmp; }
+            __syncthreads();                                   /* b4: K(t+1)+addressing visible */
+        }
+    } else {
     /* ================= pass one: per-row running max m and exp-sum l ================= */
     for (int t = et0; t < et1; ++t) {
         const int64_t jb = (int64_t)t * kBN;
@@ -358,10 +558,8 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
     }
 
     /* ===================== pass two: O = P.V, P at the final m ====================== */
-    roCW::fragment<roCW::accumulator, 16, 16, 16, float> oa[D / 16];
-    #pragma unroll
-    for (int i = 0; i < D / 16; ++i) roCW::fill_fragment(oa[i], 0.0f);
-
+    /* oa was filled above the arm branch; do NOT redeclare it here (a shadow would
+     * leave the outer accumulators unfilled for the tail). */
     for (int t = et0; t < et1; ++t) {
         const int64_t jb = (int64_t)t * kBN;
 
@@ -448,6 +646,8 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
         }
         __syncthreads();
     }
+
+    }  /* end non-DBUF arm */
 
     /* ===================== out = (O / l) * vds, in 32-row halves ===================== */
     float* Osp = reinterpret_cast<float*>(raw + C::offQ);   /* aliases Q+S, both dead */

@@ -116,7 +116,7 @@ using bf16 = roCW::bfloat16_t;
         * the launcher's gcnArchName gate never dispatches it on such a chip. */
 
 namespace {
-template <int D, int KVDT, int SPLITK>
+template <int D, int KVDT, int SPLITK, int DBUF = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams) {}
 template <int D, int KVDT, int SPLITK>
 __global__ __launch_bounds__(kT) void attn_paged_wmma_kernel2(R3dAttnParams) {}
@@ -334,14 +334,43 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
 
     const int kvbf = (P.kvdt == RAD_BF16);
     const int d128 = (P.head_dim == 128);
+    /* DBUF slice arm (see the prefill launcher's comment): default-on after the
+     * paired bench; R3D_ATTN_NO_DBUF=1 forces the old staging arm. The merge
+     * kernel is schedule-agnostic -- same arena contract -- no second arm. */
+    static int dbuf = -1;
+#ifdef R3D_DBG
+    dbuf = 0;
+#else
+    if (dbuf < 0) dbuf = getenv("R3D_ATTN_NO_DBUF") ? 0 : 1;
+#endif
+    const bool dbuf_ok = dbuf && !v2 && kvbf && (P.kv_sd == 1) && ((((uintptr_t)P.kv) & 15) == 0);
+    #define R3D_DK_LAUNCH4(K, D, KV, SK, DB)                                                               \
+        do {                                                                                               \
+            hipLaunchKernelGGL((K<D, KV, SK, DB>),                                                         \
+                               dim3((unsigned)P.q_heads, (unsigned)P.n_seq, (unsigned)gz),                \
+                               dim3(kThreads), 0, stream, P);                                             \
+            hipError_t e0 = hipGetLastError();                                                             \
+            if (e0 != hipSuccess) return RAD_E_DEVICE;   /* partial state: fail the step */                \
+            hipLaunchKernelGGL((attn_splitk_merge_kernel<D>),                                              \
+                               dim3((unsigned)P.q_heads, (unsigned)P.rows), dim3(D), 0, stream, P, spl);   \
+            hipError_t e1 = hipGetLastError();                                                             \
+            return e1 == hipSuccess ? RAD_OK : RAD_E_DEVICE;                                               \
+        } while (0)
     #define R3D_DK_ARMS(K)                                                           \
         if      (d128 &&  kvbf) R3D_DK_LAUNCH(K, 128, RAD_BF16);                     \
         else if (d128 && !kvbf) R3D_DK_LAUNCH(K, 128, RAD_F8E4M3);                   \
         else if (!d128 &&  kvbf) R3D_DK_LAUNCH(K, 64, RAD_BF16);                     \
         else                     R3D_DK_LAUNCH(K, 64, RAD_F8E4M3);
-    if (v2) { R3D_DK_ARMS(attn_paged_wmma_kernel2) }
-    else    { R3D_DK_ARMS(attn_paged_wmma_kernel)  }
+    if (v2)           { R3D_DK_ARMS(attn_paged_wmma_kernel2) }
+    else if (dbuf_ok) {
+        if      (d128 &&  kvbf) R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 128, RAD_BF16, 1, 1);
+        else if (d128 && !kvbf) R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 128, RAD_F8E4M3, 1, 1);
+        else if (!d128 &&  kvbf) R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 64, RAD_BF16, 1, 1);
+        else                     R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 64, RAD_F8E4M3, 1, 1);
+    }
+    else              { R3D_DK_ARMS(attn_paged_wmma_kernel)  }
     #undef R3D_DK_ARMS
+    #undef R3D_DK_LAUNCH4
     #undef R3D_DK_LAUNCH
     return RAD_E_DEVICE;   /* unreachable: every macro arm returns */
 }
