@@ -1015,13 +1015,24 @@ static const RadKernelInfo kRows[] = {
   cBf16Row, 1, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gemm_nt },
 
+{ "logits_gemm_bf16", "logits_gemm", "vocab",
+  "the lm_head projection: same tile as gemm_nt_bf16, the vocabulary edge's parameter "
+  "spelling; logits go out F32",
+  "any M and any vocabulary; n_embd a multiple of 8",
+  "bf16 x and lm_head, F32 LOGITS OUT, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cLogitsGemm, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_logits_gemm },
+
 /* logits_gemm: the e4m3 head with one float scale per 128 columns of K (the
  * layout hook admits exactly that joined form; the launcher pins the scale
  * grid's row block to 1 or 128). Ragged K without a four-byte row walk, and
- * int8 heads, are refused -- the host libraries keep those. Declared before
- * the bf16 head row so an encoded weight gets its layout hook first; the hook
- * refuses single-plane storage, so a plain bf16 head still lands on the row
- * below. */
+ * int8 heads, are refused -- the host libraries keep those. Declared AFTER the
+ * bf16 head row on purpose: a plain head must be claimed by the bf16 row (an
+ * unsupported hook answer is "store as is", not a decline -- declaring first
+ * here would win the plain band and refuse it at launch, dropping serve to
+ * host). An encoded band declines the hookless bf16 row at declare time
+ * anyway, so this row is the only one left standing for it. */
 { "logits_gemm_e4m3", "logits_gemm", "vocab",
   "bandwidth GEMV over the joined lm_head: warp per head row, four codes per "
   "lane per step, x staged per 128-column block through LDS; the decoded e4m3 "
@@ -1034,15 +1045,6 @@ static const RadKernelInfo kRows[] = {
   cLogitsRow, 3, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_logits_gemm_e4m3,
   nullptr, r3d_layout_head, r3d_relayout_head, nullptr, r3d_unrelayout_head },
-
-{ "logits_gemm_bf16", "logits_gemm", "vocab",
-  "the lm_head projection: same tile as gemm_nt_bf16, the vocabulary edge's parameter "
-  "spelling; logits go out F32",
-  "any M and any vocabulary; n_embd a multiple of 8",
-  "bf16 x and lm_head, F32 LOGITS OUT, fp32 accumulate",
-  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
-  cLogitsGemm, 2, nullptr, 0, nullptr,
-  nullptr, nullptr, r3d_rad_logits_gemm },
 
 { "gemm_nt_q_mxfp4", "gemm_nt_q", "gemm",
   "mxfp4a8 WMMA tile: e2m1 nibbles decoded and E8M0-folded into bf16 B fragments per "
