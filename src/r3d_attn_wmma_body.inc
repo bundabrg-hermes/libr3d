@@ -30,17 +30,18 @@ __device__ __forceinline__ void bf16_store(bf16* p, uint16_t bits) {
 }
 
 /* LDS carve, byte offsets into one buffer (16-aligned), per head_dim:
- *   Q   64 x (D+4) bf16   query tile, staged once per workgroup
+ *   Q   64 x (D+8) bf16   query tile, staged once per workgroup (pitch 8-aligned:
+ *                         the vector staging path stores uint4 straight into LDS)
  *   S   64 x 40    f32    score tile (pad 8: 32 real columns, row-bank spread)
  *   P   64 x 36    bf16   exp'd probabilities, pass two only
- *   KV  32 x (D+4) bf16   key tile, THEN the value tile (aliased: V stages after the
+ *   KV  32 x (D+8) bf16   key tile, THEN the value tile (aliased: V stages after the
  *                         tile's S-fragments have left the LDS, one sync apart)
  *   meta m/l f32[64], rowbase i64[32], colbad u8[32]
  * O-store staging (32 x (D+8) f32, halves of the output) aliases Q+S after pass two's
- * last fragment read. D=128 total: 40992 B static -- under the 48 KiB static ceiling,
+ * last fragment read. D=128 total: 41776 B static -- under the 48 KiB static ceiling,
  * no hipFuncSetAttribute dance. */
 template <int D> struct Carve {
-    static constexpr int kQP = D + 4, kVP = D + 4, kSP = kBN + 8, kPP = kBN + 4;
+    static constexpr int kQP = D + 8, kVP = D + 8, kSP = kBN + 8, kPP = kBN + 4;
     static constexpr int kOP = D + 8;
     static constexpr int offQ  = 0;
     static constexpr int offS  = (offQ + kBM * kQP * 2 + 15) & ~15;
@@ -51,6 +52,50 @@ template <int D> struct Carve {
     static constexpr int offCB = offRB + kBN * 8;
     static constexpr int total = offCB + kBN + 16;
 };
+
+/* Gather the 32 key rows RB[] (bad rows zero-filled) into LDS at pitch kVP. The
+ * vector path walks EIGHT bf16 per iteration -- the same bits, 8x fewer scalar
+ * load/store instructions per tile. It is the throughput fix the v2/v3 pair
+ * localized: deep-ctx cases sustain ~90 GB/s on a 500+ GB/s card because the
+ * elementwise loop, the barriers, and the bytes are all fine; only the
+ * 2-byte-at-a-time walk is slow. `vec` arrives as the dtype/stride/base gate
+ * (contiguous rows, 16B-aligned bases); the live row bases RB[] are re-checked
+ * for 8-element alignment here (serve KV slots are multiples of 2*head_dim, so
+ * yes on every shape the engine serves; the scalar loop keeps any odd shape
+ * bit-identical too). fp8 stays scalar: fp8_to_bf16_w is per-byte and the
+ * unpack costs more than it saves. koff selects K (0) or V (D) within the slot.
+ * Must be called after the addressing barrier (it reads RB[]). */
+template <int D, int KVDT>
+__device__ __forceinline__ void stage_kv_tile(bf16* KVp, const int64_t* RB,
+                                              const R3dAttnParams& P, int64_t koff,
+                                              bool vec) {
+    constexpr int DSH = (D == 128) ? 7 : 6;
+    typedef Carve<D> C;
+    if (vec) {
+        for (int r = 0; r < kBN; ++r)
+            if (RB[r] >= 0 && (RB[r] & 7)) { vec = false; break; }
+    }
+    if (vec) {
+        for (int e = threadIdx.x; e < kBN * D / 8; e += kThreads) {
+            const int r = e >> (DSH - 3), d = (e & ((1 << (DSH - 3)) - 1)) << 3;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (RB[r] >= 0)
+                v = *reinterpret_cast<const uint4*>((const uint16_t*)P.kv + RB[r] + koff + d);
+            *reinterpret_cast<uint4*>(KVp + r * C::kVP + d) = v;
+        }
+    } else {
+        for (int e = threadIdx.x; e < kBN * D; e += kThreads) {
+            const int r = e >> DSH, d = e & (D - 1);
+            uint16_t u = 0;
+            if (RB[r] >= 0) {
+                const int64_t a = RB[r] + (koff + (int64_t)d) * P.kv_sd;
+                u = (KVDT == RAD_BF16) ? ((const uint16_t*)P.kv)[a]
+                                       : fp8_to_bf16_w(((const uint8_t*)P.kv)[a]);
+            }
+            bf16_store(KVp + r * C::kVP + d, u);
+        }
+    }
+}
 
 template <int D, int KVDT, int SPLITK>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams P) {
@@ -159,14 +204,32 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
     }
 
     /* ---- stage Q once: rows tok_base..+63 (invalid rows zeroed; they mask everywhere
-     * and never store), columns 0..head_dim-1. ---- */
+     * and never store), columns 0..head_dim-1. Vector path when the q walk is
+     * contiguous and 8-aligned on both sides (bit-identical copy either way). ---- */
     const int64_t qbase = tok_base * P.q_rs + (int64_t)h * P.q_hs;
-    for (int e = tid; e < kBM * D; e += kThreads) {
-        const int r = e >> DSH, d = e & DM1;
-        bf16_store(Qsp + r * C::kQP + d, (r < valid)
-            ? ((const uint16_t*)P.q)[qbase + (int64_t)r * P.q_rs + (int64_t)d * P.q_ds]
-            : (uint16_t)0);
+    const bool qvec = (P.q_ds == 1) && ((P.q_rs & 7) == 0) && ((P.q_hs & 7) == 0) &&
+                      ((qbase & 7) == 0) && ((((uintptr_t)P.q) & 15) == 0);
+    if (qvec) {
+        for (int e = tid; e < kBM * D / 8; e += kThreads) {
+            const int r = e >> (DSH - 3), d = (e & ((1 << (DSH - 3)) - 1)) << 3;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (r < valid)
+                v = *reinterpret_cast<const uint4*>((const uint16_t*)P.q
+                                                    + qbase + (int64_t)r * P.q_rs + d);
+            *reinterpret_cast<uint4*>(Qsp + r * C::kQP + d) = v;
+        }
+    } else {
+        for (int e = tid; e < kBM * D; e += kThreads) {
+            const int r = e >> DSH, d = e & DM1;
+            bf16_store(Qsp + r * C::kQP + d, (r < valid)
+                ? ((const uint16_t*)P.q)[qbase + (int64_t)r * P.q_rs + (int64_t)d * P.q_ds]
+                : (uint16_t)0);
+        }
     }
+    /* Per-kernel gate for the KV staging vector path (per-tile RB alignment is
+     * re-checked inside stage_kv_tile). fp8 is excluded by dtype, not alignment. */
+    const bool kvvec = (KVDT == RAD_BF16) && (P.kv_sd == 1) &&
+                       ((((uintptr_t)P.kv) & 15) == 0);
     if (tid < kBM) { MSP[tid] = -INFINITY; LSP[tid] = 0.0f; }
     __syncthreads();
 #ifdef R3D_DBG
@@ -199,6 +262,9 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
         }
         __syncthreads();
 
+#ifdef R3D_DBG
+        /* the debug wire keeps its own instrumented scalar loop: the R3D_DBG build
+         * is forensics, never a perf reference (see the printf+LDS 401 trap). */
         for (int e = tid; e < kBN * D; e += kThreads) {
             const int r = e >> DSH, d = e & DM1;
             uint16_t u = 0;
@@ -206,17 +272,18 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                 const int64_t a = RB[r] + (int64_t)d * P.kv_sd;
                 u = (KVDT == RAD_BF16) ? ((const uint16_t*)P.kv)[a]
                                        : fp8_to_bf16_w(((const uint8_t*)P.kv)[a]);
-#ifdef R3D_DBG
                 if (dbg && t == t0 && e == 0) {
                     dbg[0] = (double)RB[r];
                     dbg[1] = (double)(KVDT == RAD_BF16 ? ((const uint16_t*)P.kv)[a]
                                                       : (int)((const uint8_t*)P.kv)[a]);
                     dbg[2] = (double)u;
                 }
-#endif
             }
             bf16_store(KVp + r * C::kVP + d, u);
         }
+#else
+        stage_kv_tile<D, KVDT>(KVp, RB, P, 0, kvvec);
+#endif
         __syncthreads();
 #ifdef R3D_DBG
         if (dbg && t == t0 && tid == 0) {
@@ -310,16 +377,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             RB[tid] = rb; CB[tid] = (rb < 0) ? 1 : 0;
         }
         __syncthreads();
-        for (int e = tid; e < kBN * D; e += kThreads) {
-            const int r = e >> DSH, d = e & DM1;
-            uint16_t u = 0;
-            if (RB[r] >= 0) {
-                const int64_t a = RB[r] + (int64_t)d * P.kv_sd;
-                u = (KVDT == RAD_BF16) ? ((const uint16_t*)P.kv)[a]
-                                       : fp8_to_bf16_w(((const uint8_t*)P.kv)[a]);
-            }
-            bf16_store(KVp + r * C::kVP + d, u);
-        }
+        stage_kv_tile<D, KVDT>(KVp, RB, P, 0, kvvec);       /* K tile, as pass one */
         __syncthreads();
 
         roCW::fill_fragment(a0, 0.0f);         /* S again: same fragments, same order, */
@@ -353,6 +411,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
 #endif
         __syncthreads();                       /* this tile's S is consumed: KV is free */
 
+#ifdef R3D_DBG
         for (int e = tid; e < kBN * D; e += kThreads) {     /* V tile, aliasing K */
             const int r = e >> DSH, d = e & DM1;
             uint16_t u = 0;
@@ -360,17 +419,18 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                 const int64_t a = RB[r] + ((int64_t)D + d) * P.kv_sd;
                 u = (KVDT == RAD_BF16) ? ((const uint16_t*)P.kv)[a]
                                        : fp8_to_bf16_w(((const uint8_t*)P.kv)[a]);
-#ifdef R3D_DBG
                 if (dbg && t == t0 && e == 0) {
                     dbg[11] = (double)a;
                     dbg[12] = (double)(KVDT == RAD_BF16 ? ((const uint16_t*)P.kv)[a]
                                                         : (int)((const uint8_t*)P.kv)[a]);
                     dbg[13] = (double)u;
                 }
-#endif
             }
             bf16_store(KVp + r * C::kVP + d, u);
         }
+#else
+        stage_kv_tile<D, KVDT>(KVp, RB, P, D, kvvec);       /* V tile, aliasing K */
+#endif
         __syncthreads();
 
         /* O += P.V: A = P row-major [16w][jk]; the V tile IS [key][d] = row-major B. */
