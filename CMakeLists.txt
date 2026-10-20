@@ -56,7 +56,8 @@ rad_add_plugin(libr3d kernels
   SOURCES     src/r3d_rows.cpp
   HIP_SOURCES src/r3d_rmsnorm.hip src/r3d_embed.hip src/r3d_kvstore.hip
               src/r3d_actmul.hip src/r3d_cast.hip src/r3d_rope.hip
-              src/r3d_gemm_bf16.hip src/r3d_gemm_bf16_m64.hip src/r3d_attn_paged.hip
+              src/r3d_gemm_bf16.hip src/r3d_gemm_bf16_m64.hip src/r3d_gemm_mxfp4.hip
+              src/r3d_attn_paged.hip
               src/r3d_attn_paged_wmma.hip src/r3d_attn_paged_decode.hip
               src/r3d_sample.hip
               src/r3d_band.hip src/r3d_more.hip

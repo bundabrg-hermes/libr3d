@@ -142,9 +142,10 @@ static const RadOperandSpec oRope[] = {
     { "positions", RAD_OPD_IN,    0 },
 };
 
-/* gemm_nt: verbatim libr4d (r4d_rows.cpp pGemmNt/oGemmNt). The quantised variants
- * (gemm_nt_q, _bias, gated) have no rows here: RDNA3 has no fp8 hardware and the int
- * grids are later tiers. */
+/* gemm_nt: verbatim libr4d (r4d_rows.cpp pGemmNt/oGemmNt). The quantised gemm_nt_q is
+ * declared next; its mxfp4a8 encoding has a row (r3d_gemm_mxfp4.hip, bf16 boundary
+ * conversion -- RDNA3 has no fp8/fp4 hardware), the int grids are later tiers, and the
+ * _bias/gated variants have no rows yet. */
 static const RadParamSpec pGemmNt[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "N",     RAD_P_INT, RAD_REQUIRED },
@@ -155,6 +156,29 @@ static const RadOperandSpec oGemmNt[] = {
     { "a", RAD_OPD_IN,     0 },
     { "b", RAD_OPD_WEIGHT, 0 },
     { "y", RAD_OPD_OUT,    0 },
+};
+
+/* gemm_nt_q: verbatim libr4d (r4d_rows.cpp pGemmNtQ/oGemmNtQ) so schema_same() passes
+ * when the plugins co-load. a_sum/b_ref are the seventh/sixth operand tail RadArgs
+ * cannot carry as weight aux (the ABI gap libr4d's comment spells out); the mxfp4a8
+ * entry refuses a_sum, and accepts-and-ignores b_ref exactly as both host libraries. */
+static const RadParamSpec pGemmNtQ[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "N",     RAD_P_INT, RAD_REQUIRED },
+    { "K",     RAD_P_INT, RAD_REQUIRED },
+    { "group", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    { "pb1",   RAD_P_INT, RAD_OPTIONAL },
+    { "pb2",   RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oGemmNtQ[] = {
+    { "a",       RAD_OPD_IN,     0 },
+    { "a_scale", RAD_OPD_IN,     1 },
+    { "b",       RAD_OPD_WEIGHT, 0 },
+    { "b_scale", RAD_OPD_WEIGHT, 0 },
+    { "y",       RAD_OPD_OUT,    0 },
+    { "a_sum",   RAD_OPD_IN,     1 },
+    { "b_ref",   RAD_OPD_WEIGHT, 1 },
 };
 
 /* logits_gemm: verbatim libr4d (r4d_rows.cpp pLogits/oLogits). Same three operands in the
@@ -407,6 +431,11 @@ static const RadOpSchema kSchemas[] = {
       oLogits, (int)(sizeof(oLogits)/sizeof(oLogits[0])),
       "the lm_head projection. gemm_nt's arithmetic under the vocabulary edge's parameter "
       "spelling; M is one row per SAMPLED position, `gather_rows` having run first." },
+    { "gemm_nt_q", pGemmNtQ, (int)(sizeof(pGemmNtQ)/sizeof(pGemmNtQ[0])),
+      oGemmNtQ, (int)(sizeof(oGemmNtQ)/sizeof(oGemmNtQ[0])),
+      "C[M,N] = A[M,K] @ dequant(Bq)[N,K]^T. `dtype` names the operand COMBINATION, so one "
+      "op covers w4a16 through mxfp4a8 and an architecture plugin that changes quant changes "
+      "one string." },
     { "attn_paged", pAttnPaged, (int)(sizeof(pAttnPaged)/sizeof(pAttnPaged[0])),
       oAttnPaged, (int)(sizeof(oAttnPaged)/sizeof(oAttnPaged[0])),
       "Paged attention over kv_cache[num_blocks, kv_heads, block_size, 2*head_dim] (K then "
@@ -524,6 +553,13 @@ static const RadConstraint cLogitsGemm[] = {
     { "dtype",  RAD_C_IN,  0,    "bf16" },
 };
 
+/* gemm_nt_q mxfp4a8: the format gate IS the dtype string (every operand dtypes follow
+ * from it; the entry re-checks them). Other gemm_nt_q encodings are refused inside the
+ * entry with RAD_E_UNSUPPORTED, so this constraint only keeps the selector honest. */
+static const RadConstraint cMxfp4Row[] = {
+    { "dtype", RAD_C_IN, 0, "mxfp4a8" },
+};
+
 /* kv_store constraints, the positional form of libr4d's cKvStore = { C_GE("block_size", 1),
  * C_IN("kv_dtype", "bf16") }. */
 static const RadConstraint cKvStore[] = {
@@ -623,6 +659,7 @@ extern "C" int r3d_rad_cast(const RadArgs*, RadStream);
 extern "C" int r3d_rad_rope(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt(const RadArgs*, RadStream);
 extern "C" int r3d_rad_logits_gemm(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gemm_nt_q(const RadArgs*, RadStream);
 extern "C" int r3d_rad_attn_paged(const RadArgs*, RadStream);
 extern "C" int r3d_rad_attn_paged_decode(const RadArgs*, RadStream);
 extern "C" int64_t r3d_rad_attn_decode_scratch(const RadArgs*);
@@ -753,6 +790,18 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cLogitsGemm, 2, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_logits_gemm },
+
+{ "gemm_nt_q_mxfp4", "gemm_nt_q", "gemm",
+  "mxfp4a8 WMMA tile: e2m1 nibbles decoded and E8M0-folded into bf16 B fragments per "
+  "32-K group, fp8_e4m3 activations decoded exactly, fp32 accumulators flushed and "
+  "row-scaled by a_scale per 128-K group through LDS",
+  "b:32 / a:128 scale grids only; nibble rows byte-packed; ragged tiles load as zero "
+  "and are never stored; M derives from numel(y)/N",
+  "fp8_e4m3 a with f32 a_scale, e2m1 b with E8M0 b_scale, bf16 y; b_ref accepted and "
+  "ignored (both host libraries do); a_sum refused",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cMxfp4Row, 1, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gemm_nt_q },
 
 { "attn_paged_bf16", "attn_paged", "attn",
   "paged causal / sliding-window attention, one workgroup per (query row, head), any "
