@@ -108,6 +108,13 @@ namespace {
 namespace roCW = rocwmma;
 using bf16 = roCW::bfloat16_t;
 
+/* bf16(x) on rocwmma::bfloat16_t CONVERTS NUMERICALLY (the same trap as the layout
+ * probes: casting bf16 fragments to integer truncates). Fragment staging carries raw
+ * bf16 BIT patterns -- write them, never a constructed bf16. */
+__device__ __forceinline__ void bf16_store(bf16* p, uint16_t bits) {
+    *reinterpret_cast<uint16_t*>(p) = bits;
+}
+
 /* LDS carve, byte offsets into one buffer (16-aligned), per head_dim:
  *   Q   64 x (D+4) bf16   query tile, staged once per workgroup
  *   S   64 x 40    f32    score tile (pad 8: 32 real columns, row-bank spread)
@@ -145,6 +152,20 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
     float*  LSP = MSP + kBM;
     int64_t* RB = reinterpret_cast<int64_t*>(raw + C::offRB);
     unsigned char* CB = raw + C::offCB;
+#ifdef R3D_DBG
+    /* Debug wire: kdes carries a double[64] dump buffer (the repro's REPRO_DBG=1 arm);
+     * descales are forced off on such runs (REPRO_NOP=1 pairs with it). Device printf is
+     * NOT an option in this kernel: printf + a >32 KB static-LDS launch fails with
+     * hipErrorIllegalState(401) on ROCm 10.1 -- that detour cost a session. */
+    double* dbg = nullptr;
+    {
+        const bool dbg_wg = (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0);
+        if (dbg_wg) { dbg = (threadIdx.x < 32 && P.kdes)
+                                ? reinterpret_cast<double*>(const_cast<RadTensor*>(P.kdes)->data)
+                                : nullptr;
+                      P.kdes = nullptr; P.vdes = nullptr; }   /* NOP arith in the dump wg */
+    }
+#endif
 
     const int h = blockIdx.x, s = blockIdx.y, qt = blockIdx.z;
     const int tid = threadIdx.x, w = tid >> 5;
@@ -199,12 +220,19 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
     const int64_t qbase = tok_base * P.q_rs + (int64_t)h * P.q_hs;
     for (int e = tid; e < kBM * D; e += kThreads) {
         const int r = e >> DSH, d = e & DM1;
-        Qsp[r * C::kQP + d] = (r < valid)
-            ? bf16(((const uint16_t*)P.q)[qbase + (int64_t)r * P.q_rs + (int64_t)d * P.q_ds])
-            : bf16((uint16_t)0);
+        bf16_store(Qsp + r * C::kQP + d, (r < valid)
+            ? ((const uint16_t*)P.q)[qbase + (int64_t)r * P.q_rs + (int64_t)d * P.q_ds]
+            : (uint16_t)0);
     }
     if (tid < kBM) { MSP[tid] = -INFINITY; LSP[tid] = 0.0f; }
     __syncthreads();
+#ifdef R3D_DBG
+    if (dbg && tid == 0) {
+        dbg[54] = (double)bf16_f32_w(((const uint16_t*)Qsp)[0]);
+        dbg[57] = (double)(unsigned)((const uint16_t*)Qsp)[0];   /* raw LDS bits */
+        dbg[58] = (double)(unsigned)((const uint16_t*)P.q)[qbase]; /* global truth */
+    }
+#endif
 
     roCW::fragment<roCW::matrix_a, 16, 16, 16, bf16, roCW::row_major> fa;
     roCW::fragment<roCW::matrix_b, 16, 16, 16, bf16, roCW::col_major> fb0, fb1;
@@ -235,10 +263,26 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                 const int64_t a = RB[r] + (int64_t)d * P.kv_sd;
                 u = (KVDT == RAD_BF16) ? ((const uint16_t*)P.kv)[a]
                                        : fp8_to_bf16_w(((const uint8_t*)P.kv)[a]);
+#ifdef R3D_DBG
+                if (dbg && t == t0 && e == 0) {
+                    dbg[0] = (double)RB[r];
+                    dbg[1] = (double)(KVDT == RAD_BF16 ? ((const uint16_t*)P.kv)[a]
+                                                      : (int)((const uint8_t*)P.kv)[a]);
+                    dbg[2] = (double)u;
+                }
+#endif
             }
-            KVp[r * C::kVP + d] = bf16(u);
+            bf16_store(KVp + r * C::kVP + d, u);
         }
         __syncthreads();
+#ifdef R3D_DBG
+        if (dbg && t == t0 && tid == 0) {
+            dbg[55] = (double)bf16_f32_w(((const uint16_t*)KVp)[0]);
+            dbg[56] = (double)bf16_f32_w(((const uint16_t*)Qsp)[0]);
+            dbg[59] = (double)(unsigned)((const uint16_t*)KVp)[0];   /* raw LDS bits */
+            dbg[60] = (double)(unsigned)((const uint16_t*)Qsp)[0];
+        }
+#endif
 
         /* S = Q.K^T: matrix_a row-major at &Qsp[16w][k0]; the [k][n] B tile is K^T, and
          * col-major at &KVp[n0][k0] means element (k,n) = ptr[n*VP + k] = KVp[n][k]. */
@@ -250,6 +294,19 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             roCW::load_matrix_sync(fb1, KVp + 16 * C::kVP + k0, C::kVP);
             roCW::mma_sync(a0, fa, fb0, a0);
             roCW::mma_sync(a1, fa, fb1, a1);
+#ifdef R3D_DBG
+            if (dbg && t == t0 && k0 == 0 && tid == 0) {   /* what the first mma saw */
+                for (int i = 0; i < 8; ++i) {
+                    dbg[18 + i] = (double)fa.x[i];
+                    dbg[26 + i] = (double)fb0.x[i];
+                    dbg[42 + i] = (double)a0.x[i];
+                }
+                dbg[50] = (double)bf16_f32_w(((const uint16_t*)KVp)[0]);
+                dbg[51] = (double)bf16_f32_w(((const uint16_t*)KVp)[1]);
+                dbg[52] = (double)bf16_f32_w(((const uint16_t*)Qsp)[0]);
+                dbg[53] = (double)bf16_f32_w(((const uint16_t*)Qsp)[1]);
+            }
+#endif
         }
         roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP,      a0, C::kSP, roCW::mem_row_major);
         roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP + 16, a1, C::kSP, roCW::mem_row_major);
@@ -278,6 +335,15 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                 LSP[tid] += sum;
             }
         }
+#ifdef R3D_DBG
+        if (dbg && t == t0 && tid == 0) {
+            dbg[3] = (double)Ssp[0];
+            dbg[4] = (double)Ssp[16];
+            dbg[5] = (double)MSP[0];
+            dbg[6] = (double)LSP[0];
+            dbg[7] = (double)scale2;
+        }
+#endif
         __syncthreads();
     }
 
@@ -309,7 +375,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                 u = (KVDT == RAD_BF16) ? ((const uint16_t*)P.kv)[a]
                                        : fp8_to_bf16_w(((const uint8_t*)P.kv)[a]);
             }
-            KVp[r * C::kVP + d] = bf16(u);
+            bf16_store(KVp + r * C::kVP + d, u);
         }
         __syncthreads();
 
@@ -333,8 +399,15 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                 const float m = MSP[r];
                 if (m != -INFINITY) pv = exp2f(Ssp[r * C::kSP + jj] * scale2 - m);
             }
-            Psp[r * C::kPP + jj] = bf16(f32_bf16_w(pv));
+            bf16_store(Psp + r * C::kPP + jj, f32_bf16_w(pv));
         }
+#ifdef R3D_DBG
+        if (dbg && t == t0 && tid == 0) {
+            dbg[8] = (double)Ssp[0];
+            dbg[9] = (double)bf16_f32_w(((const uint16_t*)Psp)[0]);
+            dbg[10] = (double)MSP[0];
+        }
+#endif
         __syncthreads();                       /* this tile's S is consumed: KV is free */
 
         for (int e = tid; e < kBN * D; e += kThreads) {     /* V tile, aliasing K */
@@ -344,8 +417,16 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                 const int64_t a = RB[r] + ((int64_t)D + d) * P.kv_sd;
                 u = (KVDT == RAD_BF16) ? ((const uint16_t*)P.kv)[a]
                                        : fp8_to_bf16_w(((const uint8_t*)P.kv)[a]);
+#ifdef R3D_DBG
+                if (dbg && t == t0 && e == 0) {
+                    dbg[11] = (double)a;
+                    dbg[12] = (double)(KVDT == RAD_BF16 ? ((const uint16_t*)P.kv)[a]
+                                                        : (int)((const uint8_t*)P.kv)[a]);
+                    dbg[13] = (double)u;
+                }
+#endif
             }
-            KVp[r * C::kVP + d] = bf16(u);
+            bf16_store(KVp + r * C::kVP + d, u);
         }
         __syncthreads();
 
@@ -385,6 +466,14 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             if (row >= valid) continue;
             const float ll = LSP[row];
             const float o = Osp[r * C::kOP + d] * (ll > 0.0f ? 1.0f / ll : 0.0f) * vds;
+#ifdef R3D_DBG
+            if (dbg && half == 0 && e == 0) {
+                dbg[14] = (double)ll;
+                dbg[15] = (double)Osp[0];
+                dbg[16] = (double)o;
+                dbg[17] = (double)vds;
+            }
+#endif
             const int64_t ob = (tok_base + row) * P.o_rs + (int64_t)h * P.o_hs
                              + (int64_t)d * P.o_ds;
             if (P.out_f32) ((float*)P.out)[ob] = o;
@@ -405,7 +494,38 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
 
 #endif
 
+#ifdef R3D_DBG
+namespace { __global__ void r3d_dbg_null(int* p) { if (p) *p = 1; } }
+#endif
+
 int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
+#ifdef R3D_DBG
+    static int dbg_once = 0;
+    if (!dbg_once) {
+        dbg_once = 1;
+        hipFuncAttributes at{};
+        hipError_t e1 = hipFuncGetAttributes(&at, (const void*)&attn_paged_wmma_kernel<128, RAD_BF16>);
+        printf("DBG attr bf16 err=%d shared=%zu regs=%d\n", (int)e1, at.sharedSizeBytes, (int)at.numRegs);
+        e1 = hipFuncGetAttributes(&at, (const void*)&attn_paged_wmma_kernel<128, RAD_F8E4M3>);
+        printf("DBG attr f8  err=%d shared=%zu regs=%d\n", (int)e1, at.sharedSizeBytes, (int)at.numRegs);
+        int* nullobj = nullptr;
+        if (hipMalloc(&nullobj, 4) == hipSuccess) {
+            r3d_dbg_null<<<1, 64>>>(nullobj);
+            printf("DBG null launch err=%d %s\n", (int)hipGetLastError(), hipGetErrorString(hipGetLastError()));
+            hipDeviceSynchronize();
+        }
+    }
+    printf("DBG gate qdt=%d kvdt=%d hd=%d rows=%d n_seq=%d q_heads=%d | BF16=%d F8E4M3=%d "
+           "allowed=%d\n",
+           (int)P.qdt, (int)P.kvdt, (int)P.head_dim, (int)P.rows, (int)P.n_seq, (int)P.q_heads,
+           (int)RAD_BF16, (int)RAD_F8E4M3, (int)({ static int a = -1;
+               if (a < 0) { hipDeviceProp_t d; int dev = 0;
+                   if (hipGetDevice(&dev) == hipSuccess && hipGetDeviceProperties(&d, dev) == hipSuccess)
+                       a = (strstr(d.gcnArchName, "gfx1100") || strstr(d.gcnArchName, "gfx1101")) ? 1 : 0;
+                   else a = 0;
+                   if (getenv("R3D_NO_WMMA")) a = 0; }
+               a; }));
+#endif
     static int allowed = -1;
     if (allowed < 0) {
         hipDeviceProp_t d;
@@ -436,5 +556,10 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
     else if (!d128 &&  kvbf) R3D_LAUNCH(64, RAD_BF16);
     else                     R3D_LAUNCH(64, RAD_F8E4M3);
     #undef R3D_LAUNCH
-    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    hipError_t le = hipGetLastError();
+#ifdef R3D_DBG
+    printf("DBG launched grid(%u,%u,%u) err=%d %s\n",
+           grid.x, grid.y, grid.z, (int)le, hipGetErrorString(le));
+#endif
+    return le == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }

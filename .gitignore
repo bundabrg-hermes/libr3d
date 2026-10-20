@@ -5,3 +5,12 @@ build*/
 docs/isa/.venv/
 docs/isa/isa.db
 
+
+# hipcc --save-temps droppings (ISA triage runs)
+*-hip-amdgcn-*
+*-host-x86_64-*
+*.hipfb*
+*.lto.o
+*.lto.s
+*.resolution.txt
+*.tmp.bc
