@@ -143,6 +143,7 @@ static void compare(const Opd& a, const Opd& d) {
 
 static void run_pair(Case& c, const RadKernelInfo* rk, const RadKernelInfo* dk) {
     const size_t n = c.o.size();
+    std::printf("[%s] begin\n", c.title);
     std::vector<RadTensor> th(n), td(n);
     for (size_t i = 0; i < n; ++i) {
         Opd& op = c.o[i];
@@ -188,6 +189,7 @@ static void params_prep(Case& c, int T, int K, int V, int width) {
 
 int main(int argc, char** argv) {
     if (argc < 3) { std::printf("usage: %s <libr3d.so> <libref.so>\n", argv[0]); return 2; }
+    setvbuf(stdout, nullptr, _IONBF, 0);
     static Lib r3d, ref;
     r3d.open(argv[1]); ref.open(argv[2]);
     CK(hipSetDevice(0));
@@ -275,14 +277,14 @@ int main(int argc, char** argv) {
         run_pair(c, rk_prep, dk_prep);
     }
 
-    // ---- fused A: two decode sequences (slen 1 and 2), speculative nacc {2,1}, GQA grp 3,
-    //      V 64 (idle-tail threads), negative OUTPUT state_idx slot on seq1 t1 (skip write).
+    // ---- fused A: two decode sequences (slen 2 each), speculative nacc {2,1} (rollback),
+    //      GQA grp 3, V 64 (idle-tail threads), negative OUTPUT state_idx slot on seq1 t1.
     {
-        Case c; c.title = "fused A: N2 slen1+2 nacc{2,1} K128 V64 grp3 skip";
-        const int T = 2, K = 128, V = 64, Hg = 2, H = 6, W = 4, CSL = 4, CSLOTS = 4,
+        Case c; c.title = "fused A: N2 slen2+2 nacc{2,1} K128 V64 grp3 skip";
+        const int T = 4, K = 128, V = 64, Hg = 2, H = 6, W = 4, CSL = 4, CSLOTS = 4,
                   SST = 2, SW = 3, GRP = 3;
         const int CD = 2 * Hg * K + H * V;
-        c.pi("q_len", 1); c.pi("head_k", K); c.pi("head_v", V); c.pi("conv_width", W);
+        c.pi("q_len", 2); c.pi("head_k", K); c.pi("head_v", V); c.pi("conv_width", W);
         c.pi("n_head_v", H); c.pf("scale", 0.08838834764831845); c.pf("eps", 1e-6);
         c.pf("l2_eps", 1e-6); c.pf("softplus_thr", 20.0); c.ps("act", "silu");
         c.pi("state_fp16", 0); c.ps("state_form", "per_candidate");
@@ -311,9 +313,9 @@ int main(int argc, char** argv) {
         fill_f32(rng, c.o[st].b, 2.0f); fill_bf16(rng, c.o[z].b, 3.0f);
         fill_f32(rng, c.o[nw].b, 2.0f);
         fill_i32({1, 3}, c.o[ci].b);
-        fill_i32({0, 0, 1,  0, 1, -1}, c.o[si].b);     // seq0 in=si[0][1]=0; seq1 t1 write skipped
+        fill_i32({0, 1, 1,  0, -1, 0}, c.o[si].b);     // seq0 in=si[0][1]=1; seq1 t1 write skipped
         fill_i32({2, 1}, c.o[na].b);
-        fill_i32({0, 1, 3}, c.o[cu].b);
+        fill_i32({0, 2, 4}, c.o[cu].b);
         c.outs = {o, st, cs};
         run_pair(c, rk_fused, dk_fused);
     }

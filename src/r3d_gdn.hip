@@ -714,7 +714,7 @@ __global__ __launch_bounds__(kPrepThreads) void gdn_conv_prep_conv_kernel(
     __shared__ float s_w[kConvHistMax];
     __shared__ float s_b;
     for (int32_t j = (int32_t)threadIdx.x; j < width - 1; j += (int32_t)kPrepThreads)
-        s_hist[j] = csrow ? ldt2(csrow, dtCS, j) : 0.0f;      /* raw history, not the rolled window */
+        s_hist[j] = (warm && csrow) ? ldt2(csrow, dtCS, j) : 0.0f;  /* cold slot: zero window, not recycled bytes */
     for (int32_t j = (int32_t)threadIdx.x; j < width; j += (int32_t)kPrepThreads)
         s_w[j] = ldt2(w + c * w_pb, dtW, j);
     if (threadIdx.x == 0) s_b = b ? ldt2(b, dtB, c) : 0.0f;
