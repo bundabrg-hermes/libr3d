@@ -37,8 +37,11 @@
 
 #include "rad_abi.h"
 #include "rad_plugin.h"
+#include "r3d_attn.h"
 
 namespace {
+
+using AttnParams = R3dAttnParams;   /* shared with the WMMA tile TU via r3d_attn.h */
 
 /* ---- dtype-widening helpers (identical bit patterns to libref's ld_dt path) ---------- */
 
@@ -82,28 +85,8 @@ __device__ __forceinline__ float ldt_dev(const RadTensor* t, int64_t off) {
 }
 
 /* ---- one launch's scalars; strides/pitches computed host-side exactly as the oracle
- *      computes them from the tensor headers, so the device loop is pure addressing ---- */
-
-struct AttnParams {
-    const void* q;      const void* kv;      void* out;   /* out typed by out_f32 */
-    const void* bt;     const void* su;      const void* cus;
-    const RadTensor* kdes;  const RadTensor* vdes;   /* nullable */
-    uint32_t bt_dt, su_dt, cus_dt;
-    int out_f32;
-
-    int64_t q_rs, q_hs, q_ds;
-    int64_t o_rs, o_hs, o_ds;
-    int64_t kv_sb, kv_sh, kv_so, kv_sd;   /* kv_view: block, kv head, slot, element */
-    int64_t bt_rs, bt_cs;
-
-    int64_t head_dim, gqa, kv_heads, q_heads, n_seq;
-    int64_t block_size, jcap;             /* jcap = max_blocks * block_size */
-    int64_t max_blocks;
-    int     causal;
-    int64_t window;
-    float   scale;
-    int64_t q_len_uniform;                /* rows/n_seq when cu_seqlens is absent */
-};
+ *      computes them from the tensor headers, so the device loop is pure addressing.
+ *      The struct itself lives in r3d_attn.h (the WMMA tile reads the same fields). ---- */
 
 /* ref_attn.cpp key_at: key j's slot offset in the cache, or -1 when the mask hides it or
  * its block is unmapped. Same rules, same order of tests. */
@@ -342,6 +325,7 @@ extern "C" int r3d_rad_attn_paged(const RadArgs* a, RadStream s) {
     P.bt_cs = bt->rank >= 2 ? bt->stride[bt->rank - 1] : 1;
     P.jcap = P.max_blocks * P.block_size;
     P.out_f32 = (o->dtype == RAD_F32);
+    P.qdt = q->dtype; P.kvdt = kv->dtype; P.rows = rows;
     /* The default is computed in float, as ref computes it; a given scale arrives as the
      * stored double and narrows once, as ref's p_f32 does. */
     P.scale = (float)rad_args_getf_or(a, "scale",
@@ -352,6 +336,14 @@ extern "C" int r3d_rad_attn_paged(const RadArgs* a, RadStream s) {
 
     const size_t shmem = (size_t)P.head_dim * sizeof(float);
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
+
+    /* Offer the launch to the WMMA tile first (r3d_attn_paged_wmma.hip). It sees the
+     * same P the v1 kernel would have, computed in the same lines; it refuses what it
+     * does not serve (chips without a gfx11xx object, q-f32 / kv-f32, head_dim outside
+     * {64,128}, R3D_NO_WMMA=1) and a refusal is ordinary traffic, not an error -- v1
+     * below was never launched in that case and serves the op exactly as before. */
+    if (r3d_attn_paged_wmma_launch(P, stream) == RAD_OK) return RAD_OK;
+
     dim3 grid((unsigned)total);
     dim3 block((unsigned)P.head_dim);
     #define R3D_ATTN(Q, KV) hipLaunchKernelGGL((attn_paged_kernel<Q, KV>), grid, block, \
