@@ -329,7 +329,7 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
     const int spl = use_fold ? spl_fold : spl_plain;
     if (spl <= 1) return tile_or_v1();
 
-    const int64_t per_seq = (P.cus ? P.rows : P.q_len_uniform * (use_fold ? P.gqa : 1));
+    const int64_t per_seq = (P.cus ? P.rows : P.q_len_uniform) * (use_fold ? P.gqa : 1);
     const int64_t tiles_q = (per_seq + kBM - 1) / kBM;   /* per-seq exact, ragged loose */
     const int64_t gz = tiles_q * spl;
     const int64_t gx = use_fold ? P.kv_heads : P.q_heads;

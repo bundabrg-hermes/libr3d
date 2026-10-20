@@ -30,7 +30,8 @@ static float bf16_f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; memcp
 static int envid(const char* k, int dflt) { const char* v = getenv(k); return v ? atoi(v) : dflt; }
 
 int main() {
-    const int HD = envid("REPRO_HD", 128), BS = 16, QH = 8, KVH = 2, GQA = 4;
+    const int HD = envid("REPRO_HD", 128), BS = 16, QH = 8;
+    const int GQA = envid("REPRO_GQA", 4), KVH = QH / GQA;
     const int QLEN = envid("REPRO_QLEN", 1);
     const int CTX  = envid("REPRO_CTX", 300);
     const int NB   = (CTX + BS - 1) / BS;
@@ -120,6 +121,15 @@ int main() {
     t_o.shape[0] = QLEN; t_o.shape[1] = QH; t_o.shape[2] = HD;
     t_o.stride[0] = ROWW; t_o.stride[1] = HD; t_o.stride[2] = 1;
     RadTensor host_arr[] = { t_q, t_kv, t_bt, t_su, nul, nul, cu, t_o };
+    // REPRO_CUS=1: pass cu_seqlens exactly like the engine does on decode -- the
+    // serve calls all carry it, so a fold/arm gate keyed on cus must be tested here.
+    int32_t hcu[2] = { 0, QLEN };
+    if (envid("REPRO_CUS", 0)) {
+        void* dcu = nullptr;
+        hipMalloc(&dcu, 8); hipMemcpy(dcu, hcu, 8, hipMemcpyHostToDevice);
+        cu.data = dcu; cu.dtype = RAD_I32; cu.rank = 1;
+        cu.shape[0] = 2; cu.stride[0] = 1;
+    }
     RadTensor* tarr = nullptr;
     if (hipHostMalloc((void**)&tarr, sizeof(host_arr), hipHostMallocMapped) != hipSuccess || !tarr) {
         printf("hipHostMalloc failed\n"); return 1;
@@ -163,6 +173,13 @@ int main() {
 
     // ---- (b) host re-merge of the arena ----
     // layout: so[idx*HD+d], sm[pn*SPL*HD + idx], sl[pn*SPL*(HD+1) + idx], idx=(t*QH+h)*SPL+sp
+    if (SPL <= 1) {
+        // The entry routes splits==1 to the SPLITK=0 tile arm (r3d_attn_paged_decode
+        // "if (spl <= 1) return tile_or_v1()"): partials are NEVER written, so
+        // re-merging the arena here would re-merge the poison. (a) alone proves spl=1.
+        printf("(b) skipped: spl=1 runs the tile arm, arena untouched\n");
+        return 0;
+    }
     const int64_t pn = (int64_t)QLEN * QH;
     const float* pso = arena.data();
     const float* psm = pso + pn * SPL * HD;

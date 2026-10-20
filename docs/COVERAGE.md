@@ -790,3 +790,42 @@ gfx11 build, which is why it looked missing), covering GDN, h256/gqa6 attention,
 therefore a scheduling question -- one R9700 window on the stock image -- not a
 kernel question. libr3d's MXFP4 row is still worth doing, but GDN first, or the
 48 GDN layers run on AVX in host RAM regardless of how good the GEMM gets.
+
+## 2026-10-20 (late): the GQA fold at serve, and an A/B that tested nothing for two sessions
+
+**Fold serve A/B, the first real numbers** (same .so build10, arms differ only by
+`R3D_NO_GQA`; pairs alternated twice to cancel drift; MiniCPM fixture, rdna3-dev):
+
+| arm | decode @8192 | decode @2048 | TTFT @1961 (min) |
+|---|---|---|---|
+| plain (per-q-head, spl=12) | 27.0 / 27.2 tok/s | 41–42 | 0.510 s |
+| **fold (per-kv-head, spl=64)** | **48.9 / 50.3** | **47.6–49.0** | 0.470 s |
+
+Non-overlapping distributions at 8k across both rounds; the mechanism is exactly
+the promised one (KV streamed once per q-head group). TTFT unchanged (prefill is
+GEMM-bound). Fold is the shipped default; serve now mounts build10.
+
+**The fold "serve crash" was a harness illusion.** The A/B's fold phases never
+started a server at all: `docker rm -f` silently failed (its error was swallowed
+by `>/dev/null 2>&1`), radiance ignores SIGTERM and its GPU teardown stalls
+behind the co-tenant (`kfd_process_wq_release` hog warnings in dmesg right at
+the arm switches), so the kill lands but the reap doesn't -- an EXITED corpse
+keeps holding the container name and the next `docker run` dies on `Conflict`,
+whose error the orchestrator's `tail -1` also dropped. The `Connection refused`
++ stale-`live step` output that read like a fold warmup hang was the *previous
+arm's* idle server being torn down. Fixes: rm retry loop with a loud failure,
+`--stop-signal SIGKILL`, `RUN FAIL` echo on docker run, orchestrator `tail -2`.
+Rule: an A/B arm that never printed its launch proof tested nothing -- the
+fold arm had been silently absent from every serve comparison before this.
+
+**Probe/gate repairs.** `repro_attn_splitk` (b) re-merged the poisoned arena at
+SPL=1, where the entry routes to the SPLITK=0 tile arm and no partials exist --
+a vacuous check that "failed" 1.000 while (a) was passing (the gate's grep
+pattern dropped the (a) line, which is how a green suite shipped a scary
+phantom). Now (b) skips at SPL=1 with a comment, every probe line prints (a).
+`REPRO_CUS`/`REPRO_GQA` exercise the engine's real call shape (cu_seqlens on
+every decode call); the new fold+cus+gqa8+qlen8 case passes **pre-fix too** --
+`kBM=64` makes the loose bound exact through qlen 8 x gqa 8 -- but the cus
+branch of `per_seq` now multiplies by gqa as its own comment always claimed,
+which is the exact bound only when gqa > 8 (27B-class, and dflash2 at qlen>1):
+insurance for the 27B track, not a live bug on this one.
