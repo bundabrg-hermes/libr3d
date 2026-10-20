@@ -1181,22 +1181,51 @@ for mapped-eligible tiers ("stored form is not the container's"). Startup died a
   sweeps budget-skip all logits_gemm cases (7.1-14.2 GiB against the co-tenant's
   RAM), so the unit test is the correctness evidence, plus serve adoption.
 
-## 27B serve placement chain — two walls remain, both beyond libr3d rows
+## 27B serve placement chain — ONE blocker, and it is the conv pair (2026-10-20, corrected same day)
 
-With GDN + imrope + logits all claimed, the 27B startup walks one wall per
-restart (each fix exposes the next):
+An earlier draft of this section blamed an "fp8 GEMM wall". `--debug-selection`
+refutes that: the trunk GEMM bands are claimed (995 op bands on libr3d; only
+`attn_paged/rope/kv_store/*_table` even print a device+host pair line). The real
+chain, from `sel27.log` (kept in `/scratch/r3d/`):
 
-1. `blk.N.attn.gate_up_proj/gate_proj/down_proj` (fp8_e4m3, 128x32): any host row
-   (`gemm_mma`/`gemm_rt`) triggers mapped-tier widening of the fp8 codes ->
-   "stored form is not the container's". Fix = an fp8 GEMM row with planes +
-   swizzled-scale (TMA) handling. Same scale-grid decode as here; bigger job.
-2. `blk.0.attn_norm.weight` (+10 more): RAD_F32 tensors on a bf16-eligible band
-   placed on the mapped tier — the engine *requires* the consumer to declare
-   `RAD_WEIGHT_WIDENING`; that knob is undocumented in `rad_abi.h`/`rad_block.h`.
-   Possibly resolved for free by the fp8-GEMM fix changing the band's eligibility;
-   untested.
+1. `gdn_conv_prep` + `gdn_conv_recurrent_update` resolve host-only (the two
+   unrecorded ops). Their weights (`ssm_inz.weight/scale/ref`, `ssm_out.*` —
+   three-plane encodings, plus `ssm_ab`) are then "weights only a host kernel
+   can read".
+2. Planner rule (engine_bringup, WARN x720): a block whose group contains such a
+   weight keeps the WHOLE group in the container's mapping (mapped tier).
+3. The group includes `attn_norm.weight`/`ffn_norm.weight`, which are declared
+   RAD_F32 and stored bf16 -> `widen=true` at load -> `weight_file_direct` false
+   -> the mapped-tier guard in engine_bringup refuses: "stored form is not the
+   container's (widened at load)". Startup stops there.
+
+Why minicpm never hit it: pure-llama, norms declared bf16 (identity, no widen),
+so group-pinning to the mapping is legal there. Engine-side fixes exist (split a
+widened weight out of a pinned group — it's 512 B/layer; or declare the qwen35
+norm operand bf16), but the libr3d-side unlock is in scope and was always the
+backlog: **device rows for `gdn_conv_prep` + `gdn_conv_recurrent_update` with a
+layout hook for the three-plane ssm weights**. No host-only member -> no
+group-pinning -> norms get staged -> startup proceeds. The kbench recording of
+those ops is separately blocked by the ssm-dt bf16/f32 dtype quirk — gate via
+`--record-rows` or a recorded-rows fix, not on the serve path.
+
+`--debug-selection` also pinned the VRAM split for the eventual serve: weights
+6.67 GiB static, KV 14.44 GiB, mapped 9.67 GiB, host pool 0 B. The card has room.
 
 Incident: the first serve27 attempt OOM-killed `libr3d-serve` (MiniCPM demo,
 exit 137) — 27B host-side mapping on a box holding co-tenant serve + one serve has
 ~2.6 GB headroom. Do not run serve27 while minicpm serve is up; minicpm serve
 was restored after staging (health 200, 564/564 device bands).
+
+## Whole-GDN serve A/B on minicpm: NULL experiment, closed (2026-10-20)
+
+`R3D_NO_GDN=1` vs plain, paired same-session decode@8k on `libr3d-serve`:
+40.2-41.3 vs 43.9-48.8 tok/s. The gap is noise — MiniCPM5-2B is pure `llama`
+arch, **zero GDN ops** (rad-info: 42 layers plain attention, 2 kv heads). Both
+arms executed byte-identical paths. The kill switch itself is verified working
+where GDN exists (`rad-info --plugins`: 43 kernels / 37 schemas plain, 38 / 33
+with the env). A meaningful whole-GDN serve A/B needs the 27B serve, which is
+blocked behind the fp8_e4m3 GEMM wall above. The earlier claim that "minicpm
+serve exercises GDN" was false — the evidence was `grep -c gdn` on a binary
+container (589 hits = quantization noise). `grep -a` on binaries proves nothing;
+ask `rad-info`.
