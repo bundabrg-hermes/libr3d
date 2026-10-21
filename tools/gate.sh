@@ -17,8 +17,11 @@
 # build13 built (`docker run --rm -v ~/projects/libr3d/libr3d:/work -w /work
 # radiance-dev:v1.8.1 cmake --build /work/build13 -j2` -- no --device: a compile is
 # card-free), and ~/scratch/r3d holding mxfp4.rkb + mxfp4_nodraft.rkb (mounted as
-# /scratch). NEVER point --home or the build at build11: the live serve mounts it, and
-# radiance-co-tenant is production -- this script touches neither.
+# /scratch). NEVER point --home or the build at the mounted build dir of the live
+# serve (spec9g mounts build13 since issue #5): gates are safe (they stage copies
+# from a read-only mount), but a rebuild of the serve's build dir means the NEXT
+# serve restart silently adopts it -- gate first, or stage into the next build
+# dir. radiance-co-tenant is production -- this script touches neither.
 set -euo pipefail
 
 REPO=/home/devuser/projects/libr3d/libr3d
