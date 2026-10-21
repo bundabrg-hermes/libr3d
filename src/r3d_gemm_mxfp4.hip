@@ -398,15 +398,79 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
     const uint8_t* crow = B + (int64_t)rr * b_pitch;
     const uint8_t* brow = BS + (int64_t)rr * bs_pitch;   /* b_scale is per weight row */
 
-    for (int i = threadIdx.x; i < MT * 256; i += kThreads)
-        xs[i >> 8][i & 255] = 0.0f;
     float acc[MT];
 #pragma unroll
     for (int m = 0; m < MT; ++m) acc[m] = 0.0f;
-    __syncthreads();                            /* LUT and xs visible */
+    __syncthreads();                            /* LUT visible (and xs, where it exists) */
 
     const int n256 = K >> 8;                      /* K % 128 == 0 is the row gate */
     const bool partial = (K & 255) != 0;          /* one trailing 128-wide span */
+
+    if constexpr (MT == 1) {
+        /* M == 1 -- the decode step. No xs: 16 codes per lane (uint2 of nibbles plus
+         * the matching uint4 of activation bytes) ride registers side by side, so the
+         * span loop carries NO barriers at all, at the fp8 GEMV's load widths.
+         * A 512-span is sixteen 32-of-K groups: lane PAIR p (lanes 2p, 2p+1) folds to
+         * own group it*16+p exactly -- pair butterfly (offset 1), the pair flushes
+         * (sub * sa) * 2^(x-127), and the sixteen terms fold warp-wide (offsets 2..16).
+         * Odd A bases take a scalar byte walk, never an issue-time refusal (#4 rule). */
+        float a0 = 0.0f;
+        const int nspan = K >> 9;
+        const int tail  = K & 511;                   /* K % 128 == 0 gate: 128 or 384 */
+        for (int it = 0; it < nspan + (tail ? 1 : 0); ++it) {
+            const int kb  = it << 9;
+            const int rem = (it < nspan) ? 512 : tail;
+            const bool act = (lane << 4) < rem;
+            uint2  b8 = make_uint2(0u, 0u);
+            uint4  av = make_uint4(0u, 0u, 0u, 0u);
+            if (act) {
+                const uint8_t* bp = crow + (kb >> 1) + (lane << 3);
+                if (!(((uintptr_t)bp) & 7u))
+                    b8 = *(const uint2*)bp;
+                else {                                   /* 4-odd B (rare): two dwords */
+                    b8.x = *(const uint32_t*)bp;
+                    b8.y = *(const uint32_t*)(bp + 4);
+                }
+                const uint8_t* ap = A + kb + (lane << 4);
+                if (!(((uintptr_t)ap) & 15u))
+                    av = *(const uint4*)ap;
+                else {
+                    uint8_t* axw = (uint8_t*)&av;
+#pragma unroll
+                    for (int t = 0; t < 16; ++t) axw[t] = ap[t];
+                }
+            }
+            const int p    = lane >> 1;              /* this pair's slot inside the span */
+            const bool gact = (p << 5) < rem;
+            const int  g   = (it << 4) + (gact ? p : ((rem >> 5) - 1));
+            float sc = 0.0f;
+            if (gact) {
+                const uint8_t x = brow[g];
+                sc = (x == 0xffu) ? __uint_as_float(0x7fc00000u)
+                   : (x == 0x00u) ? 0x1p-127f
+                                  : __uint_as_float((uint32_t)x << 23);
+            }
+            float s = 0.0f;
+            if (act) {
+                const uint8_t* ax = (const uint8_t*)&av;
+#pragma unroll
+                for (int t = 0; t < 16; ++t) {
+                    const uint32_t nib = (t < 8 ? b8.x : b8.y) >> (4 * (t & 7));
+                    s = __fmaf_rn(fp8e4m3_gemv(ax[t]), L16[nib & 15u], s);
+                }
+            }
+            s += __shfl_xor(s, 1);                   /* the pair owns group g */
+            const float sa = AS[g >> 2];
+            float c = gact ? (s * sa) * sc : 0.0f;
+#pragma unroll
+            for (int off = 2; off < kWave; off <<= 1)
+                c += __shfl_xor(c, off);
+            a0 += c;
+        }
+        if (lane == 0 && r < N) Y[r] = f32_to_bf16_m4(a0);
+        return;
+    }
+
     for (int it = 0; it < n256 + (partial ? 1 : 0); ++it) {
         const int kb   = it << 8;
         const int rem  = (it < n256) ? 256 : 128;
