@@ -800,6 +800,16 @@ static const RadConstraint cMxfp4Row[] = {
     { "dtype", RAD_C_IN, 0, "mxfp4a8" },
 };
 
+/* gemm_nt_q fp8a8: same shape as the mxfp4 gate -- the dtype string IS the format, the
+ * entry re-checks every operand dtype. The scale grid is 128-of-K on both sides (the
+ * checkpoint's weight_block_size), and K a multiple of 128 so every WMMA group closes
+ * on a scale block; ragged K resolves past this row to the reference. */
+static const RadConstraint cFp8A8Row[] = {
+    { "dtype", RAD_C_IN, 0, "fp8a8" },
+    { "K",     RAD_C_DIV, 128, nullptr },
+    { "group", RAD_C_EQ, 128, nullptr },
+};
+
 /* kv_store constraints, the positional form of libr4d's cKvStore = { C_GE("block_size", 1),
  * C_IN("kv_dtype", "bf16") }. */
 static const RadConstraint cKvStore[] = {
@@ -961,6 +971,7 @@ extern "C" int r3d_rad_rope_table(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt(const RadArgs*, RadStream);
 extern "C" int r3d_rad_logits_gemm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gemm_nt_q_fp8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_logits_gemm_e4m3(const RadArgs*, RadStream);
 extern "C" int r3d_layout_head(const RadParam*, int, int, const RadEncoding*, const int*,
                                const RadTensor*, int, RadLayout*);
@@ -1152,6 +1163,19 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cMxfp4Row, 1, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gemm_nt_q },
+
+{ "gemm_nt_q_fp8a8", "gemm_nt_q", "gemm",
+  "fp8a8 WMMA tile: e4m3 codes on both operands decoded through an exact bf16 LUT, one "
+  "128-of-K scale group per WMMA burst, the group partial flushed through LDS as "
+  "(sub * a_scale) * b_scale in the oracle's order, bf16 store",
+  "K a multiple of 128 (the scale grid must close on a whole block); N any (ragged "
+  "columns load zero and are never stored); M derives from numel(y)/N; b_scale either "
+  "the 128x128 checkpoint block grid or a per-row grid",
+  "fp8_e4m3 a with f32 a_scale per (row, 128 K), fp8_e4m3 b with bf16 scale per 128x128 "
+  "tile (or per row), bf16 y; a_sum and b_ref refused (as ref does at this encoding)",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cFp8A8Row, 3, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gemm_nt_q_fp8 },
 
 { "attn_paged_bf16", "attn_paged", "attn",
   "paged causal / sliding-window attention, one workgroup per (query row, head), any "
