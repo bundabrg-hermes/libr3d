@@ -29,6 +29,7 @@
  * with software decode is the follow-up that restores MLP speed.)
  */
 #include <hip/hip_runtime.h>
+#include "r3d_dump.h"
 #include <cstring>
 #include <cmath>
 
@@ -253,6 +254,22 @@ __global__ __launch_bounds__(kThreads) void sigmoid_kernel(
         stt2(y, dtY, i, r3d_sigmoid(ldt2(x, dtX, i)));
 }
 
+/* Gather variant: X is a rank-3 view [rows, heads, n] with holes (stride[1] > n --
+ * the 27B ssm gate plane interleaves gate heads with the up half at 512-element
+ * pitch). ref's offlin walks LOGICAL indices: y[row, h*n+j] = x[row*s0 + h*s1 + j].
+ * The linear kernel above would read the holes; only this form matches ref. */
+__global__ __launch_bounds__(kThreads) void sigmoid_gather_kernel(
+    const uint8_t* __restrict__ x, uint32_t dtX,
+    uint8_t* __restrict__ y, uint32_t dtY,
+    int64_t s0, int64_t s1, int64_t heads, int64_t n, int64_t nel) {
+    const int64_t stride0 = (int64_t)gridDim.x * kThreads;
+    const int64_t roww = heads * n;
+    for (int64_t i = (int64_t)blockIdx.x * kThreads + threadIdx.x; i < nel; i += stride0) {
+        const int64_t row = i / roww, f = i % roww, h = f / n, j = f % n;
+        stt2(y, dtY, i, r3d_sigmoid(ldt2(x, dtX, row * s0 + h * s1 + j)));
+    }
+}
+
 /* ------------------------------------------------------------------ entry helpers */
 static inline bool dt_act_ok(uint32_t dt) { return dt == RAD_F32 || dt == RAD_BF16; }
 /* Row-major [rows, cols] reader, rank-2 with a unit last stride, OR rank-1 single row
@@ -278,7 +295,10 @@ static inline int row2_pitch(const RadTensor* t, int64_t cols, int64_t* pitch) {
         /* shape[last] == cols: the leading-dim walk degenerates to r*cols exactly when
          * the leading dims are contiguous; refuse anything else (ref walks, this kernel
          * class pitches). */
-        for (int i = 0; i + 1 < (int)t->rank - 1; ++i)
+        /* every adjacent pair, innermost included: a hole at stride[rank-2] (the
+         * interleaved-gate view [rows, heads, n] with stride[1] > n) makes the linear
+         * walk disagree with ref's logical walk -- that was the 27B gate corruption. */
+        for (int i = 0; i < (int)t->rank - 1; ++i)
             if (t->stride[i] != t->shape[i + 1] * t->stride[i + 1]) return -4;
         *pitch = cols;
         return 0;
@@ -292,7 +312,10 @@ static inline int64_t param_i(const RadArgs* a, const char* k, int64_t fb) {
 } /* anonymous namespace */
 
 /* ------------------------------------------------------------------ entries */
-extern "C" int r3d_rad_quant_act_fp8(const RadArgs* a, RadStream s) {
+static int r3d_quant_act_fp8_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_quant_act_fp8(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("quant_act_fp8", r3d_quant_act_fp8_impl)
+static int r3d_quant_act_fp8_impl(const RadArgs* a, RadStream s) {
     const RadTensor* x = rad_arg_in(a, 0);
     const RadTensor* q = rad_arg_in(a, 1);
     const RadTensor* sc = rad_arg_in(a, 2);
@@ -318,7 +341,10 @@ extern "C" int r3d_rad_quant_act_fp8(const RadArgs* a, RadStream s) {
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
-extern "C" int r3d_rad_gated_quant_fp8(const RadArgs* a, RadStream s) {
+static int r3d_gated_quant_fp8_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gated_quant_fp8(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("gated_quant_fp8", r3d_gated_quant_fp8_impl)
+static int r3d_gated_quant_fp8_impl(const RadArgs* a, RadStream s) {
     const RadTensor* gu = rad_arg_in(a, 0);
     const RadTensor* q  = rad_arg_in(a, 1);
     const RadTensor* sc = rad_arg_in(a, 2);
@@ -353,7 +379,10 @@ extern "C" int r3d_rad_gated_quant_fp8(const RadArgs* a, RadStream s) {
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
-extern "C" int r3d_rad_add(const RadArgs* a, RadStream s) {
+static int r3d_add_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_add(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("add", r3d_add_impl)
+static int r3d_add_impl(const RadArgs* a, RadStream s) {
     const RadTensor* A = rad_arg_in(a, 0);
     const RadTensor* B = rad_arg_in(a, 1);
     const RadTensor* Y = rad_arg_in(a, 2);
@@ -383,7 +412,10 @@ extern "C" int r3d_rad_add(const RadArgs* a, RadStream s) {
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
-extern "C" int r3d_rad_mul(const RadArgs* a, RadStream s) {
+static int r3d_mul_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_mul(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("mul", r3d_mul_impl)
+static int r3d_mul_impl(const RadArgs* a, RadStream s) {
     const RadTensor* A = rad_arg_in(a, 0);
     const RadTensor* B = rad_arg_in(a, 1);
     const RadTensor* Y = rad_arg_in(a, 2);
@@ -409,7 +441,10 @@ extern "C" int r3d_rad_mul(const RadArgs* a, RadStream s) {
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
-extern "C" int r3d_rad_sigmoid(const RadArgs* a, RadStream s) {
+static int r3d_sigmoid_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_sigmoid(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("sigmoid", r3d_sigmoid_impl)
+static int r3d_sigmoid_impl(const RadArgs* a, RadStream s) {
     const RadTensor* X = rad_arg_in(a, 0);
     const RadTensor* Y = rad_arg_in(a, 1);
     if (!X || !Y) return RAD_E_INVAL;
@@ -422,7 +457,21 @@ extern "C" int r3d_rad_sigmoid(const RadArgs* a, RadStream s) {
      * with that only while the [rows, n] layout is hole-free -- row2_pitch alone would
      * accept a pitch wider than n, where offlin would read different elements. */
     int64_t p;
-    if (row2_pitch(X, n, &p) || (X->rank == 2 && p != n)) return RAD_E_STRIDE;
+    const int xrc = row2_pitch(X, n, &p);
+    if (xrc == -4 && X->rank == 3 && X->stride[2] == 1 && X->shape[2] == n &&
+        X->stride[1] >= n && X->stride[0] == X->shape[1] * X->stride[1]) {
+        /* interleaved gate view: gather on logical indices (see sigmoid_gather_kernel) */
+        const int64_t heads = X->shape[1];
+        if (Y->rank != 2 || Y->stride[1] != 1 || Y->shape[1] != heads * n ||
+            Y->shape[0] != X->shape[0]) return RAD_E_STRIDE;
+        const int64_t gblocks = (nel + kThreads - 1) / kThreads;
+        sigmoid_gather_kernel<<<dim3((uint32_t)(gblocks < 65535 ? gblocks : 65535)),
+                                dim3(kThreads), 0, (hipStream_t)(uintptr_t)s>>>(
+            (const uint8_t*)X->data, X->dtype, (uint8_t*)Y->data, Y->dtype,
+            X->stride[0], X->stride[1], heads, n, nel);
+        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    }
+    if (xrc || (X->rank == 2 && p != n)) return RAD_E_STRIDE;
     if (row2_pitch(Y, n, &p) || (Y->rank == 2 && p != n)) return RAD_E_STRIDE;
     const int64_t blocks = (nel + kThreads - 1) / kThreads;
     sigmoid_kernel<<<dim3((uint32_t)(blocks < 65535 ? blocks : 65535)), dim3(kThreads), 0,
@@ -431,7 +480,10 @@ extern "C" int r3d_rad_sigmoid(const RadArgs* a, RadStream s) {
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
-extern "C" int r3d_rad_gather_rows(const RadArgs* a, RadStream s) {
+static int r3d_gather_rows_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gather_rows(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("gather_rows", r3d_gather_rows_impl)
+static int r3d_gather_rows_impl(const RadArgs* a, RadStream s) {
     const RadTensor* x = rad_arg_in(a, 0);
     const RadTensor* idx = rad_arg_in(a, 1);
     const RadTensor* y = rad_arg_in(a, 2);
