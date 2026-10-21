@@ -849,6 +849,16 @@ static const RadConstraint cFp8A8DecodeRow[] = {
     { "group", RAD_C_EQ, 128, nullptr },
 };
 
+/* gemm_nt_q_mxfp4 decode band (issue #5): the width row's band is M <= 8 -- decode and
+ * speculative verify. The 256-of-K spans need K a multiple of 128 (a tail span is then
+ * exactly half-width); the entry re-checks every dtype, the band's own M bound, and the
+ * uint2-per-lane byte alignment. */
+static const RadConstraint cMxfp4DecodeRow[] = {
+    { "dtype", RAD_C_IN, 0, "mxfp4a8" },
+    { "M",     RAD_C_LE, 8, nullptr },
+    { "K",     RAD_C_DIV, 128, nullptr },
+};
+
 /* gemm_nt_q_gated fp8a8: the composed row (tile into scratch, gated_quant epilogue)
  * sizes its arena at the band's M bound, so the band stops at 64 -- the whole dflash
  * drafter M range this container declares. act silu and sigmoid both compile in the
@@ -875,6 +885,7 @@ enum { R3D_PRIO_ATTN_DECODE = 1100 };   /* split-KV rows win the decode band fro
                                            any-length tile; nothing else is ranked */
 enum { R3D_PRIO_FP8_DECODE  = 1100 };   /* same law for gemm_nt_q: the width row wins
                                            M <= 8 from the m64 tile (issue #4) */
+enum { R3D_PRIO_MXFP4_DECODE = 1100 };  /* the mxfp4 band's own width row (issue #5) */
 
 /* act_mul: the bf16 gated MLP, all four oracle activations this kernel ports. */
 static const RadConstraint cActMul[] = {
@@ -1027,6 +1038,7 @@ extern "C" int r3d_rad_logits_gemm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q_fp8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q_fp8_decode(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gemm_nt_q_mxfp4_decode(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q_gated_fp8(const RadArgs*, RadStream);
 extern "C" int64_t r3d_rad_gemm_nt_q_gated_fp8_scratch(const RadArgs*);
 extern "C" int r3d_rad_logits_gemm_e4m3(const RadArgs*, RadStream);
@@ -1248,6 +1260,22 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_FP8_DECODE,
   cFp8A8DecodeRow, 4, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gemm_nt_q_fp8_decode },
+
+{ "gemm_nt_q_mxfp4_decode", "gemm_nt_q", "gemm",
+  "mxfp4a8 decode-band width row: warp per weight row, eight codes per lane (one "
+  "aligned uint2), the activation rows decoded per 256-of-K span through LDS, every "
+  "weight byte read exactly once; each 4-lane quad owns one 32-of-K scale group and "
+  "flushes (sub * a_scale) * 2^(e8m0-127) in the oracle's order -- the per-32 group "
+  "structure the m64 tile reassociates away",
+  "M <= 8 (decode and speculative verify -- the band the m64 tile wastes at ragged "
+  "M); K a multiple of 128 (the 256-of-K spans close, a tail span is half-width); "
+  "N any (dead warps clamp their load row and never store); M derives from numel(y)/N",
+  "fp8_e4m3 a with f32 a_scale per (row, 128 K), e2m1 b with E8M0 b_scale per "
+  "(row, 32 K), bf16 y; b_ref accepted and ignored (both host libraries do); a_sum "
+  "refused; a B whose base breaks the uint2 walk resolves to the m64 tile",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_MXFP4_DECODE,
+  cMxfp4DecodeRow, 3, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gemm_nt_q_mxfp4_decode },
 
 { "gemm_nt_q_gated_fp8a8", "gemm_nt_q_gated", "gemm",
   "the fp8a8 tile writing its bf16 gate_up plane into the launch scratch, closed by the "
@@ -1648,19 +1676,26 @@ static bool r3d_row_hidden(const char* op) {
     return false;
 }
 
-/* The fp8a8 levers, at the same registration gate as R3D_NO_GDN (a launch-time refusal is
- * an abort, not a re-resolve: the engine picks the row at declare and "a kernel that
- * refuses at issue was selected wrongly" -- what R3D_NO_FP8A8=1 would have hit on its
- * first serve A/B, and what R3D_NO_FP8_DEC=1 hit on its first one for real).
+/* The decode-band levers, at the same registration gate as R3D_NO_GDN (a launch-time
+ * refusal is an abort, not a re-resolve: the engine picks the row at declare and "a
+ * kernel that refuses at issue was selected wrongly" -- what R3D_NO_FP8A8=1 would have
+ * hit on its first serve A/B, and what R3D_NO_FP8_DEC=1 hit on its first one for real).
  * R3D_NO_FP8A8=1 withdraws all three fp8a8 rows (the bands then place on the host, as
  * they did before the rows shipped); R3D_NO_FP8_DEC=1 withdraws only the decode row, so
- * the M <= 8 band falls to the m64 tile on the same .so -- the issue #4 A/B arm. The
- * op schemas stay declared either way: gemm_nt_q/gated keep their mxfp4 rows. */
-static bool r3d_fp8_row_hidden(const RadKernelInfo& k) {
-    static const bool no_fp8 = getenv("R3D_NO_FP8A8") != nullptr;
-    static const bool no_dec = getenv("R3D_NO_FP8_DEC") != nullptr;
-    if (!no_fp8 && !no_dec) return false;
-    if (!strcmp(k.name, "gemm_nt_q_fp8a8_decode")) return true;   /* both levers hide it */
+ * the M <= 8 band falls to the m64 tile on the same .so -- the issue #4 A/B arm.
+ * R3D_NO_FP4_DEC=1 is that same lever for the mxfp4 band (issue #5). R3D_NO_MXFP4=1
+ * withdraws both mxfp4 rows: it was the pre-registration-gdn lever and carried the same
+ * latent abort fault #4 caught -- the entry-level refusal now only backstops the gate.
+ * The op schemas stay declared either way: gemm_nt_q/gated keep their other-encoding
+ * rows. */
+static bool r3d_band_row_hidden(const RadKernelInfo& k) {
+    static const bool no_fp8  = getenv("R3D_NO_FP8A8") != nullptr;
+    static const bool no_f8d  = getenv("R3D_NO_FP8_DEC") != nullptr;
+    static const bool no_mx   = getenv("R3D_NO_MXFP4") != nullptr;
+    static const bool no_mxd  = getenv("R3D_NO_FP4_DEC") != nullptr;
+    if (!strcmp(k.name, "gemm_nt_q_fp8a8_decode")) return no_fp8 || no_f8d;
+    if (!strcmp(k.name, "gemm_nt_q_mxfp4_decode")) return no_mx || no_mxd;
+    if (!strcmp(k.name, "gemm_nt_q_mxfp4"))        return no_mx;
     return no_fp8 && (!strcmp(k.name, "gemm_nt_q_fp8a8") ||
                       !strcmp(k.name, "gemm_nt_q_gated_fp8a8"));
 }
@@ -1696,14 +1731,14 @@ static void r3d_anchor_gate(void) {
 int rad_kernel_count(void) {
     r3d_anchor_gate();
     int n = 0;
-    for (const RadKernelInfo& k : kRows) if (!r3d_row_hidden(k.op) && !r3d_fp8_row_hidden(k)) ++n;
+    for (const RadKernelInfo& k : kRows) if (!r3d_row_hidden(k.op) && !r3d_band_row_hidden(k)) ++n;
     return n;
 }
 const RadKernelInfo* rad_kernel_at(int i) {
     r3d_anchor_gate();
     if (i < 0) return nullptr;
     for (const RadKernelInfo& k : kRows)
-        if (!r3d_row_hidden(k.op) && !r3d_fp8_row_hidden(k) && i-- == 0) return &k;
+        if (!r3d_row_hidden(k.op) && !r3d_band_row_hidden(k) && i-- == 0) return &k;
     return nullptr;
 }
 
