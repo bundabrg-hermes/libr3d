@@ -349,8 +349,9 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_m64_kernel(
  *
  * The m64 tile at M = 1..8 stages every nibble row through a 64-row slab it uses M rows
  * of: ~28 GB/s effective on the flagship serve's decode. This row reads every weight byte
- * exactly once instead -- warp per weight row, eight codes per lane (one aligned uint2,
- * the fp8 GEMV's dword pattern halved in code size per byte), the MT activation rows
+ * exactly once instead -- warp per weight row, eight codes per lane (one aligned dword:
+ * the fp8 GEMV's uint4-per-lane walk nibble-halved, 4 bytes carrying 8 e2m1 codes),
+ * the MT activation rows
  * decoded through LDS per 256-of-K span.
  *
  * The fold keeps the ORACLE's per-32-of-K flush, which the tile gave up: a 256 span is
@@ -416,10 +417,12 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
         }
         __syncthreads();
 
-        /* One aligned uint2 per lane: k = lane*8 + 0..7, ascending within the lane. */
+        /* One aligned dword per lane: nibbles kb + lane*8 + 0..7. Nibble k lives in byte
+         * k>>1 (the tile's rule), so the dword is at byte (kb>>1) + lane*4 -- indexing
+         * the packed row by k DOUBLES the stride, the nibble form of the byte-pitch trap. */
         const bool act = (lane << 3) < rem;
-        uint2 b8 = make_uint2(0u, 0u);
-        if (act) b8 = *(const uint2*)(crow + kb + (lane << 3));
+        uint32_t b4 = 0u;
+        if (act) b4 = *(const uint32_t*)(crow + (kb >> 1) + (lane << 2));
 
         const int sg = lane >> 2;                 /* this quad's group inside the span */
         const bool qact = sg < (rem >> 5);
@@ -442,8 +445,8 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
                 const float x8[8] = { v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w };
 #pragma unroll
                 for (int t = 0; t < 8; ++t) {
-                    const uint32_t nib = (t < 4 ? b8.x : b8.y) >> (4 * (t & 3));
-                    s = __fmaf_rn(x8[t], L16[nib & 15u], s);   /* product exact in f32 */
+                    const uint32_t nib = (b4 >> (4 * t)) & 15u;   /* low nibble = even k */
+                    s = __fmaf_rn(x8[t], L16[nib], s);            /* product exact in f32 */
                 }
             }
             sub[m] = s;
@@ -459,7 +462,10 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
             const float sa = AS[(int64_t)m * as_pitch + (g32 >> 2)];
             float c = qact ? (sub[m] * sa) * sc : 0.0f;         /* quant_dot's two-multiply order */
 #pragma unroll
-            for (int off = 4; off; off <<= 1)                  /* fold the eight group terms */
+            for (int off = 4; off < kWave; off <<= 1)          /* fold the eight group terms.
+             * NOT `off; off <<= 1`: off never reaches 0 that way -- on wave32 masks >= 32
+             * are out of range, the compiler either poisons them away (looks exact) or
+             * emits self-selecting shuffles that double c per surviving step (~2^27). */
                 c += __shfl_xor(c, off);
             acc[m] += c;
         }
@@ -635,7 +641,7 @@ static int r3d_gemm_nt_q_impl(const RadArgs* a, RadStream s) {
  * hands it the decode shapes and the m64 row keeps prefill. R3D_NO_FP4_DEC=1 refuses
  * the row outright (the resolver then gives the band to the m64 tile); the refusal is
  * ALSO enforced at the registration gate in r3d_rows.cpp, which is where the engine
- * actually re-resolves. The uint2-per-lane walk pins B's byte alignment; anything odd
+ * actually re-resolves. The dword-per-lane walk pins B's 4-byte alignment; anything odd
  * rides the tile. b_ref is accepted and ignored like the tile's (the fp8 decode row
  * refuses it -- at the fp8 encoding ref refuses b_ref at all, at mxfp4a8 it is a legal
  * derived plane both host libraries ignore). */
