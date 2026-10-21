@@ -196,7 +196,7 @@ static const RadParamSpec pGemmNtQGated[] = {
 };
 static const RadOperandSpec oGemmNtQGated[] = {
     { "a",         RAD_OPD_IN,     0 },
-    { "a_scale",   RAD_OPD_IN,     1 },
+    { "a_scale",   RAD_OPD_IN,     0 },
     { "b",         RAD_OPD_WEIGHT, 0 },
     { "b_scale",   RAD_OPD_WEIGHT, 0 },
     { "q",         RAD_OPD_OUT,    0 },
