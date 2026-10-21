@@ -48,6 +48,7 @@
  * read AS STORED -- libr4d's own conv rows declare no hook either. See the section comments.
  */
 #include <cstring>
+#include <cstdlib>
 
 #include <hip/hip_runtime.h>
 
@@ -593,8 +594,15 @@ __global__ __launch_bounds__(kConvThreads) void gdn_conv_update_kernel(
  * three separate f32 steps; softplus/sigmoid/exp ride the band's double-rounded r3d_exp_f and
  * r3d_log1p the conv row proved bit-identical.
  *
- * SCOPE: state_form per_candidate only -- the row constrains it, so the selector never asks
- * about an anchor batch (the entry point also refuses one). The out-projection quantiser pair
+ * SCOPE: both state_form shapes. per_candidate is the form a non-speculative batch issues;
+ * anchor is the speculative form -- one committed state per sequence, the step's rank-1 factors
+ * written beside it in libr4d's layout for the next step to replay num_accepted of. The anchor
+ * leg is ref's AnchorLayout exactly: six state_idx columns (0..2 the anchor window, 3..5 the
+ * factor blocks), the anchor slot found through the stamp at the factor block's mark, the fold
+ * replaying each 32-row group of V from its own k copy and its own (g, beta), the publish at
+ * column 2, the stamps on all three factor copies, and no per-candidate state writes. A step
+ * declaring more tokens than the block's tmax is refused at resolve, as ref refuses the op.
+ * The out-projection quantiser pair
  * (o_q/o_scale, issued by the 27B decode band) writes ref's q8_group epilogue: one e4m3 group
  * per (token, head) over the o row AS STORED, scale amax/448. A negative sidx entry
  * skips the state write for that token as ref's `so >= 0` guard does; a negative input slot
@@ -607,6 +615,7 @@ __global__ __launch_bounds__(kConvThreads) void gdn_conv_update_kernel(
 constexpr uint32_t kRecThreads = 128;   /* one value column per thread: head_v <= 128 */
 constexpr int32_t  kRecK       = 128;   /* head_k register bound: the column IS a register array */
 
+template <bool ANCHOR>
 __global__ __launch_bounds__(kRecThreads, 1) void gdn_recurrent_update_kernel(
     const uint8_t* __restrict__ q,  uint32_t dtQ, int64_t q_s0b, int64_t q_s1b,
     const uint8_t* __restrict__ k,  uint32_t dtK, int64_t k_s0b, int64_t k_s1b,
@@ -623,22 +632,44 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_recurrent_update_kernel(
     const uint8_t* __restrict__ nw, uint32_t dtW, int64_t w_s1b,
     uint8_t* __restrict__ o,        uint32_t dtO, int64_t o_s0b, int64_t o_s1b,
     uint8_t* __restrict__ oq, R3dRow voq, uint8_t* __restrict__ osc, R3dRow vosc,
-    int64_t V, int64_t grp, float scale, float l2eps, float neps, float spthr, int sigm) {
+    int64_t V, int64_t grp, float scale, float l2eps, float neps, float spthr, int sigm,
+    int64_t st_eb, int64_t al_groups, int64_t al_fstr, int64_t al_vb, int64_t al_gb,
+    int64_t al_mark, int64_t al_tmax) {
     const int64_t h = blockIdx.x, n = blockIdx.y, e = threadIdx.x;
     const int64_t bos  = ldi_g(dtC, cu, n);
     const int64_t slen = ldi_g(dtC, cu, n + 1) - bos;
-    if (slen <= 0) return;                            /* per_candidate: ref's continue */
+    if (slen <= 0 && !ANCHOR) return;      /* per_candidate: ref's continue; anchor folds anyway */
     const int64_t na = nacc ? ldi_g(dtN, nacc, n) : 1;
-    const int64_t rd = na > 0 ? na - 1 : 0;
-    const int64_t slot_in = ldi_g(dtS, (const uint8_t*)sidx + n * si_s0b +
-                            (rd < sw ? rd : sw - 1) * si_s1b, 0);
-    if (slot_in < 0) return;                          /* ref: the whole (n,h) row is skipped */
+    uint8_t* __restrict__ stb = st8 + h * st_s1b;
+    int64_t slot_in;
+    int64_t colF[3] = { 0, 0, 0 };         /* anchor: the factor columns 3..5 */
+    int64_t colA2 = 0;                     /* anchor: the publish column */
+    bool dup_f = false;
+    if (ANCHOR) {
+        int64_t col[6]; bool pad = false;
+        const uint8_t* srow = (const uint8_t*)sidx + n * si_s0b;
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) { col[c] = ldi_g(dtS, srow + c * si_s1b, 0); pad = pad || col[c] < 0; }
+        if (pad) return;                   /* ref: any negative column skips the (n,h) row */
+        if (na > al_tmax) return;          /* ref refuses the OP at shape level on na > tmax;
+                                            * the row skip is the closest kernel-level analog */
+        #pragma unroll
+        for (int c = 0; c < 3; ++c) colF[c] = col[3 + c];
+        colA2 = col[2];
+        dup_f = col[3] != col[4] || col[5] != col[4];
+        const int m = (int)(ldt2(stb + colF[1] * st_s0b + al_mark * st_eb, dtST, 0) + 0.5f) - 1;
+        slot_in = col[3 - ((m >= 0 && m <= 2) ? m : 1)];   /* AnchorLayout::anchor_col */
+    } else {
+        const int64_t rd = na > 0 ? na - 1 : 0;
+        slot_in = ldi_g(dtS, (const uint8_t*)sidx + n * si_s0b +
+                        (rd < sw ? rd : sw - 1) * si_s1b, 0);
+        if (slot_in < 0) return;                          /* ref: the whole (n,h) row is skipped */
+    }
 
     const int64_t hk = h / grp;
     const uint8_t* __restrict__ qb = q + hk * q_s1b;
     const uint8_t* __restrict__ kb = k + hk * k_s1b;
     const uint8_t* __restrict__ vb = v + h  * v_s1b;
-    uint8_t* __restrict__ stb = st8 + h * st_s1b;
     uint8_t* __restrict__ ob  = o + h * o_s1b;
     const uint8_t* __restrict__ zb = z ? z + h * z_s1b : nullptr;
     const bool own = e < V;
@@ -671,6 +702,51 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_recurrent_update_kernel(
             #pragma unroll
             for (int d = 0; d < kRecK; ++d) st[d] = ldt2(sb, dtST, d);
         }
+    }
+
+    if (ANCHOR) {
+        /* The fold (ref's replay): walk the previous step's na accepted tokens from column 4's
+         * factor block -- each 32-row group of V replays from its own k copy with its own
+         * (g, beta), over exactly the token loop's delta-rule chains. Then publish the
+         * advanced anchor at column 2 and stamp all three factor copies with their column. */
+        for (int64_t t = 0; t < na; ++t) {
+            const uint8_t* __restrict__ ft = stb + colF[1] * st_s0b + t * al_fstr * st_eb;
+            for (int64_t gi = 0; gi < al_groups; ++gi) {
+                __syncthreads();                      /* previous group's s_kn reads done */
+                s_kn[e] = ldt2(ft + gi * kRecK * st_eb, dtST, e);
+                __syncthreads();
+                const float g_  = ldt2(ft + (al_gb + 2 * gi) * st_eb, dtST, 0);
+                const float bt_ = ldt2(ft + (al_gb + 2 * gi + 1) * st_eb, dtST, 0);
+                const int64_t e0 = 32 * gi, e1 = (V < e0 + 32) ? V : e0 + 32;
+                if (own && e >= e0 && e < e1) {
+                    const float vrow = ldt2(ft + al_vb * st_eb, dtST, e);
+                    const float dec = r3d_exp_f(g_);
+                    float sk2 = 0.0f;
+                    #pragma unroll
+                    for (int d = 0; d < kRecK; ++d) { st[d] *= dec; sk2 += st[d] * s_kn[d]; }
+                    const float uu = bt_ * (vrow - sk2);
+                    #pragma unroll
+                    for (int d = 0; d < kRecK; ++d) st[d] += uu * s_kn[d];
+                }
+            }
+        }
+        if (own) {                                    /* publish the advanced anchor at col 2 */
+            uint8_t* __restrict__ row = stb + colA2 * st_s0b + e * st_s2b;
+            if (dtST == RAD_F32 && ((uintptr_t)row & 15u) == 0) {
+                float4* __restrict__ s4 = (float4*)row;
+                #pragma unroll
+                for (int d = 0; d < kRecK / 4; ++d)
+                    s4[d] = make_float4(st[4*d], st[4*d+1], st[4*d+2], st[4*d+3]);
+            } else {
+                #pragma unroll
+                for (int d = 0; d < kRecK; ++d) stt2(row, dtST, d, st[d]);
+            }
+        }
+        if (e == 0) {                                 /* the shift stamps, ref's (c + 1) */
+            for (int c = 0; c < 3; ++c)
+                stt2(stb + colF[c] * st_s0b + al_mark * st_eb, dtST, 0, (float)(c + 1));
+        }
+        __syncthreads();      /* the token loop rewrites s_kn the fold's last group may still read */
     }
 
     for (int64_t t = 0; t < slen; ++t) {
@@ -757,8 +833,27 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_recurrent_update_kernel(
             }
         }
 
-        const int64_t so = ldi_g(dtS, (const uint8_t*)sidx + n * si_s0b +
-                             (t < sw ? t : sw - 1) * si_s1b, 0);
+        if (ANCHOR) {
+            /* This token's factors for the next step's fold, ref's writes: kn once per 32-row
+             * group, v once, (g, beta) once per group. The read block (column 4) is written
+             * always; the window siblings only when the window actually shifted (dup_f). */
+            for (int c = 0; c < 3; ++c) {
+                if (c != 1 && !dup_f) continue;
+                uint8_t* __restrict__ ft = stb + colF[c] * st_s0b + t * al_fstr * st_eb;
+                for (int64_t gi = 0; gi < al_groups; ++gi)
+                    stt2(ft + gi * kRecK * st_eb, dtST, e, s_kn[e]);
+                if (own) {
+                    stt2(ft + al_vb * st_eb, dtST, e, vreg);
+                    if (e == 0)
+                        for (int64_t gi = 0; gi < al_groups; ++gi) {
+                            stt2(ft + (al_gb + 2 * gi) * st_eb, dtST, 0, gv);
+                            stt2(ft + (al_gb + 2 * gi + 1) * st_eb, dtST, 0, bt);
+                        }
+                }
+            }
+        }
+        const int64_t so = ANCHOR ? -1 : ldi_g(dtS, (const uint8_t*)sidx + n * si_s0b +
+                             (t < sw ? t : sw - 1) * si_s1b, 0);   /* anchor: no per-token writes */
         if (own && so >= 0) {
             uint8_t* __restrict__ srow = stb + so * st_s0b + e * st_s2b;
             if (dtST == RAD_F32 && ((uintptr_t)srow & 15u) == 0) {
@@ -940,6 +1035,7 @@ __global__ __launch_bounds__(32) void gdn_conv_prep_gate_kernel(
  */
 constexpr uint32_t kFusWidthMax = 4;
 
+template <bool ANCHOR>
 __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kernel(
     const uint8_t* __restrict__ x, uint32_t dtX, int64_t x_pb,
     const uint8_t* __restrict__ w, uint32_t dtW, int64_t w_pb,
@@ -960,11 +1056,13 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kern
     uint8_t* __restrict__ o,        uint32_t dtO, int64_t o_s0b, int64_t o_s1b,
     uint8_t* __restrict__ oq, R3dRow voq, uint8_t* __restrict__ osc, R3dRow vosc,
     int64_t HgK, int64_t K2, int64_t V, int64_t grp, int32_t width,
-    float scale, float l2eps, float neps, float spthr, int sigm) {
+    float scale, float l2eps, float neps, float spthr, int sigm,
+    int64_t st_eb, int64_t al_groups, int64_t al_fstr, int64_t al_vb, int64_t al_gb,
+    int64_t al_mark, int64_t al_tmax) {
     const int64_t h = blockIdx.x, n = blockIdx.y, e = threadIdx.x;
     const int64_t bos  = ldi_g(dtC, cu, n);
     const int64_t slen = ldi_g(dtC, cu, n + 1) - bos;
-    if (slen <= 0) return;
+    if (slen <= 0 && !ANCHOR) return;      /* anchor folds on a row-less step; ref's conv skips it */
     const int64_t na = nacc ? ldi_g(dtN, nacc, n) : 1;
     const int64_t rd = na > 0 ? na - 1 : 0;
     const int64_t cslot = ldi_g(dtCI, cidx, n);
@@ -1024,7 +1122,8 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kern
         if (own_v) stt2(stv + t * V * eb, dtX, e, accv * r3d_sigmoid(accv));
     }
 
-    if (width > 1) {                       /* window commit: shifted tail, then this step */
+    if (width > 1 && slen > 0) {           /* window commit: shifted tail, then this step; a
+                                            * row-less step commits nothing (ref's conv skip) */
         for (int32_t i = 0; i < w1 - 1; ++i) {
             stt2(csq, dtCS, i, hq[i + 1]);
             stt2(csk, dtCS, i, hkk[i + 1]);
@@ -1040,10 +1139,29 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kern
     }
 
     /* ---- the recurrent leg, verbatim the shipped kernel with the staged rows ---- */
-    const int64_t slot_in = ldi_g(dtS, (const uint8_t*)sidx + n * si_s0b +
-                            (rd < sw ? rd : sw - 1) * si_s1b, 0);
-    if (slot_in < 0) return;               /* ref's continue -- AFTER the conv commit above */
     uint8_t* __restrict__ stb = st8 + h * st_s1b;
+    int64_t slot_in;
+    int64_t colF[3] = { 0, 0, 0 };         /* anchor: the factor columns 3..5 */
+    int64_t colA2 = 0;                     /* anchor: the publish column */
+    bool dup_f = false;
+    if (ANCHOR) {
+        int64_t col[6]; bool pad = false;
+        const uint8_t* srow = (const uint8_t*)sidx + n * si_s0b;
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) { col[c] = ldi_g(dtS, srow + c * si_s1b, 0); pad = pad || col[c] < 0; }
+        if (pad) return;                   /* ref's continue -- AFTER the conv commit above */
+        if (na > al_tmax) return;          /* ref refuses the OP at shape level on na > tmax */
+        #pragma unroll
+        for (int c = 0; c < 3; ++c) colF[c] = col[3 + c];
+        colA2 = col[2];
+        dup_f = col[3] != col[4] || col[5] != col[4];
+        const int m = (int)(ldt2(stb + colF[1] * st_s0b + al_mark * st_eb, dtST, 0) + 0.5f) - 1;
+        slot_in = col[3 - ((m >= 0 && m <= 2) ? m : 1)];   /* AnchorLayout::anchor_col */
+    } else {
+        slot_in = ldi_g(dtS, (const uint8_t*)sidx + n * si_s0b +
+                        (rd < sw ? rd : sw - 1) * si_s1b, 0);
+        if (slot_in < 0) return;           /* ref's continue -- AFTER the conv commit above */
+    }
     uint8_t* __restrict__ ob  = o + h * o_s1b;
     const uint8_t* __restrict__ zb = z ? z + h * z_s1b : nullptr;
     const bool own = e < V;
@@ -1070,6 +1188,51 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kern
     }
 
     const float nwv = nw ? ldt2(nw + (own ? e : 0) * w_s1b, dtNW, 0) : 1.0f;
+
+    if (ANCHOR) {
+        /* The fold (ref's replay): walk the previous step's na accepted tokens from column 4's
+         * factor block -- each 32-row group of V replays from its own k copy with its own
+         * (g, beta), over exactly the token loop's delta-rule chains. Then publish the
+         * advanced anchor at column 2 and stamp all three factor copies with their column. */
+        for (int64_t t = 0; t < na; ++t) {
+            const uint8_t* __restrict__ ft = stb + colF[1] * st_s0b + t * al_fstr * st_eb;
+            for (int64_t gi = 0; gi < al_groups; ++gi) {
+                __syncthreads();                      /* previous group's s_kn reads done */
+                s_kn[e] = ldt2(ft + gi * kRecK * st_eb, dtST, e);
+                __syncthreads();
+                const float g_  = ldt2(ft + (al_gb + 2 * gi) * st_eb, dtST, 0);
+                const float bt_ = ldt2(ft + (al_gb + 2 * gi + 1) * st_eb, dtST, 0);
+                const int64_t e0 = 32 * gi, e1 = (V < e0 + 32) ? V : e0 + 32;
+                if (own && e >= e0 && e < e1) {
+                    const float vrow = ldt2(ft + al_vb * st_eb, dtST, e);
+                    const float dec = r3d_exp_f(g_);
+                    float sk2 = 0.0f;
+                    #pragma unroll
+                    for (int d = 0; d < kRecK; ++d) { st[d] *= dec; sk2 += st[d] * s_kn[d]; }
+                    const float uu = bt_ * (vrow - sk2);
+                    #pragma unroll
+                    for (int d = 0; d < kRecK; ++d) st[d] += uu * s_kn[d];
+                }
+            }
+        }
+        if (own) {                                    /* publish the advanced anchor at col 2 */
+            uint8_t* __restrict__ row = stb + colA2 * st_s0b + e * st_s2b;
+            if (dtST == RAD_F32 && ((uintptr_t)row & 15u) == 0) {
+                float4* __restrict__ s4 = (float4*)row;
+                #pragma unroll
+                for (int d = 0; d < kRecK / 4; ++d)
+                    s4[d] = make_float4(st[4*d], st[4*d+1], st[4*d+2], st[4*d+3]);
+            } else {
+                #pragma unroll
+                for (int d = 0; d < kRecK; ++d) stt2(row, dtST, d, st[d]);
+            }
+        }
+        if (e == 0) {                                 /* the shift stamps, ref's (c + 1) */
+            for (int c = 0; c < 3; ++c)
+                stt2(stb + colF[c] * st_s0b + al_mark * st_eb, dtST, 0, (float)(c + 1));
+        }
+        __syncthreads();      /* the token loop rewrites s_kn the fold's last group may still read */
+    }
 
     for (int64_t t = 0; t < slen; ++t) {
         const int64_t tok = bos + t;
@@ -1151,8 +1314,27 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kern
             }
         }
 
-        const int64_t so = ldi_g(dtS, (const uint8_t*)sidx + n * si_s0b +
-                             (t < sw ? t : sw - 1) * si_s1b, 0);
+        if (ANCHOR) {
+            /* This token's factors for the next step's fold, ref's writes: kn once per 32-row
+             * group, v once, (g, beta) once per group. The read block (column 4) is written
+             * always; the window siblings only when the window actually shifted (dup_f). */
+            for (int c = 0; c < 3; ++c) {
+                if (c != 1 && !dup_f) continue;
+                uint8_t* __restrict__ ft = stb + colF[c] * st_s0b + t * al_fstr * st_eb;
+                for (int64_t gi = 0; gi < al_groups; ++gi)
+                    stt2(ft + gi * kRecK * st_eb, dtST, e, s_kn[e]);
+                if (own) {
+                    stt2(ft + al_vb * st_eb, dtST, e, vreg);
+                    if (e == 0)
+                        for (int64_t gi = 0; gi < al_groups; ++gi) {
+                            stt2(ft + (al_gb + 2 * gi) * st_eb, dtST, 0, gv);
+                            stt2(ft + (al_gb + 2 * gi + 1) * st_eb, dtST, 0, bt);
+                        }
+                }
+            }
+        }
+        const int64_t so = ANCHOR ? -1 : ldi_g(dtS, (const uint8_t*)sidx + n * si_s0b +
+                             (t < sw ? t : sw - 1) * si_s1b, 0);   /* anchor: no per-token writes */
         if (own && so >= 0) {
             uint8_t* __restrict__ srow = stb + so * st_s0b + e * st_s2b;
             if (dtST == RAD_F32 && ((uintptr_t)srow & 15u) == 0) {
@@ -1646,7 +1828,8 @@ static int gdn_recurrent_update_impl(const RadArgs* a, RadStream s) {
     if (!q || !k || !v || !av || !bv || !st || !sidx || !cu || !o) return RAD_E_INVAL;
 
     const char* sf = rad_args_gets(a, "state_form");
-    if (sf && std::strcmp(sf, "per_candidate") != 0) return RAD_E_UNSUPPORTED;   /* anchor: r4d's */
+    const bool anchor = sf && !std::strcmp(sf, "anchor");
+    if (sf && !anchor && std::strcmp(sf, "per_candidate") != 0) return RAD_E_UNSUPPORTED;
 
     const auto dt2_ok = [](uint32_t d) { return d == RAD_F32 || d == RAD_BF16; };
     const bool alog_on = alog && alog->data, dtb_on = dtb && dtb->data;
@@ -1719,7 +1902,13 @@ static int gdn_recurrent_update_impl(const RadArgs* a, RadStream s) {
     rc = v3_ok(v, Hv, Vd, &v_s0, &v_s1);     if (rc) return rc;
     rc = v3_ok(o, Hv, Vd, &o_s0, &o_s1);     if (rc) return rc;
     if (z_on) {
-        rc = v3_ok(z, Hv, Vd, &z_s0, &z_s1); if (rc) return rc;
+        /* ref views z through v3_rows: a rank-2 view -- the engine's fused [q|k|v|z] tail,
+         * which live serve hands here -- carries the token stride in stride[0]; v3 semantics
+         * (heads*dim) would silently read the wrong rows past token 0. */
+        if (z->rank >= 2 && z->stride[z->rank - 1] != 1) return RAD_E_STRIDE;
+        z_s0 = z->rank >= 3 ? z->stride[z->rank - 3]
+                            : z->rank == 2 ? z->stride[0] : Hv * Vd;
+        z_s1 = z->rank >= 3 ? z->stride[z->rank - 2] : Vd;
         if (rad_tensor_numel(z) < T * Hv * Vd) return RAD_E_SHAPE;
     }
     const int64_t a_s0 = av->rank >= 2 ? av->stride[av->rank - 2] : Hv;
@@ -1735,6 +1924,26 @@ static int gdn_recurrent_update_impl(const RadArgs* a, RadStream s) {
     const int64_t st_s2 = st->rank >= 4 ? st->stride[st->rank - 2] : Kd;
     if (st->rank >= 4 && st->stride[st->rank - 1] != 1) return RAD_E_STRIDE;
     if (rad_tensor_numel(st) < T * Hv * Vd * Kd) return RAD_E_SHAPE;
+
+    /* Anchor form: ref's shape rules. Six state_idx columns; the factor block must be dense
+     * [V,K] inside the slot (AnchorLayout indexes it flat); and a step longer than the block's
+     * tmax is refused at resolve -- q_len is the engine's per-sequence bound, and the accepted
+     * prefix can never exceed the candidates issued, so the launcher can see what ref checks
+     * from cu. */
+    int64_t al_groups = 0, al_fstr = 0, al_vb = 0, al_gb = 0, al_mark = 0, al_tmax = 0;
+    long long ql_ll = 0;
+    if (anchor) {
+        if (sw < 6) return RAD_E_SHAPE;
+        if (st->rank >= 4 && st->stride[st->rank - 2] != Kd) return RAD_E_STRIDE;
+        al_groups = (Vd + 31) / 32;
+        al_fstr   = al_groups * Kd + Vd + 2 * al_groups;
+        al_vb     = al_groups * Kd;
+        al_gb     = al_groups * Kd + Vd;
+        al_tmax   = (Vd * Kd - 1) / al_fstr; if (al_tmax > 16) al_tmax = 16;
+        if (al_tmax < 1) return RAD_E_SHAPE;
+        al_mark   = al_tmax * al_fstr;
+        if (rad_args_geti(a, "q_len", &ql_ll) && ql_ll > al_tmax) return RAD_E_UNSUPPORTED;
+    }
 
     /* 1-D weight vectors: ref's laststride reads; unit last stride (dense vectors). */
     auto vec_ok = [&](const RadTensor* t, int64_t n, int64_t* s1) -> int {
@@ -1752,8 +1961,20 @@ static int gdn_recurrent_update_impl(const RadArgs* a, RadStream s) {
     bool q_on = false; R3dRow voq, vosc;
     int rq = r3d_qpair_view(oq, osc, T, Hv, Vd, &q_on, &voq, &vosc); if (rq) return rq;
 
-    gdn_recurrent_update_kernel<<<dim3((uint32_t)Hv, (uint32_t)N), dim3(kRecThreads), 0,
-                                  (hipStream_t)(uintptr_t)s>>>(
+    auto rec_kern = anchor ? &gdn_recurrent_update_kernel<true>
+                           : &gdn_recurrent_update_kernel<false>;
+    if (anchor && std::getenv("R3D_ANCHOR_TRACE"))
+        std::fprintf(stderr, "[anchor-trace rec] T=%lld N=%lld Hv=%lld K=%lld V=%lld sw=%lld "
+                     "q_len_param=%lld dtQ=%u dtV=%u dtST=%u dtS=%u dtN=%u dtCU=%u dtO=%u "
+                     "z=%d nw=%d oq=%d st_s0=%lld st_s1=%lld st_s2=%lld\n",
+                     (long long)T, (long long)N, (long long)Hv, (long long)Kd, (long long)Vd,
+                     (long long)sw, (long long)ql_ll,
+                     (unsigned)q->dtype, (unsigned)v->dtype, (unsigned)st->dtype,
+                     (unsigned)sidx->dtype, nacc ? (unsigned)nacc->dtype : 255u,
+                     (unsigned)cu->dtype, (unsigned)o->dtype, (int)z_on, (int)nw_on, (int)q_on,
+                     (long long)st_s0, (long long)st_s1, (long long)st_s2);
+    rec_kern<<<dim3((uint32_t)Hv, (uint32_t)N), dim3(kRecThreads), 0,
+               (hipStream_t)(uintptr_t)s>>>(
         (const uint8_t*)q->data, q->dtype, rad_dtype_bytes(q->dtype, q_s0), rad_dtype_bytes(q->dtype, q_s1),
         (const uint8_t*)k->data, k->dtype, rad_dtype_bytes(k->dtype, k_s0), rad_dtype_bytes(k->dtype, k_s1),
         (const uint8_t*)v->data, v->dtype, rad_dtype_bytes(v->dtype, v_s0), rad_dtype_bytes(v->dtype, v_s1),
@@ -1776,7 +1997,9 @@ static int gdn_recurrent_update_impl(const RadArgs* a, RadStream s) {
         nw_on ? rad_dtype_bytes(nw->dtype, w_s1) : 0,
         (uint8_t*)o->data, o->dtype, rad_dtype_bytes(o->dtype, o_s0), rad_dtype_bytes(o->dtype, o_s1),
         q_on ? (uint8_t*)oq->data : nullptr, voq, q_on ? (uint8_t*)osc->data : nullptr, vosc,
-        Vd, Hv / Hg, (float)scale_d, (float)l2_d, (float)eps_d, (float)thr_d, sigm);
+        Vd, Hv / Hg, (float)scale_d, (float)l2_d, (float)eps_d, (float)thr_d, sigm,
+        (int64_t)rad_dtype_bytes(st->dtype, 1), al_groups, al_fstr, al_vb, al_gb,
+        al_mark, al_tmax);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
@@ -1960,7 +2183,7 @@ static int gdn_conv_prep_impl(const RadArgs* a, RadStream s) {
  * o_q?, o_scale?) -- the pair's union, staging tensors absent by design. Derivations are ref's:
  * T = o->shape[0], Hv = o->shape[1], conv_dim = x's column count, Hg = (conv_dim - Hv*head_v) /
  * (2*head_k) -- no shape[rank-2] guessing anywhere. The row inherits the recurrent row's scope:
- * head_k 128, head_v <= 128, per_candidate only, quantiser pair refused. conv_width up to 4
+ * head_k 128, head_v <= 128, both state_form shapes, quantiser pair honoured. conv_width up to 4
  * (the fused window lives in registers). The staging smem is sized from the ONE bound a
  * launcher can see: the conv contract caps a sequence at state_len - conv_width + 2 tokens. */
 static int gdn_conv_recurrent_update_impl(const RadArgs*, RadStream);
@@ -1990,7 +2213,8 @@ static int gdn_conv_recurrent_update_impl(const RadArgs* a, RadStream s) {
     if (!x || !w || !cs || !cidx || !av || !bv || !st || !sidx || !cu || !o)
         return RAD_E_INVAL;
     const char* sf = rad_args_gets(a, "state_form");
-    if (sf && std::strcmp(sf, "per_candidate") != 0) return RAD_E_UNSUPPORTED;
+    const bool anchor = sf && !std::strcmp(sf, "anchor");
+    if (sf && !anchor && std::strcmp(sf, "per_candidate") != 0) return RAD_E_UNSUPPORTED;
 
     const auto dt2_ok = [](uint32_t d) { return d == RAD_F32 || d == RAD_BF16; };
     const bool cb_on = cb && cb->data, alog_on = alog && alog->data, dtb_on = dtb && dtb->data;
@@ -2067,6 +2291,26 @@ static int gdn_conv_recurrent_update_impl(const RadArgs* a, RadStream s) {
     if (st->rank >= 4 && st->stride[st->rank - 1] != 1) return RAD_E_STRIDE;
     if (rad_tensor_numel(st) < T * Hv * Vd * Kd) return RAD_E_SHAPE;
 
+    /* Anchor form: ref's shape rules. Six state_idx columns; the factor block must be dense
+     * [V,K] inside the slot (AnchorLayout indexes it flat); and a step longer than the block's
+     * tmax is refused at resolve -- q_len is the engine's per-sequence bound, and the accepted
+     * prefix can never exceed the candidates issued, so the launcher can see what ref checks
+     * from cu. */
+    int64_t al_groups = 0, al_fstr = 0, al_vb = 0, al_gb = 0, al_mark = 0, al_tmax = 0;
+    long long ql_ll = 0;
+    if (anchor) {
+        if (sw < 6) return RAD_E_SHAPE;
+        if (st->rank >= 4 && st->stride[st->rank - 2] != Kd) return RAD_E_STRIDE;
+        al_groups = (Vd + 31) / 32;
+        al_fstr   = al_groups * Kd + Vd + 2 * al_groups;
+        al_vb     = al_groups * Kd;
+        al_gb     = al_groups * Kd + Vd;
+        al_tmax   = (Vd * Kd - 1) / al_fstr; if (al_tmax > 16) al_tmax = 16;
+        if (al_tmax < 1) return RAD_E_SHAPE;
+        al_mark   = al_tmax * al_fstr;
+        if (rad_args_geti(a, "q_len", &ql_ll) && ql_ll > al_tmax) return RAD_E_UNSUPPORTED;
+    }
+
     auto v3_ok = [&](const RadTensor* t, int64_t heads, int64_t dim,
                      int64_t* s0, int64_t* s1) -> int {
         *s0 = t->rank >= 3 ? t->stride[t->rank - 3] : heads * dim;
@@ -2077,7 +2321,13 @@ static int gdn_conv_recurrent_update_impl(const RadArgs* a, RadStream s) {
     int64_t o_s0, o_s1, z_s0 = 0, z_s1 = 0;
     int rc = v3_ok(o, Hv, Vd, &o_s0, &o_s1);  if (rc) return rc;
     if (z_on) {
-        rc = v3_ok(z, Hv, Vd, &z_s0, &z_s1);  if (rc) return rc;
+        /* ref views z through v3_rows: a rank-2 view -- the engine's fused [q|k|v|z] tail,
+         * which live serve hands here -- carries the token stride in stride[0]; v3 semantics
+         * (heads*dim) would silently read the wrong rows past token 0. */
+        if (z->rank >= 2 && z->stride[z->rank - 1] != 1) return RAD_E_STRIDE;
+        z_s0 = z->rank >= 3 ? z->stride[z->rank - 3]
+                            : z->rank == 2 ? z->stride[0] : Hv * Vd;
+        z_s1 = z->rank >= 3 ? z->stride[z->rank - 2] : Vd;
         if (rad_tensor_numel(z) < T * Hv * Vd) return RAD_E_SHAPE;
     }
     auto vec_ok = [&](const RadTensor* t, int64_t n, int64_t* s1) -> int {
@@ -2111,8 +2361,21 @@ static int gdn_conv_recurrent_update_impl(const RadArgs* a, RadStream s) {
     if (smem > 48 * 1024) return RAD_E_UNSUPPORTED;   /* LDS budget, incl. the recurrent leg */
 
     const int32_t w32 = (int32_t)width;
-    gdn_conv_recurrent_update_kernel<<<dim3((uint32_t)Hv, (uint32_t)N), dim3(kRecThreads),
-                                       (uint32_t)smem, (hipStream_t)(uintptr_t)s>>>(
+    auto fus_kern = anchor ? &gdn_conv_recurrent_update_kernel<true>
+                           : &gdn_conv_recurrent_update_kernel<false>;
+    if (anchor && std::getenv("R3D_ANCHOR_TRACE"))
+        std::fprintf(stderr, "[anchor-trace fus] T=%lld N=%lld Hv=%lld K=%lld V=%lld sw=%lld "
+                     "q_len_param=%lld width=%d state_len=%lld cs_slots=%lld dtX=%u dtST=%u dtS=%u "
+                     "dtCI=%u dtN=%u dtO=%u z=%d nw=%d oq=%d st_s0=%lld st_s1=%lld st_s2=%lld\n",
+                     (long long)T, (long long)N, (long long)Hv, (long long)Kd, (long long)Vd,
+                     (long long)sw, (long long)ql_ll, (int)width, (long long)state_len,
+                     (long long)cs_slots, (unsigned)x->dtype, (unsigned)st->dtype,
+                     (unsigned)sidx->dtype, (unsigned)cidx->dtype,
+                     nacc ? (unsigned)nacc->dtype : 255u, (unsigned)o->dtype,
+                     (int)z_on, (int)nw_on, (int)q_on,
+                     (long long)st_s0, (long long)st_s1, (long long)st_s2);
+    fus_kern<<<dim3((uint32_t)Hv, (uint32_t)N), dim3(kRecThreads),
+               (uint32_t)smem, (hipStream_t)(uintptr_t)s>>>(
         (const uint8_t*)x->data, x->dtype, rad_dtype_bytes(x->dtype, xrow),
         (const uint8_t*)w->data, w->dtype, rad_dtype_bytes(w->dtype, w_s0),
         cb_on ? (const uint8_t*)cb->data : nullptr, cb_on ? cb->dtype : 0,
@@ -2139,6 +2402,8 @@ static int gdn_conv_recurrent_update_impl(const RadArgs* a, RadStream s) {
         (uint8_t*)o->data, o->dtype, rad_dtype_bytes(o->dtype, o_s0), rad_dtype_bytes(o->dtype, o_s1),
         q_on ? (uint8_t*)oq->data : nullptr, voq, q_on ? (uint8_t*)osc->data : nullptr, vosc,
         Hg * Kd, 2 * Hg * Kd, Vd, Hv / Hg, w32,
-        (float)scale_d, (float)l2_d, (float)eps_d, (float)thr_d, sigm);
+        (float)scale_d, (float)l2_d, (float)eps_d, (float)thr_d, sigm,
+        (int64_t)rad_dtype_bytes(st->dtype, 1), al_groups, al_fstr, al_vb, al_gb,
+        al_mark, al_tmax);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
