@@ -183,6 +183,27 @@ static const RadOperandSpec oGemmNtQ[] = {
     { "b_ref",   RAD_OPD_WEIGHT, 1 },
 };
 
+/* gemm_nt_q_gated: verbatim libref (ref_registry.cpp pGemmQGated/oGemmQGated) so
+ * schema_same() passes. `act` is required here, unlike on the quantiser; `N` is the
+ * weight's rows, twice the fused width, so the output is [M, N/2]. */
+static const RadParamSpec pGemmNtQGated[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "N",     RAD_P_INT, RAD_REQUIRED },
+    { "K",     RAD_P_INT, RAD_REQUIRED },
+    { "group", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    { "act",   RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oGemmNtQGated[] = {
+    { "a",         RAD_OPD_IN,     0 },
+    { "a_scale",   RAD_OPD_IN,     1 },
+    { "b",         RAD_OPD_WEIGHT, 0 },
+    { "b_scale",   RAD_OPD_WEIGHT, 0 },
+    { "q",         RAD_OPD_OUT,    0 },
+    { "scale",     RAD_OPD_OUT,    0 },
+    { "out_bf16",  RAD_OPD_OUT,    1 },
+};
+
 /* logits_gemm: verbatim libr4d (r4d_rows.cpp pLogits/oLogits). Same three operands in the
  * same order as gemm_nt, the extents spelled n_vocab / n_embd. */
 static const RadParamSpec pLogits[] = {
@@ -631,6 +652,13 @@ static const RadOpSchema kSchemas[] = {
       "C[M,N] = A[M,K] @ dequant(Bq)[N,K]^T. `dtype` names the operand COMBINATION, so one "
       "op covers w4a16 through mxfp4a8 and an architecture plugin that changes quant changes "
       "one string." },
+    { "gemm_nt_q_gated", pGemmNtQGated, (int)(sizeof(pGemmNtQGated)/sizeof(pGemmNtQGated[0])),
+      oGemmNtQGated, (int)(sizeof(oGemmNtQGated)/sizeof(oGemmNtQGated[0])),
+      "gemm_nt_q over a [2n, K] gate_up plane with gated_quant_fp8's pass folded into the "
+      "epilogue: the outputs are the quantiser's E4M3 codes, its scale per (row, `group` "
+      "columns) and optionally the bf16 product, and no [M, 2n] tensor is ever written. "
+      "Byte-identical to the two ops it replaces, which is what makes it substitutable "
+      "rather than a second numerical path." },
     { "attn_paged", pAttnPaged, (int)(sizeof(pAttnPaged)/sizeof(pAttnPaged[0])),
       oAttnPaged, (int)(sizeof(oAttnPaged)/sizeof(oAttnPaged[0])),
       "Paged attention over kv_cache[num_blocks, kv_heads, block_size, 2*head_dim] (K then "
@@ -810,6 +838,18 @@ static const RadConstraint cFp8A8Row[] = {
     { "group", RAD_C_EQ, 128, nullptr },
 };
 
+/* gemm_nt_q_gated fp8a8: the composed row (tile into scratch, gated_quant epilogue)
+ * sizes its arena at the band's M bound, so the band stops at 64 -- the whole dflash
+ * drafter M range this container declares. act silu and sigmoid both compile in the
+ * ported epilogue; K keeps the plain row's 128 rule. */
+static const RadConstraint cFp8A8GatedRow[] = {
+    { "dtype", RAD_C_IN, 0, "fp8a8" },
+    { "M",     RAD_C_LE, 64, nullptr },
+    { "K",     RAD_C_DIV, 128, nullptr },
+    { "group", RAD_C_EQ, 128, nullptr },
+    { "act",   RAD_C_IN, 0, "silu sigmoid" },
+};
+
 /* kv_store constraints, the positional form of libr4d's cKvStore = { C_GE("block_size", 1),
  * C_IN("kv_dtype", "bf16") }. */
 static const RadConstraint cKvStore[] = {
@@ -972,6 +1012,8 @@ extern "C" int r3d_rad_gemm_nt(const RadArgs*, RadStream);
 extern "C" int r3d_rad_logits_gemm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q_fp8(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gemm_nt_q_gated_fp8(const RadArgs*, RadStream);
+extern "C" int64_t r3d_rad_gemm_nt_q_gated_fp8_scratch(const RadArgs*);
 extern "C" int r3d_rad_logits_gemm_e4m3(const RadArgs*, RadStream);
 extern "C" int r3d_layout_head(const RadParam*, int, int, const RadEncoding*, const int*,
                                const RadTensor*, int, RadLayout*);
@@ -1176,6 +1218,21 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cFp8A8Row, 3, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gemm_nt_q_fp8 },
+
+{ "gemm_nt_q_gated_fp8a8", "gemm_nt_q_gated", "gemm",
+  "the fp8a8 tile writing its bf16 gate_up plane into the launch scratch, closed by the "
+  "ported gated_quant_fp8 epilogue in the same launch -- the byte-identical composition "
+  "of the two shipped rows (libr4d's fuse-check precedent); no [M,2n] tensor reaches the "
+  "caller",
+  "M <= 64 (the scratch is sized at the band's bound; dflash's drafter band); K a "
+  "multiple of 128; N = 2n with n a whole number of 128-column scale groups in practice "
+  "(the epilogue's amax closes per group inside the row); M derives from numel(q)/n",
+  "fp8_e4m3 a with f32 a_scale per (row, 128 K), fp8_e4m3 b with bf16 scale per 128x128 "
+  "tile, e4m3 q + f32 scale out, optional bf16 product; act silu or sigmoid; a_sum refused",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cFp8A8GatedRow, 5, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gemm_nt_q_gated_fp8,
+  r3d_rad_gemm_nt_q_gated_fp8_scratch },
 
 { "attn_paged_bf16", "attn_paged", "attn",
   "paged causal / sliding-window attention, one workgroup per (query row, head), any "

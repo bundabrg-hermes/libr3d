@@ -40,12 +40,17 @@
 #include <hip/hip_runtime.h>
 #include "r3d_dump.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 #include "rad_abi.h"
 #include "rad_plugin.h"   /* rad_arg_in / rad_tensor_numel (host-side entry helpers) */
+
+/* One 128-of-K scale group per WMMA burst; 256 threads band the epilogue rows. */
+constexpr int kEpiThreads = 256;
+constexpr int kEpiWarps   = kEpiThreads / 32;
 
 namespace {
 
@@ -279,29 +284,160 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_m64_kernel(
 
 #endif
 
-/* ---- the entry: gemm_nt_q schema, fp8a8 only ----------------------------------------
+/* ---- the gemm_nt_q_gated epilogue ---------------------------------------------------
  *
- * Positions follow oGemmNtQ (a, a_scale, b, b_scale, y, a_sum?, b_ref?). Every refusal
- * is RAD_E_UNSUPPORTED so the engine may answer from another row or the reference --
- * format gate first, shape gate second. */
-static int r3d_gemm_nt_q_fp8_impl(const RadArgs*, RadStream);
-extern "C" int r3d_rad_gemm_nt_q_fp8(const RadArgs* a, RadStream s)
-    R3D_DUMP_WRAP("gemm_nt_q_fp8", r3d_gemm_nt_q_fp8_impl)
-static int r3d_gemm_nt_q_fp8_impl(const RadArgs* a, RadStream s) {
-    static const bool no_fp8 = getenv("R3D_NO_FP8A8") != nullptr;
-    if (no_fp8) return RAD_E_UNSUPPORTED;
+ * gated_quant_fp8_kernel ported verbatim from r3d_band.hip (the same copy pattern the
+ * GDN TU's quantiser pair uses): the fused row must be byte-identical to
+ * gemm_nt_q followed by gated_quant_fp8, so the epilogue is that kernel, not a
+ * re-derivation. It reads the [M,N] bf16 gate_up plane the tile just computed (gate
+ * half first), narrows both halves to bf16 before the gate exactly as the unfused pair
+ * writes and re-reads them, and emits the fp8 code plane plus per-(row, group) scales. */
 
-    const RadTensor* A    = rad_arg_in(a, 0);
-    const RadTensor* AS   = rad_arg_in(a, 1);
-    const RadTensor* B    = rad_arg_in(a, 2);
-    const RadTensor* BS   = rad_arg_in(a, 3);
-    const RadTensor* Y    = rad_arg_in(a, 4);
-    const RadTensor* ASUM = rad_arg_in(a, 5);
-    const RadTensor* BREF = rad_arg_in(a, 6);
-    if (!A || !AS || !B || !BS || !Y) return RAD_E_UNSUPPORTED;
-    if (ASUM) return RAD_E_UNSUPPORTED;   /* no zero point in this grid (ref refuses it too) */
-    if (BREF) return RAD_E_UNSUPPORTED;   /* ref accepts b_ref beside an e2m1 weight only */
+namespace {
 
+__device__ __forceinline__ float e_sigmoid(float x) {
+    return 1.0f / (1.0f + (float)exp((double)(-x)));   /* r3d_exp_f/r3d_sigmoid, verbatim */
+}
+
+__device__ __forceinline__ float e_bf16_to_f32(uint16_t h) {
+    return __uint_as_float((uint32_t)h << 16);
+}
+__device__ __forceinline__ uint16_t e_f32_to_bf16(float f) {   /* same RNE as the tile's */
+    const uint32_t u = __float_as_uint(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 0x0040u);
+    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
+/* r3d_f32_to_e4m3 verbatim: RTNE, subnormal shift, saturate at 448 -- the codes the
+ * oracle would have written (r3d_band.hip's rationale applies unchanged). */
+__device__ __forceinline__ uint8_t e_f32_to_e4m3(float f) {
+    const uint32_t u = __float_as_uint(f);
+    const uint8_t  s = (uint8_t)((u >> 24) & 0x80u);
+    const uint32_t a = u & 0x7fffffffu;
+    if (a > 0x7f800000u) return (uint8_t)(s | 0x7fu);     /* nan */
+    if (a >= 0x43e00000u) return (uint8_t)(s | 0x7eu);    /* >= 448: clamp to the largest */
+    const int e = (int)(a >> 23) - 127;
+    uint32_t m = a & 0x7fffffu;
+    if (e < -10) return s;                                /* below half the smallest subnormal */
+    if (e < -6) {                                         /* subnormal fp8 */
+        const int sh = -6 - e + 20;
+        m |= 0x800000u;
+        const uint32_t lo = m & ((1u << sh) - 1u);
+        uint32_t q = m >> sh;
+        const uint32_t half = 1u << (sh - 1);
+        if (lo > half || (lo == half && (q & 1u))) ++q;
+        return (uint8_t)(s | q);
+    }
+    uint32_t q = m >> 20;
+    const uint32_t lo = m & 0xfffffu;
+    int ee;
+    if (lo > 0x80000u || (lo == 0x80000u && (q & 1u))) ++q;
+    ee = e + 7;
+    if (q == 0x8u) { q = 0; ++ee; }
+    if (ee > 15 || (ee == 15 && q >= 7u)) return (uint8_t)(s | 0x7eu);
+    return (uint8_t)(s | ((uint32_t)ee << 3) | q);
+}
+
+__device__ __forceinline__ float e_ldt2(const uint8_t* p, uint32_t dt, int64_t i) {
+    return dt == RAD_F32 ? ((const float*)p)[i]
+                         : e_bf16_to_f32(((const uint16_t*)p)[i]);
+}
+__device__ __forceinline__ void e_stt2(uint8_t* p, uint32_t dt, int64_t i, float v) {
+    if (dt == RAD_F32) ((float*)p)[i] = v;
+    else ((uint16_t*)p)[i] = e_f32_to_bf16(v);
+}
+
+/* block_max verbatim (fmaxf's NaN-skipping matches ref's strict `>` scan). */
+__device__ __forceinline__ float e_block_max(float v, float* s_part) {
+    for (uint32_t off = 16; off; off >>= 1)
+        v = fmaxf(v, __shfl_down_sync(0xFFFFFFFFull, v, off));
+    const uint32_t lane = threadIdx.x & 31u, wid = threadIdx.x >> 5;
+    if (lane == 0) s_part[wid] = v;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float r = s_part[0];
+        for (uint32_t w = 1; w < kEpiWarps; ++w) r = fmaxf(r, s_part[w]);
+        s_part[0] = r;
+    }
+    __syncthreads();
+    return s_part[0];
+}
+
+__device__ __forceinline__ float e_gated_h(const uint8_t* __restrict__ gub, uint32_t dt,
+                                           int64_t n, int64_t i, int silu) {
+    const float gt = e_ldt2(gub, RAD_BF16, i);            /* the tile's plane is always bf16 */
+    const float up = e_ldt2(gub, RAD_BF16, n + i);
+    const float sg = e_sigmoid(gt);
+    (void)dt;
+    return e_bf16_to_f32(e_f32_to_bf16((silu ? gt * sg : sg) * up));
+}
+
+__global__ __launch_bounds__(kEpiThreads) void gated_quant_epilogue_kernel(
+    const uint8_t* __restrict__ gu, uint32_t dt, int64_t gu_pitch,
+    uint8_t* __restrict__ q, int64_t q_pitch,
+    float* __restrict__ scale, int64_t s_pitch,
+    uint8_t* __restrict__ ob, uint32_t ob_dt, int64_t ob_pitch,
+    int64_t n, int64_t g, int64_t ngrp, int silu) {
+    __shared__ float s_part[kEpiWarps]; __shared__ float s_sc;
+    const int64_t row = blockIdx.x;
+    const uint8_t* __restrict__ gub = gu + row * gu_pitch;
+    uint8_t* __restrict__ qr = q + row * q_pitch;
+    uint8_t* __restrict__ yr = ob ? ob + row * ob_pitch : nullptr;
+
+    for (int64_t gi = 0; gi < ngrp; ++gi) {
+        const int64_t k0 = gi * g, k1 = (k0 + g < n) ? k0 + g : n;
+        float amax = 0.0f;
+        for (int64_t i = (int64_t)threadIdx.x; i < k1 - k0; i += (int64_t)kEpiThreads) {
+            const float m = fabsf(e_gated_h(gub, dt, n, k0 + i, silu));
+            if (m > amax) amax = m;
+        }
+        amax = e_block_max(amax, s_part);
+        if (threadIdx.x == 0) {
+            const float sc = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
+            s_sc = sc;
+            scale[row * s_pitch + gi] = sc;
+        }
+        __syncthreads();
+        const float inv = 1.0f / s_sc;
+        for (int64_t i = (int64_t)threadIdx.x; i < k1 - k0; i += (int64_t)kEpiThreads) {
+            const float h = e_gated_h(gub, dt, n, k0 + i, silu);
+            if (yr) e_stt2(yr, ob_dt, k0 + i, h);
+            float c = h * inv;
+            if (c >  448.0f) c =  448.0f;
+            if (c < -448.0f) c = -448.0f;
+            qr[k0 + i] = e_f32_to_e4m3(c);
+        }
+        __syncthreads();   /* s_sc reused next group */
+    }
+}
+
+} /* anonymous namespace */
+
+/* ---- the entries --------------------------------------------------------------------
+ *
+ * gemm_nt_q positions: (a, a_scale, b, b_scale, y, a_sum?, b_ref?).
+ * gemm_nt_q_gated positions: (a, a_scale, b, b_scale, q, scale, out_bf16?) -- the tile
+ * runs into the launch scratch as the [M,N] bf16 gate_up plane and the epilogue above
+ * closes it, the byte-identical composition of the two shipped rows (libr4d's own
+ * fuse-check precedent). Every refusal is RAD_E_UNSUPPORTED so the engine may answer
+ * from another row or the reference -- format gate first, shape gate second. */
+
+namespace {
+
+struct F8Plan {
+    const uint8_t *A, *B;
+    const float*  AS;
+    const uint16_t* BS;
+    int64_t M, N, K;
+    int as_cols, bs_cols, rblk;
+    int64_t a_pitch, b_pitch, as_pitch, bs_pitch;
+    int allowed;
+};
+
+/* Everything both fp8a8 entries share: format gate, operand dtypes, scale grids,
+ * pitches, chip gate. Returns RAD_OK or the refusal code. */
+int f8_plan(const RadArgs* a, const RadTensor* A, const RadTensor* AS,
+            const RadTensor* B, const RadTensor* BS, int64_t M, F8Plan* P) {
     const char* dtype = rad_args_gets(a, "dtype");
     if (!dtype || strcmp(dtype, "fp8a8") != 0) return RAD_E_UNSUPPORTED;
 
@@ -309,7 +445,7 @@ static int r3d_gemm_nt_q_fp8_impl(const RadArgs* a, RadStream s) {
     if (rad_args_geti(a, "pb1", &pb1) && pb1 > 0) return RAD_E_UNSUPPORTED;   /* e2m1-only parts */
     if (rad_args_geti(a, "pb2", &pb2) && pb2 > 0) return RAD_E_UNSUPPORTED;
 
-    if (A->dtype != RAD_F8E4M3 || B->dtype != RAD_F8E4M3 || Y->dtype != RAD_BF16 ||
+    if (A->dtype != RAD_F8E4M3 || B->dtype != RAD_F8E4M3 ||
         AS->dtype != RAD_F32 || BS->dtype != RAD_BF16)
         return RAD_E_UNSUPPORTED;
 
@@ -317,11 +453,7 @@ static int r3d_gemm_nt_q_fp8_impl(const RadArgs* a, RadStream s) {
     if (!rad_args_geti(a, "N", &N) || !rad_args_geti(a, "K", &K)) return RAD_E_SHAPE;
     if (N <= 0 || K <= 0) return RAD_E_SHAPE;
     if (K % 128) return RAD_E_UNSUPPORTED;   /* the scale grid must close on a whole block */
-
-    /* M is numel(Y)/N -- NEVER the schema's M parameter (the arena-capacity rule). */
-    const long long Yn = rad_tensor_numel(Y);
-    if (Yn <= 0 || Yn % N) return RAD_E_SHAPE;
-    const long long M = Yn / N;
+    if (M <= 0) return RAD_E_SHAPE;
     if (M > 0x7ffffffLL || N > 0x7ffffffLL || K > 0x7ffffffLL) return RAD_E_SHAPE;
     if (rad_tensor_numel(A) < M * K || rad_tensor_numel(B) < N * K) return RAD_E_SHAPE;
 
@@ -353,7 +485,6 @@ static int r3d_gemm_nt_q_fp8_impl(const RadArgs* a, RadStream s) {
     /* Contiguous innermost axes. */
     if (A->rank >= 2 && A->stride[A->rank - 1] != 1) return RAD_E_STRIDE;
     if (B->rank >= 2 && B->stride[B->rank - 1] != 1) return RAD_E_STRIDE;
-    if (Y->rank >= 2 && Y->stride[Y->rank - 1] != 1) return RAD_E_STRIDE;
 
     /* Chip gate (runtime, not compile-time: the host pass sees no __gfxNNNN__ macro). */
     static int allowed = -1;
@@ -367,35 +498,198 @@ static int r3d_gemm_nt_q_fp8_impl(const RadArgs* a, RadStream s) {
     }
     if (!allowed) return RAD_E_UNSUPPORTED;
 
+    P->A = (const uint8_t*)A->data; P->B = (const uint8_t*)B->data;
+    P->AS = (const float*)AS->data; P->BS = (const uint16_t*)BS->data;
+    P->M = M; P->N = N; P->K = K;
+    P->as_cols = (int)as_cols; P->bs_cols = (int)bs_cols; P->rblk = rblk;
+    P->a_pitch  = f8_row_stride(A, K);
+    P->b_pitch  = f8_row_stride(B, K);
+    P->as_pitch = f8_row_stride(AS, as_cols);
+    P->bs_pitch = f8_row_stride(BS, bs_cols);
+    P->allowed = allowed;
+    return RAD_OK;
+}
+
+void f8_launch_tile(const F8Plan& P, void* ydata, int64_t y_pitch, RadStream s,
+                    const char* trace) {
     static const bool no_dbuf = getenv("R3D_GEMM_NO_DBUF") != nullptr;
-
-    const int64_t a_pitch  = f8_row_stride(A, K);
-    const int64_t b_pitch  = f8_row_stride(B, K);
-    const int64_t y_pitch  = f8_row_stride(Y, N);
-    const int64_t as_pitch = f8_row_stride(AS, as_cols);
-    const int64_t bs_pitch = f8_row_stride(BS, bs_cols);
-
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
-    dim3 grid((unsigned)((N + kNB - 1) / kNB), (unsigned)((M + kMB - 1) / kMB));
+    dim3 grid((unsigned)((P.N + kNB - 1) / kNB), (unsigned)((P.M + kMB - 1) / kMB));
     if (no_dbuf)
         hipLaunchKernelGGL((gemm_nt_fp8a8_m64_kernel<false>), grid, dim3(kThreads), 0, stream,
-                           (const uint8_t*)A->data, (const uint8_t*)B->data, (uint16_t*)Y->data,
-                           (const float*)AS->data, (const uint16_t*)BS->data,
-                           (int)M, (int)N, (int)K, (int)as_cols, (int)bs_cols,
-                           a_pitch, b_pitch, y_pitch, as_pitch, bs_pitch, rblk);
+                           P.A, P.B, (uint16_t*)ydata, P.AS, P.BS,
+                           (int)P.M, (int)P.N, (int)P.K, P.as_cols, P.bs_cols,
+                           P.a_pitch, P.b_pitch, y_pitch, P.as_pitch, P.bs_pitch, P.rblk);
     else
         hipLaunchKernelGGL((gemm_nt_fp8a8_m64_kernel<true>), grid, dim3(kThreads), 0, stream,
-                           (const uint8_t*)A->data, (const uint8_t*)B->data, (uint16_t*)Y->data,
-                           (const float*)AS->data, (const uint16_t*)BS->data,
-                           (int)M, (int)N, (int)K, (int)as_cols, (int)bs_cols,
-                           a_pitch, b_pitch, y_pitch, as_pitch, bs_pitch, rblk);
+                           P.A, P.B, (uint16_t*)ydata, P.AS, P.BS,
+                           (int)P.M, (int)P.N, (int)P.K, P.as_cols, P.bs_cols,
+                           P.a_pitch, P.b_pitch, y_pitch, P.as_pitch, P.bs_pitch, P.rblk);
     const hipError_t le = hipGetLastError();
-    if (le != hipSuccess) fprintf(stderr, "libr3d: fp8a8 m64 launch FAILED (%s)\n",
-                                  hipGetErrorName(le));
+    if (le != hipSuccess) fprintf(stderr, "libr3d: %s launch FAILED (%s)\n",
+                                  trace, hipGetErrorName(le));
     else if (getenv("R3D_DEBUG_GEMM")) {
         static bool once = false;
         if (!once) { once = true; fprintf(stderr, "libr3d: fp8a8 WMMA tile launched (%s)\n",
                                           no_dbuf ? "single-buffer" : "dbuf pipeline"); }
     }
-    return le == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+} /* anonymous namespace */
+
+static int r3d_gemm_nt_q_fp8_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gemm_nt_q_fp8(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("gemm_nt_q_fp8", r3d_gemm_nt_q_fp8_impl)
+static int r3d_gemm_nt_q_fp8_impl(const RadArgs* a, RadStream s) {
+    static const bool no_fp8 = getenv("R3D_NO_FP8A8") != nullptr;
+    if (no_fp8) return RAD_E_UNSUPPORTED;
+
+    const RadTensor* A    = rad_arg_in(a, 0);
+    const RadTensor* AS   = rad_arg_in(a, 1);
+    const RadTensor* B    = rad_arg_in(a, 2);
+    const RadTensor* BS   = rad_arg_in(a, 3);
+    const RadTensor* Y    = rad_arg_in(a, 4);
+    const RadTensor* ASUM = rad_arg_in(a, 5);
+    const RadTensor* BREF = rad_arg_in(a, 6);
+    if (!A || !AS || !B || !BS || !Y) return RAD_E_UNSUPPORTED;
+    if (ASUM) return RAD_E_UNSUPPORTED;   /* no zero point in this grid (ref refuses it too) */
+    if (BREF) return RAD_E_UNSUPPORTED;   /* ref accepts b_ref beside an e2m1 weight only */
+    if (Y->dtype != RAD_BF16) return RAD_E_UNSUPPORTED;
+
+    /* M is numel(Y)/N -- NEVER the schema's M parameter (the arena-capacity rule). */
+    long long Np = 0;
+    if (!rad_args_geti(a, "N", &Np) || Np <= 0) return RAD_E_SHAPE;
+    const long long Yn = rad_tensor_numel(Y);
+    if (Yn <= 0 || Yn % Np) return RAD_E_SHAPE;
+
+    if (Y->rank >= 2 && Y->stride[Y->rank - 1] != 1) return RAD_E_STRIDE;
+
+    F8Plan P{};
+    int rc = f8_plan(a, A, AS, B, BS, Yn / Np, &P);
+    if (rc) return rc;
+    f8_launch_tile(P, Y->data, f8_row_stride(Y, Np), s, "fp8a8 m64");
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* ---- gemm_nt_q_gated at fp8a8 --------------------------------------------------------
+ *
+ * The tile runs into the launch scratch as the [M,N] bf16 gate_up plane (scratch sized
+ * by the row's hook below), and the ported epilogue closes it into the fp8 code pair --
+ * the byte-identical composition of gemm_nt_q followed by gated_quant_fp8. M is
+ * numel(q)/n (the code plane is the output carrier, ref_gemm_nt_q_gated's own rule). */
+
+namespace {
+
+/* row2_pitch from r3d_band.hip (the sealed form: rank 0 refuses, rank >= 3 walks every
+ * adjacent pair -- an innermost stride hole is the 27B gate-corruption trap). */
+int f8_row2_pitch(const RadTensor* t, int64_t cols, int64_t* pitch) {
+    if (!t || !t->data) return -1;
+    if (t->rank == 0) return -4;
+    if (t->rank == 1) {
+        if (rad_tensor_numel(t) != cols || t->stride[0] != 1) return -2;
+        *pitch = 0;
+        return 0;
+    }
+    if (t->rank == 2) {
+        if (t->stride[1] != 1) return -3;
+        *pitch = (t->shape[1] == cols) ? t->stride[0] : cols;
+        return 0;
+    }
+    if (t->stride[t->rank - 1] != 1) return -3;
+    if (t->shape[t->rank - 1] != cols) { *pitch = cols; return 0; }   /* ref's linear fallback */
+    for (int i = 0; i < (int)t->rank - 1; ++i)
+        if (t->stride[i] != t->shape[i + 1] * t->stride[i + 1]) return -4;
+    *pitch = cols;
+    return 0;
+}
+
+} /* anonymous namespace */
+
+static int r3d_gemm_nt_q_gated_fp8_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gemm_nt_q_gated_fp8(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("gemm_nt_q_gated_fp8", r3d_gemm_nt_q_gated_fp8_impl)
+static int r3d_gemm_nt_q_gated_fp8_impl(const RadArgs* a, RadStream s) {
+    static const bool no_fp8 = getenv("R3D_NO_FP8A8") != nullptr;
+    if (no_fp8) return RAD_E_UNSUPPORTED;
+
+    const RadTensor* A    = rad_arg_in(a, 0);
+    const RadTensor* AS   = rad_arg_in(a, 1);
+    const RadTensor* B    = rad_arg_in(a, 2);
+    const RadTensor* BS   = rad_arg_in(a, 3);
+    const RadTensor* Q    = rad_arg_in(a, 4);
+    const RadTensor* SC   = rad_arg_in(a, 5);
+    const RadTensor* OB   = rad_arg_in(a, 6);
+    const RadTensor* ASUM = rad_arg_in(a, 7);
+    if (!A || !AS || !B || !BS || !Q || !SC) return RAD_E_UNSUPPORTED;
+    if (ASUM) return RAD_E_UNSUPPORTED;
+    if (Q->dtype != RAD_F8E4M3 || SC->dtype != RAD_F32) return RAD_E_UNSUPPORTED;
+    if (OB && OB->dtype != RAD_BF16 && OB->dtype != RAD_F32) return RAD_E_UNSUPPORTED;
+
+    /* `act` is required here (ref_gemm_nt_q_gated's rule: an implementation may compile
+     * one gate, so an optional parameter would let it resolve for the other). */
+    const char* act = rad_args_gets(a, "act");
+    if (!act) return RAD_E_UNSUPPORTED;
+    const int silu = strcmp(act, "sigmoid") != 0;
+    if (silu && strcmp(act, "silu") != 0) return RAD_E_UNSUPPORTED;
+
+    long long N = 0;
+    if (!rad_args_geti(a, "N", &N) || N <= 0 || (N & 1)) return RAD_E_SHAPE;
+    const long long n = N / 2;
+
+    long long g = 0;
+    if (!rad_args_geti(a, "group", &g) || g <= 0) g = n;   /* ref's default */
+    if (g > n) g = n;
+    const long long ngrp = (n + g - 1) / g;
+
+    /* M is numel(q)/n -- the code plane is the output carrier. */
+    const long long Qn = rad_tensor_numel(Q);
+    if (Qn <= 0 || Qn % n) return RAD_E_SHAPE;
+    const long long M = Qn / n;
+    if (rad_tensor_numel(SC) < M * ngrp) return RAD_E_SHAPE;
+    if (OB && rad_tensor_numel(OB) < M * n) return RAD_E_SHAPE;
+
+    F8Plan P{};
+    int rc = f8_plan(a, A, AS, B, BS, M, &P);
+    if (rc) return rc;
+    if (P.N != N) return RAD_E_SHAPE;   /* N param and the b_scale grid must agree */
+
+    /* The gate_up plane lands in the launch scratch: M*N bf16. The row's scratch hook
+     * sizes the arena at declare for the band's M upper bound (M <= 64); refuse -- never
+     * overrun -- if a launch outgrows what the arena got. */
+    const int64_t need = M * N * (int64_t)sizeof(uint16_t);
+    if (!a->scratch || a->scratch_bytes < need) return RAD_E_UNSUPPORTED;
+
+    int64_t qp = 0, sp = 0, op = 0;
+    if (f8_row2_pitch(Q, n, &qp)) return RAD_E_STRIDE;
+    if (f8_row2_pitch(SC, ngrp, &sp)) return RAD_E_STRIDE;
+    if (OB && f8_row2_pitch(OB, n, &op)) return RAD_E_STRIDE;
+
+    hipStream_t stream = (hipStream_t)(uintptr_t)s;
+    f8_launch_tile(P, a->scratch, N, s, "fp8a8 gated tile");
+    if (hipGetLastError() != hipSuccess) return RAD_E_DEVICE;
+
+    /* Pitches follow the band entry's convention: the kernel offsets the byte pointer
+     * first and indexes elements from there, so the bf16 plane and the optional bf16/f32
+     * product take BYTE pitches (rad_dtype_bytes), while the f32 scale takes element
+     * units (it is indexed as float* directly). q is e4m3: bytes == elements. */
+    gated_quant_epilogue_kernel<<<dim3((unsigned)M), dim3(kEpiThreads), 0, stream>>>(
+        (const uint8_t*)a->scratch, RAD_BF16, N * (int64_t)sizeof(uint16_t),
+        (uint8_t*)Q->data, qp, (float*)SC->data, sp,
+        OB ? (uint8_t*)OB->data : nullptr, OB ? OB->dtype : RAD_F32,
+        OB ? rad_dtype_bytes(OB->dtype, op) : 0,
+        n, g, ngrp, silu);
+    if (getenv("R3D_DEBUG_GEMM")) {
+        static bool once = false;
+        if (!once) { once = true; fprintf(stderr, "libr3d: fp8a8 gated row launched\n"); }
+    }
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* Scratch for the fused row: the [M,N] bf16 gate_up plane at the band's M upper bound.
+ * The row claims M <= 64, so 64*N*2 covers every launch the resolver can offer; a wider
+ * arena than the band's bound costs a few KiB and never a refusal. */
+extern "C" int64_t r3d_rad_gemm_nt_q_gated_fp8_scratch(const RadArgs* a) {
+    long long N = 0;
+    if (!rad_args_geti(a, "N", &N) || N <= 0 || N > (1LL << 34)) return 0;   /* 0 = none */
+    return 64 * N * (int64_t)sizeof(uint16_t);
 }
