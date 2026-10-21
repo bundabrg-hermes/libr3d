@@ -1311,3 +1311,43 @@ Two schema/pitch traps paid for:
   bytes (the kernel offsets a byte pointer, then indexes elements), while the
   f32 scale pitch is element units. Passing element pitches strides every row
   by half a row — silent, plausible-looking garbage.
+
+## gemm_nt_q_fp8a8_decode — the decode-band width row, 2.2x fp8 serve decode (2026-10-21)
+
+Issue #4 closed. The m64 tile at M = 1..8 stages every B row through a 64-row
+slab it uses M rows of: 98 GB/s effective on a 368 GB/s card. The new row reads
+every weight byte exactly once: warp per weight row, four codes per lane (one
+aligned dword — the logits GEMV's load pattern), the MT activation rows decoded
+through a loop-free e4m3→f32 into LDS per 128-of-K group, sub ascending per lane
+and butterfly-folded across the wave, flush `acc += (sub * sa) * sb` at exactly
+the oracle's group granularity and multiply order. Priority 1100 with `M <= 8`
+takes the decode band from the tile (the split-KV attention precedent); the
+gated row's scratch tile dispatches to the same GEMV at M <= 8, because the FFN
+gate_up plane is two-thirds of decode weight traffic and the band would not
+reach its 2x bar through q/o/down alone. Ragged N clamps the dead warps' load
+row rather than returning early: every warp must reach the block's barriers, and
+a returned warp would also leave LDS staging holes. B alignment (base and row
+pitch mod 4) is refused at the entry so odd strides resolve to the tile, which
+walks bytes.
+
+Evidence: attribution home, fp8_9b.rkb --op gemm_nt_q: 536/536, the 24 M <= 8
+cases attributed to `gemm_nt_q_fp8a8_decode` and all BIT-EXACT (0.00e+00 vs the
+5e-3 tol; the tile's worst over the remaining 36 is 3.7e-04, unchanged). Full
+fp8 pack 2582/2582, gated worst 8.62e-06 — identical to issue #1, so the GEMV
+reassociation left the composed quantiser pair exactly where it was. Stock
+2007/2007, full mxfp4 4733/4733, 0 OOB. Serve A/B (qwen3.5-9b-fp8.rad,
+--num-speculative-tokens 0, ctx-512 pair-difference probe, arms one env apart):
+tile 8.61 tok/s vs decode 18.90 tok/s — **2.19x**, ~82 -> ~180 GB/s effective.
+With the container's default MTP drafter on: 26.1 -> 35.2 tok/s.
+
+Lessons: (1) **an issue-time refusal is an engine abort, not a re-resolve** —
+"kernel ... refused op at issue ... selected wrongly". A kill switch that only
+checks getenv in the entry cannot A/B anything: the resolver picked the row at
+declare from its constraints, the launch refused, the step died. R3D_NO_FP8_DEC
+found this on its first serve A/B; R3D_NO_FP8A8 had been carrying the same
+latent fault since issue #1 (never exercised under serve). Both levers now
+withdraw their rows at the rad_kernel_at registration gate, the R3D_NO_GDN
+pattern. (2) This model container enables the MTP drafter by default — an A/B
+without --num-speculative-tokens 0 measured 1.35x, because verify/accept
+overhead dilutes GEMM bandwidth wins; match the evidence arm's spec setting,
+not just the flags you remember passing.
