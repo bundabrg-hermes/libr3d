@@ -1648,6 +1648,23 @@ static bool r3d_row_hidden(const char* op) {
     return false;
 }
 
+/* The fp8a8 levers, at the same registration gate as R3D_NO_GDN (a launch-time refusal is
+ * an abort, not a re-resolve: the engine picks the row at declare and "a kernel that
+ * refuses at issue was selected wrongly" -- what R3D_NO_FP8A8=1 would have hit on its
+ * first serve A/B, and what R3D_NO_FP8_DEC=1 hit on its first one for real).
+ * R3D_NO_FP8A8=1 withdraws all three fp8a8 rows (the bands then place on the host, as
+ * they did before the rows shipped); R3D_NO_FP8_DEC=1 withdraws only the decode row, so
+ * the M <= 8 band falls to the m64 tile on the same .so -- the issue #4 A/B arm. The
+ * op schemas stay declared either way: gemm_nt_q/gated keep their mxfp4 rows. */
+static bool r3d_fp8_row_hidden(const RadKernelInfo& k) {
+    static const bool no_fp8 = getenv("R3D_NO_FP8A8") != nullptr;
+    static const bool no_dec = getenv("R3D_NO_FP8_DEC") != nullptr;
+    if (!no_fp8 && !no_dec) return false;
+    if (!strcmp(k.name, "gemm_nt_q_fp8a8_decode")) return true;   /* both levers hide it */
+    return no_fp8 && (!strcmp(k.name, "gemm_nt_q_fp8a8") ||
+                      !strcmp(k.name, "gemm_nt_q_gated_fp8a8"));
+}
+
 int rad_kernel_schema_count(void) {
     int n = 0;
     for (const RadOpSchema& s : kSchemas) if (!r3d_row_hidden(s.op)) ++n;
@@ -1679,13 +1696,14 @@ static void r3d_anchor_gate(void) {
 int rad_kernel_count(void) {
     r3d_anchor_gate();
     int n = 0;
-    for (const RadKernelInfo& k : kRows) if (!r3d_row_hidden(k.op)) ++n;
+    for (const RadKernelInfo& k : kRows) if (!r3d_row_hidden(k.op) && !r3d_fp8_row_hidden(k)) ++n;
     return n;
 }
 const RadKernelInfo* rad_kernel_at(int i) {
     r3d_anchor_gate();
     if (i < 0) return nullptr;
-    for (const RadKernelInfo& k : kRows) if (!r3d_row_hidden(k.op) && i-- == 0) return &k;
+    for (const RadKernelInfo& k : kRows)
+        if (!r3d_row_hidden(k.op) && !r3d_fp8_row_hidden(k) && i-- == 0) return &k;
     return nullptr;
 }
 
