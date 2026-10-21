@@ -55,7 +55,10 @@ struct Lib {
     }
 };
 
-static size_t dt_bytes(uint32_t d) { return (d == RAD_F32 || d == RAD_I32) ? 4 : 2; }
+int dt_bytes(uint32_t d) {
+    if (d == RAD_F8E4M3 || d == RAD_F8E5M2 || d == RAD_I8 || d == RAD_U8) return 1;
+    return (d == RAD_F32 || d == RAD_I32) ? 4 : 2;
+}
 
 struct Buf {
     std::vector<uint8_t> h, seed, dout;
@@ -177,7 +180,7 @@ static void run_pair(Case& c, const RadKernelInfo* rk, const RadKernelInfo* dk) 
     ad.t = td.data(); ad.n_t = (int)n; ad.p = c.p.data(); ad.n_p = (int)c.p.size();
 
     // device run first, from the seeds; outputs start zeroed so a missed write shows up
-    for (auto& op : c.o) { op.b.restore(); if (op.kind == 1) std::memset(op.b.h.data(), 0, op.b.h.size()); }
+    for (auto& op : c.o) { op.b.restore(); if (op.kind == 1) std::memset(op.b.h.data(), 0xEE, op.b.h.size()); }
     for (auto& op : c.o) op.b.to_dev();
     int rc = dk->launch(&ad, (RadStream)nullptr);
     if (rc != RAD_OK) { std::printf("%-46s DEV launch rc=%d\n", c.title, rc); ++g_fail; return; }
@@ -186,7 +189,7 @@ static void run_pair(Case& c, const RadKernelInfo* rk, const RadKernelInfo* dk) 
                                                    hipMemcpyDeviceToHost));
 
     // ref run second, on freshly restored host seeds
-    for (auto& op : c.o) { op.b.restore(); if (op.kind == 1) std::memset(op.b.h.data(), 0, op.b.h.size()); }
+    for (auto& op : c.o) { op.b.restore(); if (op.kind == 1) std::memset(op.b.h.data(), 0xEE, op.b.h.size()); }
     rc = rk->launch(&ah, (RadStream)nullptr);
     if (rc != RAD_OK) { std::printf("%-46s REF launch rc=%d\n", c.title, rc); ++g_fail; return; }
 
@@ -212,7 +215,9 @@ int main(int argc, char** argv) {
     const RadKernelInfo* dk_prep  = r3d.row("gdn_conv_prep", RAD_DOMAIN_DEVICE);
     const RadKernelInfo* rk_fused = ref.row("gdn_conv_recurrent_update", RAD_DOMAIN_HOST);
     const RadKernelInfo* dk_fused = r3d.row("gdn_conv_recurrent_update", RAD_DOMAIN_DEVICE);
-    if (!rk_prep || !dk_prep || !rk_fused || !dk_fused) {
+    const RadKernelInfo* rk_rec   = ref.row("gdn_recurrent_update", RAD_DOMAIN_HOST);
+    const RadKernelInfo* dk_rec   = r3d.row("gdn_recurrent_update", RAD_DOMAIN_DEVICE);
+    if (!rk_prep || !dk_prep || !rk_fused || !dk_fused || !rk_rec || !dk_rec) {
         std::printf("row lookup failed: prep %p/%p fused %p/%p\n",
                     (void*)rk_prep, (void*)dk_prep, (void*)rk_fused, (void*)dk_fused);
         return 2;
@@ -374,6 +379,125 @@ int main(int argc, char** argv) {
         fill_i32({0, 4}, c.o[cu].b);
         c.outs = {o, st, cs};
         run_pair(c, rk_fused, dk_fused);
+    }
+
+    // ---- fused C: fused B's geometry with the fp8 quantiser pair present (operands 16/17):
+    //      ref's epilogue quantises the o row AS STORED, one e4m3 group per (token, head),
+    //      scale amax/448; both planes must come back byte-identical.
+    {
+        Case c; c.title = "fused C: N1 slen4 K128 V128 + fp8 quant pair";
+        const int T = 4, K = 128, V = 128, Hg = 1, H = 3, W = 4, CSL = 6, CSLOTS = 4,
+                  SST = 4, SW = 2;
+        const int CD = 2 * Hg * K + H * V;
+        c.pi("q_len", 4); c.pi("head_k", K); c.pi("head_v", V); c.pi("conv_width", W);
+        c.pi("n_head_v", H); c.pf("scale", 0.08838834764831845); c.pf("eps", 1e-6);
+        c.pf("l2_eps", 1e-6); c.pf("softplus_thr", 20.0); c.ps("act", "silu");
+        c.pi("state_fp16", 0); c.ps("state_form", "per_candidate");
+        int x  = c.add(0, "x", RAD_BF16, {T, CD});
+        int w  = c.add(0, "conv_w", RAD_BF16, {CD, W});
+        int cb = c.add(0, "conv_b", RAD_F32, {CD});
+        int cs = c.add(2, "conv_state", RAD_F32, {CSLOTS, CD, CSL});
+        int ci = c.add(0, "conv_idx", RAD_I32, {1});
+        int av = c.add(0, "a", RAD_BF16, {T, H});
+        int bv = c.add(0, "b", RAD_BF16, {T, H});
+        int al = c.add(0, "A_log", RAD_F32, {H});
+        int db = c.add(0, "dt_bias", RAD_F32, {H});
+        int st = c.add(2, "state", RAD_F32, {SST, H, V, K});
+        int si = c.add(0, "state_idx", RAD_I32, {1, SW});
+        int na = c.add(0, "num_accepted", RAD_I32, {1});
+        int cu = c.add(0, "cu", RAD_I32, {2});
+        int z  = c.add(0, "z", RAD_BF16, {1});        c.o[z].present = false;
+        int nw = c.add(0, "norm_w", RAD_F32, {V});
+        int o  = c.add(1, "o", RAD_BF16, {T, H, V});
+        int oq = c.add(1, "o_q", RAD_F8E4M3, {T, H * V});
+        int os = c.add(1, "o_scale", RAD_F32, {T, H});
+        fill_bf16(rng, c.o[x].b, 1.5f); fill_bf16(rng, c.o[w].b, 1.0f);
+        fill_f32(rng, c.o[cb].b, 0.5f); fill_f32(rng, c.o[cs].b, 2.0f);
+        fill_bf16(rng, c.o[av].b, 4.0f); fill_bf16(rng, c.o[bv].b, 6.0f);
+        fill_f32(rng, c.o[al].b, 3.0f); fill_f32(rng, c.o[db].b, 1.0f);
+        fill_f32(rng, c.o[st].b, 2.0f); fill_f32(rng, c.o[nw].b, 2.0f);
+        fill_i32({2}, c.o[ci].b);
+        fill_i32({2, 1}, c.o[si].b);
+        fill_i32({1}, c.o[na].b);
+        fill_i32({0, 4}, c.o[cu].b);
+        c.outs = {o, st, cs, oq, os};
+        run_pair(c, rk_fused, dk_fused);
+    }
+
+    // ---- fused D: all-zero inputs. Every (token, head) group is then all-zero: the
+    //      amax == 0 scale branch (1.0) and the all-0x00 code plane, which the 0xEE
+    //      OUT prefill catches a missed write of.
+    {
+        Case c; c.title = "fused D: N1 slen2 K128 V128 all-zero quant groups";
+        const int T = 2, K = 128, V = 128, Hg = 1, H = 2, W = 4, CSL = 6, CSLOTS = 2,
+                  SST = 2, SW = 2;
+        const int CD = 2 * Hg * K + H * V;
+        c.pi("q_len", 2); c.pi("head_k", K); c.pi("head_v", V); c.pi("conv_width", W);
+        c.pi("n_head_v", H); c.pf("scale", 0.08838834764831845); c.pf("eps", 1e-6);
+        c.pf("l2_eps", 1e-6); c.pf("softplus_thr", 20.0); c.ps("act", "silu");
+        c.pi("state_fp16", 0); c.ps("state_form", "per_candidate");
+        int x  = c.add(0, "x", RAD_BF16, {T, CD});      // present and all-zero (Buf inits to 0)
+        int w  = c.add(0, "conv_w", RAD_BF16, {CD, W});
+        int cb = c.add(0, "conv_b", RAD_F32, {CD});     c.o[cb].present = false;
+        int cs = c.add(2, "conv_state", RAD_F32, {CSLOTS, CD, CSL});
+        int ci = c.add(0, "conv_idx", RAD_I32, {1});
+        int av = c.add(0, "a", RAD_BF16, {T, H});
+        int bv = c.add(0, "b", RAD_BF16, {T, H});
+        int al = c.add(0, "A_log", RAD_F32, {H});
+        int db = c.add(0, "dt_bias", RAD_F32, {H});
+        int st = c.add(2, "state", RAD_F32, {SST, H, V, K});
+        int si = c.add(0, "state_idx", RAD_I32, {1, SW});
+        int na = c.add(0, "num_accepted", RAD_I32, {1});
+        int cu = c.add(0, "cu", RAD_I32, {2});
+        int z  = c.add(0, "z", RAD_BF16, {T, H, V});
+        int nw = c.add(0, "norm_w", RAD_F32, {V});
+        int o  = c.add(1, "o", RAD_BF16, {T, H, V});
+        int oq = c.add(1, "o_q", RAD_F8E4M3, {T, H * V});
+        int os = c.add(1, "o_scale", RAD_F32, {T, H});
+        fill_i32({0}, c.o[ci].b);
+        fill_i32({0, 0}, c.o[si].b);
+        fill_i32({1}, c.o[na].b);
+        fill_i32({0, 2}, c.o[cu].b);
+        c.outs = {o, st, cs, oq, os};
+        run_pair(c, rk_fused, dk_fused);
+    }
+
+    // ---- rec A: the NON-fused gdn_recurrent_update row with the pair — the registry lists
+    //      o_q/o_scale on both recurrent ops, so both kernels must carry the epilogue.
+    {
+        Case c; c.title = "rec A: N2 slen2+1 nacc{2,1} K128 V128 + fp8 quant pair";
+        const int T = 3, K = 128, V = 128, Hg = 2, H = 4, SST = 4, SW = 3;
+        c.pi("q_len", 2); c.pi("head_k", K); c.pi("head_v", V); c.pi("n_head_v", H);
+        c.pf("scale", 0.08838834764831845); c.pf("eps", 1e-6);
+        c.pf("l2_eps", 1e-6); c.pf("softplus_thr", 20.0); c.ps("act", "silu");
+        c.pi("state_fp16", 0); c.ps("state_form", "per_candidate");
+        int q  = c.add(0, "q", RAD_BF16, {T, Hg, K});
+        int k2 = c.add(0, "k", RAD_BF16, {T, Hg, K});
+        int v  = c.add(0, "v", RAD_BF16, {T, H, V});
+        int av = c.add(0, "a", RAD_BF16, {T, H});
+        int bv = c.add(0, "b", RAD_BF16, {T, H});
+        int al = c.add(0, "A_log", RAD_F32, {H});
+        int db = c.add(0, "dt_bias", RAD_F32, {H});
+        int st = c.add(2, "state", RAD_F32, {SST, H, V, K});
+        int si = c.add(0, "state_idx", RAD_I32, {2, SW});
+        int na = c.add(0, "num_accepted", RAD_I32, {2});
+        int cu = c.add(0, "cu", RAD_I32, {3});
+        int z  = c.add(0, "z", RAD_BF16, {T, H, V});
+        int nw = c.add(0, "norm_w", RAD_F32, {V});
+        int o  = c.add(1, "o", RAD_BF16, {T, H, V});
+        int oq = c.add(1, "o_q", RAD_F8E4M3, {T, H * V});
+        int os = c.add(1, "o_scale", RAD_F32, {T, H});
+        fill_bf16(rng, c.o[q].b, 1.2f); fill_bf16(rng, c.o[k2].b, 1.2f);
+        fill_bf16(rng, c.o[v].b, 1.2f);
+        fill_bf16(rng, c.o[av].b, 4.0f); fill_bf16(rng, c.o[bv].b, 6.0f);
+        fill_f32(rng, c.o[al].b, 3.0f); fill_f32(rng, c.o[db].b, 1.0f);
+        fill_f32(rng, c.o[st].b, 2.0f); fill_bf16(rng, c.o[z].b, 3.0f);
+        fill_f32(rng, c.o[nw].b, 2.0f);
+        fill_i32({0, 1, 1,  2, 2, 2}, c.o[si].b);   // seq0 in=1 writes {0,1}; seq1 in=2 writes {2}
+        fill_i32({2, 1}, c.o[na].b);
+        fill_i32({0, 2, 3}, c.o[cu].b);
+        c.outs = {o, st, oq, os};
+        run_pair(c, rk_rec, dk_rec);
     }
 
     std::printf("\n%s: %d mismatch group(s)\n", g_fail ? "FAIL" : "ALL PASS", g_fail);

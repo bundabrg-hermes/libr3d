@@ -1437,7 +1437,7 @@ static const RadKernelInfo kRows[] = {
   "padded); state_idx rows may be wider than one column (the accepted-prefix walk clamps to the "
   "last), a negative input slot skips the (sequence, head) row whole and a negative output slot "
   "skips only that token's state write, both as the reference's guards do; the o_q/o_scale "
-  "quantiser pair is refused, never silently dropped",
+  "quantiser pair writes ref's per-(token,head) e4m3 group epilogue when both are present",
   "f32/bf16 q/k/v/a/b/o and z, f32-or-bf16 A_log/dt_bias/norm_w read as stored (plain single-"
   "plane weights -- the 27B container stores them bf16 and the oracle's dtype-driven ldt reads "
   "the same bytes); the delta-rule chains, the serial-order rms and qk reductions, the double-"
@@ -1469,8 +1469,9 @@ static const RadKernelInfo kRows[] = {
   "state-idx skip, in the oracle's order -- the pair commits the conv state even when the "
   "recurrent leg then skips the row",
   "the recurrent row's scope exactly: head_k 128, head_v up to 128, per_candidate only, the "
-  "o_q/o_scale quantiser pair refused; conv_width up to 4 (the window is register-resident); "
-  "the staging smem follows the conv contract's own sequence bound, state_len - conv_width + 2",
+  "o_q/o_scale quantiser pair honoured (ref's e4m3 group epilogue); conv_width up to 4 (the "
+  "window is register-resident); the staging smem follows the conv contract's own sequence "
+  "bound, state_len - conv_width + 2",
   "bit-exact against both oracles by the same construction as the two rows it replaces, "
   "because it IS their code paths fused: the staging rounds through x's dtype, so the "
   "round trip the two-op path pays through global memory happens identically here",

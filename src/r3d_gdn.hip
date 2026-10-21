@@ -77,6 +77,35 @@ __device__ __forceinline__ uint16_t r3d_f32_to_bf16(float f) {
     if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 0x0040u);
     return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
+/* e4m3, the same encoder as r3d_band.hip's (which mirrors the ABI's rad_f32_to_fp8e4m3 that
+ * libref's st_dt uses): clamp to the largest finite, round to nearest even, subnormals exact. */
+__device__ __forceinline__ uint8_t r3d_f32_to_e4m3(float f) {
+    const uint32_t u = __float_as_uint(f);
+    const uint8_t  s = (uint8_t)((u >> 24) & 0x80u);
+    const uint32_t a = u & 0x7fffffffu;
+    if (a > 0x7f800000u) return (uint8_t)(s | 0x7fu);     /* nan */
+    if (a >= 0x43e00000u) return (uint8_t)(s | 0x7eu);    /* >= 448: clamp to the largest */
+    const int e = (int)(a >> 23) - 127;
+    uint32_t m = a & 0x7fffffu;
+    if (e < -10) return s;                                /* below half the smallest subnormal */
+    if (e < -6) {                                         /* subnormal fp8 */
+        const int sh = -6 - e + 20;
+        m |= 0x800000u;
+        const uint32_t lo = m & ((1u << sh) - 1u);
+        uint32_t q = m >> sh;
+        const uint32_t half = 1u << (sh - 1);
+        if (lo > half || (lo == half && (q & 1u))) ++q;
+        return (uint8_t)(s | q);
+    }
+    uint32_t q = m >> 20;
+    const uint32_t lo = m & 0xfffffu;
+    int ee;
+    if (lo > 0x80000u || (lo == 0x80000u && (q & 1u))) ++q;
+    ee = e + 7;
+    if (q == 0x8u) { q = 0; ++ee; }
+    if (ee > 15 || (ee == 15 && q >= 7u)) return (uint8_t)(s | 0x7eu);
+    return (uint8_t)(s | ((uint32_t)ee << 3) | q);
+}
 __device__ __forceinline__ float ldt2(const uint8_t* p, uint32_t dt, int64_t i) {
     return dt == RAD_F32 ? ((const float*)p)[i]
                          : r3d_bf16_to_f32(((const uint16_t*)p)[i]);
@@ -107,20 +136,45 @@ __device__ __forceinline__ float block_sum(float v, float* s_part) {
  * element strides within a row are 1 -- wider unit-strides are refused there, as every
  * other row of this library refuses them. z_heads > 1 selects the gate_rowoff slice
  * walk: z row = (r/z_heads)*z_tok + (r%z_heads)*ch elements. */
+/* Ref's general row view (ref_common.h rowoff): a tensor read as [rows, ch] where ch is the
+ * last dimension and a row r walks the leading dimensions with THEIR strides, so [T,H,V] is
+ * correct even when H's stride is not V. nr == 0 means the linear fallback (row pitch in
+ * elements); nr == -1 is ref's gate_rowoff heads slice. Passed by value to the kernel, which
+ * repeats the identical walk per row. */
+struct R3dRow {
+    int32_t nr;                 /* leading dims to walk (0: linear, -1: gate heads slice) */
+    int32_t shp[3];
+    int64_t str[3];
+    int64_t pitch;              /* nr == 0: row pitch, elements. nr == -1: z_tok */
+    int32_t heads;              /* nr == -1 */
+};
+
+__device__ __forceinline__ int64_t r3d_rowbase(const R3dRow& v, int64_t r) {
+    if (v.nr <= 0) {
+        if (v.nr == 0) return r * v.pitch;
+        return (r / v.heads) * v.pitch + (r % v.heads) * 0;   /* heads part added by caller */
+    }
+    int64_t off = 0;
+    for (int i = v.nr - 1; i >= 0; --i) { off += (r % v.shp[i]) * v.str[i]; r /= v.shp[i]; }
+    return off;
+}
+
 __global__ __launch_bounds__(kThreads) void gdn_gated_rmsnorm_kernel(
-    const uint8_t* __restrict__ x, uint32_t dtX, int64_t x_pitch,
-    const uint8_t* __restrict__ z, uint32_t dtZ, int64_t z_pitch,
-    int64_t z_tok, int32_t z_heads,
+    const uint8_t* __restrict__ x, uint32_t dtX, R3dRow vx,
+    const uint8_t* __restrict__ z, uint32_t dtZ, R3dRow vz, int64_t ch,
     const uint8_t* __restrict__ w, uint32_t dtW,
-    uint8_t* __restrict__ o, uint32_t dtO, int64_t o_pitch,
-    int64_t ch, float eps, int sigm) {
+    uint8_t* __restrict__ o, uint32_t dtO, R3dRow vo,
+    float eps, int sigm) {
     __shared__ float s_part[kWarps]; __shared__ float s_sc;
     const int64_t r = blockIdx.x;
-    const uint8_t* __restrict__ xb = x + r * x_pitch;
-    uint8_t* __restrict__ ob = o + r * o_pitch;
-    const int64_t zb_elems = (z_heads > 1)
-        ? (r / z_heads) * z_tok + (r % z_heads) * ch
-        : r * (z_pitch / (dtZ == RAD_F32 ? 4 : 2));
+    const int64_t ebx = (dtX == RAD_F32) ? 4 : 2, ebz = (dtZ == RAD_F32) ? 4 : 2,
+                  ebo = (dtO == RAD_F32) ? 4 : 2;
+    const uint8_t* __restrict__ xb = x + r3d_rowbase(vx, r) * ebx;
+    uint8_t* __restrict__ ob = o + r3d_rowbase(vo, r) * ebo;
+    const int64_t zbe = (vz.nr == -1)
+        ? (r / vz.heads) * vz.pitch + (r % vz.heads) * ch
+        : r3d_rowbase(vz, r);
+    const uint8_t* __restrict__ zb = z + zbe * ebz;
 
     float ss = 0.0f;
     for (int64_t i = (int64_t)threadIdx.x; i < ch; i += (int64_t)kThreads) {
@@ -132,7 +186,6 @@ __global__ __launch_bounds__(kThreads) void gdn_gated_rmsnorm_kernel(
     __syncthreads();
     const float sc = s_sc;
 
-    const uint8_t* __restrict__ zb = z + zb_elems * (dtZ == RAD_F32 ? 4 : 2);
     for (int64_t i = (int64_t)threadIdx.x; i < ch; i += (int64_t)kThreads) {
         const float zz = ldt2(zb, dtZ, i);
         const float gate = sigm ? r3d_sigmoid(zz) : zz * r3d_sigmoid(zz);
@@ -150,9 +203,25 @@ static inline int row2_pitch(const RadTensor* t, int64_t cols, int64_t* pitch) {
         *pitch = cols;
         return 0;
     }
-    if (t->rank != 2 || t->shape[1] != cols || t->stride[1] != 1) return -3;
-    *pitch = t->stride[0];
-    return 0;
+    if (t->rank == 2) {
+        if (t->stride[1] != 1) return -3;
+        /* ref's rowoff: shape[1] == cols reads the row stride; otherwise the linear
+         * fallback r*cols (a view into wider rows is read flat, as ref reads it). */
+        *pitch = (t->shape[1] == cols) ? t->stride[0] : cols;
+        return 0;
+    }
+    if (t->rank >= 3) {
+        if (t->stride[t->rank - 1] != 1) return -3;
+        if (t->shape[t->rank - 1] != cols) { *pitch = cols; return 0; }   /* ref's linear fallback */
+        /* shape[last] == cols: the leading-dim walk degenerates to r*cols exactly when
+         * the leading dims are contiguous; refuse anything else (ref walks, this kernel
+         * class pitches). */
+        for (int i = 0; i + 1 < (int)t->rank - 1; ++i)
+            if (t->stride[i] != t->shape[i + 1] * t->stride[i + 1]) return -4;
+        *pitch = cols;
+        return 0;
+    }
+    return -4;                                  /* rank 0: a degenerate shape, refused */
 }
 
 /* Index-tensor reads (i32/u32/i64), same pattern as the attention rows' ldi_w. */
@@ -515,8 +584,8 @@ __global__ __launch_bounds__(kConvThreads) void gdn_conv_update_kernel(
  *
  * SCOPE: state_form per_candidate only -- the row constrains it, so the selector never asks
  * about an anchor batch (the entry point also refuses one). The out-projection quantiser pair
- * (o_q/o_scale, absent from every recorded 27B case) is refused, not ignored: silently
- * skipping it would hand the caller unquantised rows behind its back. A negative sidx entry
+ * (o_q/o_scale, issued by the 27B decode band) writes ref's q8_group epilogue: one e4m3 group
+ * per (token, head) over the o row AS STORED, scale amax/448. A negative sidx entry
  * skips the state write for that token as ref's `so >= 0` guard does; a negative input slot
  * skips the whole (n, h) row -- output included, ref's `continue`. A_log/dt_bias/norm_w are
  * plain-scheme single-plane weights: the row reads them AS STORED (no layout hook; kbench's
@@ -542,6 +611,7 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_recurrent_update_kernel(
     const uint8_t* __restrict__ z, uint32_t dtZ, int64_t z_s0b, int64_t z_s1b,
     const uint8_t* __restrict__ nw, uint32_t dtW, int64_t w_s1b,
     uint8_t* __restrict__ o,        uint32_t dtO, int64_t o_s0b, int64_t o_s1b,
+    uint8_t* __restrict__ oq, R3dRow voq, uint8_t* __restrict__ osc, R3dRow vosc,
     int64_t V, int64_t grp, float scale, float l2eps, float neps, float spthr, int sigm) {
     const int64_t h = blockIdx.x, n = blockIdx.y, e = threadIdx.x;
     const int64_t bos  = ldi_g(dtC, cu, n);
@@ -576,6 +646,7 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_recurrent_update_kernel(
     /* The state column, one thread per value channel: a pure copy (vectorised when the row is
      * dense f32 and aligned, which the slot grid at 512-byte strides is for every page layout). */
     float st[kRecK];
+    float sv = 0.0f;                 /* the o value AS STORED: ref's quantiser reads it back */
     if (own) {
         const uint8_t* __restrict__ sb = stb + slot_in * st_s0b + e * st_s2b;
         if (dtST == RAD_F32 && ((uintptr_t)sb & 15u) == 0) {
@@ -646,8 +717,33 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_recurrent_update_kernel(
                 r *= sigm ? r3d_sigmoid(zz) : zz * r3d_sigmoid(zz);
             }
             stt2(ob + tok * o_s0b, dtO, e, r);
+            sv = (dtO == RAD_F32) ? r : r3d_bf16_to_f32(r3d_f32_to_bf16(r));
         } else {
             __syncthreads(); __syncthreads();
+        }
+
+        if (oq) {
+            /* ref's quantiser (ref_common.h q8_group, top 448): one group per (token, head)
+             * over the o row AS STORED (bf16 o quantises bf16-rounded values, as ref's ldt
+             * after its stt sees). The scale is amax/448, 1.0 for an all-zero group; the codes
+             * clamp to +-448 and encode e4m3. Row bases walk ref's rowoff: the head axis is
+             * the block's, the channel axis the owning threads'. Block-uniform `oq`, so the
+             * barriers here are as legal as the norm's pair above. */
+            s_orow[e] = sv < 0.0f ? -sv : sv;      /* idle threads write 0; amax walks < V */
+            __syncthreads();
+            if (e == 0) {
+                float amax = 0.0f;
+                for (int64_t i = 0; i < V; ++i) { const float m = s_orow[i]; if (m > amax) amax = m; }
+                s_sc = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
+            }
+            __syncthreads();
+            if (own) {
+                float c = sv * (1.0f / s_sc);
+                if (c > 448.0f) c = 448.0f;
+                if (c < -448.0f) c = -448.0f;
+                oq[r3d_rowbase(voq, tok) + h * V + e] = r3d_f32_to_e4m3(c);
+                if (e == 0) ((float*)(osc + r3d_rowbase(vosc, tok) * 4))[h] = s_sc;
+            }
         }
 
         const int64_t so = ldi_g(dtS, (const uint8_t*)sidx + n * si_s0b +
@@ -851,6 +947,7 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kern
     const uint8_t* __restrict__ z, uint32_t dtZ, int64_t z_s0b, int64_t z_s1b,
     const uint8_t* __restrict__ nw, uint32_t dtNW, int64_t w_s1b,
     uint8_t* __restrict__ o,        uint32_t dtO, int64_t o_s0b, int64_t o_s1b,
+    uint8_t* __restrict__ oq, R3dRow voq, uint8_t* __restrict__ osc, R3dRow vosc,
     int64_t HgK, int64_t K2, int64_t V, int64_t grp, int32_t width,
     float scale, float l2eps, float neps, float spthr, int sigm) {
     const int64_t h = blockIdx.x, n = blockIdx.y, e = threadIdx.x;
@@ -945,6 +1042,7 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kern
     __shared__ float s_bc[4], s_sc;
 
     float st[kRecK];
+    float sv = 0.0f;                 /* the o value AS STORED: ref's quantiser reads it back */
     if (own) {
         const uint8_t* __restrict__ sb = stb + slot_in * st_s0b + e * st_s2b;
         if (dtST == RAD_F32 && ((uintptr_t)sb & 15u) == 0) {
@@ -1013,8 +1111,33 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kern
                 r *= sigm ? r3d_sigmoid(zz) : zz * r3d_sigmoid(zz);
             }
             stt2(ob + tok * o_s0b, dtO, e, r);
+            sv = (dtO == RAD_F32) ? r : r3d_bf16_to_f32(r3d_f32_to_bf16(r));
         } else {
             __syncthreads(); __syncthreads();
+        }
+
+        if (oq) {
+            /* ref's quantiser (ref_common.h q8_group, top 448): one group per (token, head)
+             * over the o row AS STORED (bf16 o quantises bf16-rounded values, as ref's ldt
+             * after its stt sees). The scale is amax/448, 1.0 for an all-zero group; the codes
+             * clamp to +-448 and encode e4m3. Row bases walk ref's rowoff: the head axis is
+             * the block's, the channel axis the owning threads'. Block-uniform `oq`, so the
+             * barriers here are as legal as the norm's pair above. */
+            s_orow[e] = sv < 0.0f ? -sv : sv;      /* idle threads write 0; amax walks < V */
+            __syncthreads();
+            if (e == 0) {
+                float amax = 0.0f;
+                for (int64_t i = 0; i < V; ++i) { const float m = s_orow[i]; if (m > amax) amax = m; }
+                s_sc = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
+            }
+            __syncthreads();
+            if (own) {
+                float c = sv * (1.0f / s_sc);
+                if (c > 448.0f) c = 448.0f;
+                if (c < -448.0f) c = -448.0f;
+                oq[r3d_rowbase(voq, tok) + h * V + e] = r3d_f32_to_e4m3(c);
+                if (e == 0) ((float*)(osc + r3d_rowbase(vosc, tok) * 4))[h] = s_sc;
+            }
         }
 
         const int64_t so = ldi_g(dtS, (const uint8_t*)sidx + n * si_s0b +
@@ -1063,33 +1186,48 @@ extern "C" int r3d_rad_gdn_gated_rmsnorm(const RadArgs* a, RadStream s) {
     if (act && !sigm && std::strcmp(act, "silu")) return RAD_E_UNSUPPORTED;
 
     const int64_t rows = rad_tensor_numel(x) / ch;
-    if (rows <= 0 || rows > 0xffff) return RAD_E_SHAPE;
+    if (rows <= 0 || rows > 0x1000000) return RAD_E_SHAPE;
     if (rad_tensor_numel(o) < rows * ch || rad_tensor_numel(z) < rows * ch) return RAD_E_SHAPE;
     if (rad_tensor_numel(w) < ch) return RAD_E_SHAPE;
     if (w->rank != 1 || w->stride[0] != 1) return RAD_E_STRIDE;
 
-    int64_t xp, op;
-    if (row2_pitch(x, ch, &xp)) return RAD_E_STRIDE;
-    if (row2_pitch(o, ch, &op)) return RAD_E_STRIDE;
-
-    /* The gate: a plain [rows, ch] row, or ref's gate_rowoff slice -- rank-2 whose row
-     * is heads*ch wide, read heads-at-a-time. A rank-1 z is the single-row case. */
-    int64_t z_pitch = 0, z_tok = 0; int32_t z_heads = 1;
+    /* Row addressing per ref's rowoff: last dim == ch walks the leading dims with their own
+     * strides (a [T,H,V] read as [T*H,V] stays correct when H's stride is not V); the linear
+     * fallback covers rank-1 and last-dim != ch. Within-row unit stride required (as every
+     * row here demands). */
+    auto rms_view = [&](const RadTensor* t, R3dRow* v) -> int {
+        std::memset(v, 0, sizeof *v);
+        if (!t->data || t->rank == 0) return -1;
+        if (t->stride[t->rank - 1] != 1) return -2;
+        if (t->rank >= 2 && t->shape[t->rank - 1] == ch) {
+            const int nr = (int)t->rank - 1;
+            if (nr > 3) return -3;
+            for (int i = 0; i < nr; ++i) {
+                if (t->shape[i] <= 0) return -4;
+                v->shp[i] = (int32_t)t->shape[i]; v->str[i] = t->stride[i];
+            }
+            v->nr = nr;
+            return 0;
+        }
+        v->nr = 0; v->pitch = ch;
+        return 0;
+    };
+    R3dRow vx{}, vz{}, vo{};
+    if (rms_view(x, &vx)) return RAD_E_STRIDE;
+    if (rms_view(o, &vo)) return RAD_E_STRIDE;
+    /* The gate: ref's gate_rowoff slice first -- rank-2 whose row is heads*ch wide, read
+     * heads-at-a-time -- else the same walk. A rank-1 z is the single-row case. */
     if (z->rank == 2 && z->shape[1] != ch && z->shape[1] % ch == 0 && z->stride[1] == 1) {
-        z_heads = (int32_t)(z->shape[1] / ch);
-        z_tok = z->stride[0];
-    } else if (row2_pitch(z, ch, &z_pitch)) {
-        return RAD_E_STRIDE;
-    }
+        vz.nr = -1; vz.heads = (int32_t)(z->shape[1] / ch); vz.pitch = z->stride[0];
+    } else if (rms_view(z, &vz)) return RAD_E_STRIDE;
 
     gdn_gated_rmsnorm_kernel<<<dim3((uint32_t)rows), dim3(kThreads), 0,
                                (hipStream_t)(uintptr_t)s>>>(
-        (const uint8_t*)x->data, x->dtype, rad_dtype_bytes(x->dtype, xp),
-        (const uint8_t*)z->data, z->dtype, rad_dtype_bytes(z->dtype, z_pitch),
-        z_tok, z_heads,
+        (const uint8_t*)x->data, x->dtype, vx,
+        (const uint8_t*)z->data, z->dtype, vz, ch,
         (const uint8_t*)w->data, w->dtype,
-        (uint8_t*)o->data, o->dtype, rad_dtype_bytes(o->dtype, op),
-        ch, eps, sigm);
+        (uint8_t*)o->data, o->dtype, vo,
+        eps, sigm);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
@@ -1416,8 +1554,45 @@ extern "C" int r3d_rad_gdn_chunk_scan(const RadArgs* a, RadStream s) {
  * weight operands are read AS STORED through ldt2, dtype-driven exactly like ref's ldt: the
  * 27B container stores them plain bf16, a single plane each, so kbench's weight filter accepts
  * the hookless row and both sides see the same bytes. o_q/o_scale (the folded out-projection
- * quantiser) are refused, never ignored. A paged state cache keeps its strides read off the
- * tensor at rank >= 4 (page padding included). */
+ * quantiser) are honoured when both are present, as ref's epilogue defines them. A paged state
+ * cache keeps its strides read off the tensor at rank >= 4 (page padding included). */
+/* The quantiser pair (o_q, o_scale), ref's contract: enabled only when BOTH operands carry
+ * data (a lone member is ignored, exactly as ref's `if (oq && osc)` reads it), the fp8 plane
+ * is e4m3 and the scale plane f32, both unit last-stride (the library-wide refusal of wider
+ * unit axes). Both are read through ref's rowoff view: last extent == cols walks the leading
+ * dims with their own strides, everything else is the flat r*cols fallback. */
+static int r3d_qpair_view(const RadTensor* oq, const RadTensor* osc, int64_t T, int64_t Hv,
+                          int64_t Vd, bool* on, R3dRow* voq, R3dRow* vosc) {
+    *on = false;
+    std::memset(voq, 0, sizeof *voq); std::memset(vosc, 0, sizeof *vosc);
+    if (!oq || !oq->data || !osc || !osc->data) return RAD_OK;
+    if (oq->dtype != RAD_F8E4M3 || osc->dtype != RAD_F32) return RAD_E_DTYPE;
+    if (oq->rank < 1 || osc->rank < 1) return RAD_E_SHAPE;
+    if (oq->stride[oq->rank - 1] != 1 || osc->stride[osc->rank - 1] != 1) return RAD_E_STRIDE;
+    if (rad_tensor_numel(oq) < T * Hv * Vd || rad_tensor_numel(osc) < T * Hv) return RAD_E_SHAPE;
+    const RadTensor* ts[2] = { oq, osc };
+    const int64_t cols[2] = { Hv * Vd, Hv };
+    R3dRow* vs[2] = { voq, vosc };
+    for (int s = 0; s < 2; ++s) {
+        const RadTensor* t = ts[s];
+        if (t->rank >= 2 && t->shape[t->rank - 1] == cols[s]) {     /* ref's rowoff walk */
+            if (t->rank > 4) return RAD_E_UNSUPPORTED;
+            R3dRow* v = vs[s];
+            v->nr = (int32_t)(t->rank - 1);
+            int64_t rows = 1;
+            for (int i = 0; i < v->nr; ++i) {
+                v->shp[i] = (int32_t)t->shape[i]; v->str[i] = t->stride[i];
+                rows *= t->shape[i];
+            }
+            if (rows < T) return RAD_E_SHAPE;
+        } else {
+            vs[s]->nr = 0; vs[s]->pitch = cols[s];                  /* ref's linear fallback */
+        }
+    }
+    *on = true;
+    return RAD_OK;
+}
+
 extern "C" int r3d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
     const RadTensor* q    = rad_arg_in(a, 0);
     const RadTensor* k    = rad_arg_in(a, 1);
@@ -1433,11 +1608,11 @@ extern "C" int r3d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
     const RadTensor* z    = rad_arg_in(a, 11);       /* optional: absent means no gate */
     const RadTensor* nw   = rad_arg_in(a, 12);       /* optional */
     const RadTensor* o    = rad_arg_in(a, 13);
-    if (!q || !k || !v || !av || !bv || !st || !sidx || !nacc || !cu || !o) return RAD_E_INVAL;
-    /* The quantiser pair, all-or-nothing on ref's reading; ours is not implemented, and quietly
-     * dropping it would leave the caller's fp8 output plane stale. */
-    if ((rad_arg_in(a, 14) && rad_arg_in(a, 14)->data) ||
-        (rad_arg_in(a, 15) && rad_arg_in(a, 15)->data)) return RAD_E_UNSUPPORTED;
+    const RadTensor* oq   = rad_arg_in(a, 14);       /* optional fp8 quantiser pair */
+    const RadTensor* osc  = rad_arg_in(a, 15);
+    /* num_accepted is schema-required but a drafter-less serve issues it null; ref reads it
+     * null-tolerantly (absent == 1), so this row must not demand it. */
+    if (!q || !k || !v || !av || !bv || !st || !sidx || !cu || !o) return RAD_E_INVAL;
 
     const char* sf = rad_args_gets(a, "state_form");
     if (sf && std::strcmp(sf, "per_candidate") != 0) return RAD_E_UNSUPPORTED;   /* anchor: r4d's */
@@ -1450,7 +1625,7 @@ extern "C" int r3d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
         (alog_on && !dt2_ok(alog->dtype)) || (dtb_on && !dt2_ok(dtb->dtype)) ||
         (z_on && !dt2_ok(z->dtype)) || (nw_on && !dt2_ok(nw->dtype))) return RAD_E_DTYPE;
     if (!idx_dt_ok(cu->dtype) || !idx_dense(cu)) return RAD_E_STRIDE;
-    if (!idx_dt_ok(nacc->dtype) || !idx_dense(nacc)) return RAD_E_STRIDE;
+    if (nacc && (!idx_dt_ok(nacc->dtype) || !idx_dense(nacc))) return RAD_E_STRIDE;
     if (!idx_dt_ok(sidx->dtype)) return RAD_E_DTYPE;
 
     long long K_ll = 0, V_ll = 0;
@@ -1479,7 +1654,7 @@ extern "C" int r3d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
     if (rad_tensor_numel(k) < T * Hg * Kd) return RAD_E_SHAPE;
     if (rad_tensor_numel(o) < T * Hv * Vd) return RAD_E_SHAPE;
     if (rad_tensor_numel(av) < T * Hv || rad_tensor_numel(bv) < T * Hv) return RAD_E_SHAPE;
-    if (rad_tensor_numel(nacc) < N) return RAD_E_SHAPE;
+    if (nacc && rad_tensor_numel(nacc) < N) return RAD_E_SHAPE;
 
     /* state_idx: ref reads at2(si, n, col) with si = v2(sidx, sw), sw = shape[rank-1]; accept
      * rank >= 2 with a unit last stride and rows >= N. */
@@ -1543,6 +1718,9 @@ extern "C" int r3d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
     rc = vec_ok(dtb_on ? dtb : nullptr, Hv, &db_s1);   if (rc) return rc;
     rc = vec_ok(nw_on ? nw : nullptr, Vd, &w_s1);      if (rc) return rc;
 
+    bool q_on = false; R3dRow voq, vosc;
+    int rq = r3d_qpair_view(oq, osc, T, Hv, Vd, &q_on, &voq, &vosc); if (rq) return rq;
+
     gdn_recurrent_update_kernel<<<dim3((uint32_t)Hv, (uint32_t)N), dim3(kRecThreads), 0,
                                   (hipStream_t)(uintptr_t)s>>>(
         (const uint8_t*)q->data, q->dtype, rad_dtype_bytes(q->dtype, q_s0), rad_dtype_bytes(q->dtype, q_s1),
@@ -1559,13 +1737,14 @@ extern "C" int r3d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
         rad_dtype_bytes(st->dtype, st_s2),
         sidx->data, sidx->dtype, rad_dtype_bytes(sidx->dtype, si_s0),
         rad_dtype_bytes(sidx->dtype, si_s1), sw,
-        nacc->data, nacc->dtype,
+        nacc ? nacc->data : nullptr, nacc ? nacc->dtype : 0,
         cu->data, cu->dtype,
         z_on ? (const uint8_t*)z->data : nullptr, z_on ? z->dtype : 0,
         z_on ? rad_dtype_bytes(z->dtype, z_s0) : 0, z_on ? rad_dtype_bytes(z->dtype, z_s1) : 0,
         nw_on ? (const uint8_t*)nw->data : nullptr, nw_on ? nw->dtype : 0,
         nw_on ? rad_dtype_bytes(nw->dtype, w_s1) : 0,
         (uint8_t*)o->data, o->dtype, rad_dtype_bytes(o->dtype, o_s0), rad_dtype_bytes(o->dtype, o_s1),
+        q_on ? (uint8_t*)oq->data : nullptr, voq, q_on ? (uint8_t*)osc->data : nullptr, vosc,
         Vd, Hv / Hg, (float)scale_d, (float)l2_d, (float)eps_d, (float)thr_d, sigm);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
@@ -1643,9 +1822,14 @@ extern "C" int r3d_rad_gdn_conv_prep(const RadArgs* a, RadStream s) {
     const int64_t xrow = x->rank >= 2 ? x->stride[x->rank - 2] : xneed;
     if (x->rank >= 2) {
         if (x->stride[x->rank - 1] != 1) return RAD_E_STRIDE;
-        if (x->shape[x->rank - 1] < xneed) return RAD_E_SHAPE;
-    } else if (x->stride[0] != 1) return RAD_E_STRIDE;
-    if (rad_tensor_numel(x) < (T - 1) * xrow + xneed) return RAD_E_SHAPE;
+        /* Bound by the VIEW, as ref does: `x` may be the left conv_dim columns of a wider
+         * projection row (sliced at issue, like the fp8 block's fused [q|k|v|z] projection),
+         * whose numel undercounts. Only a flattened operand is bounded by numel. */
+        if (x->shape[x->rank - 1] < xneed || x->shape[x->rank - 2] < T) return RAD_E_SHAPE;
+    } else {
+        if (x->stride[0] != 1) return RAD_E_STRIDE;
+        if (rad_tensor_numel(x) < (T - 1) * xrow + xneed) return RAD_E_SHAPE;
+    }
 
     /* w: v2(w, width); b: element c of a dense row. */
     const int64_t w_s0 = w->rank >= 2 ? w->stride[w->rank - 2] : width;
@@ -1762,10 +1946,12 @@ extern "C" int r3d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
     const RadTensor* z    = rad_arg_in(a, 13);       /* optional */
     const RadTensor* nw   = rad_arg_in(a, 14);       /* optional */
     const RadTensor* o    = rad_arg_in(a, 15);
-    if (!x || !w || !cs || !cidx || !av || !bv || !st || !sidx || !nacc || !cu || !o)
+    const RadTensor* oq   = rad_arg_in(a, 16);       /* optional fp8 quantiser pair */
+    const RadTensor* osc  = rad_arg_in(a, 17);
+    /* num_accepted: schema-required, issued null by a drafter-less serve. Ref treats the
+     * absence as 1; the kernel here does the same (`na = nacc ? load : 1`). */
+    if (!x || !w || !cs || !cidx || !av || !bv || !st || !sidx || !cu || !o)
         return RAD_E_INVAL;
-    if ((rad_arg_in(a, 16) && rad_arg_in(a, 16)->data) ||
-        (rad_arg_in(a, 17) && rad_arg_in(a, 17)->data)) return RAD_E_UNSUPPORTED;
     const char* sf = rad_args_gets(a, "state_form");
     if (sf && std::strcmp(sf, "per_candidate") != 0) return RAD_E_UNSUPPORTED;
 
@@ -1778,7 +1964,7 @@ extern "C" int r3d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
         (dtb_on && !dt2_ok(dtb->dtype)) || (z_on && !dt2_ok(z->dtype)) ||
         (nw_on && !dt2_ok(nw->dtype))) return RAD_E_DTYPE;
     if (!idx_dt_ok(cu->dtype) || !idx_dense(cu)) return RAD_E_STRIDE;
-    if (!idx_dt_ok(nacc->dtype) || !idx_dense(nacc)) return RAD_E_STRIDE;
+    if (nacc && (!idx_dt_ok(nacc->dtype) || !idx_dense(nacc))) return RAD_E_STRIDE;
     if (!idx_dt_ok(cidx->dtype) || !idx_dense(cidx)) return RAD_E_STRIDE;
     if (!idx_dt_ok(sidx->dtype)) return RAD_E_DTYPE;
 
@@ -1802,13 +1988,14 @@ extern "C" int r3d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
     if (N <= 0 || N > 0xffff) return RAD_E_SHAPE;
     if (rad_tensor_numel(o) < T * Hv * Vd) return RAD_E_SHAPE;
     if (rad_tensor_numel(av) < T * Hv || rad_tensor_numel(bv) < T * Hv) return RAD_E_SHAPE;
-    if (rad_tensor_numel(nacc) < N || rad_tensor_numel(cidx) < N) return RAD_E_SHAPE;
+    if ((nacc && rad_tensor_numel(nacc) < N) || rad_tensor_numel(cidx) < N) return RAD_E_SHAPE;
     if (rad_tensor_numel(w) < conv_dim * width) return RAD_E_SHAPE;
 
-    /* x: [T, conv_dim] dense-row; w: v2(w, width); conv_b: element c of a dense row. */
+    /* x: rows of stride xrow, the left conv_dim columns (a view of a wider projection row is
+     * legal -- bound by the view's shape, not its numel, exactly as ref does). */
     const int64_t xrow = x->stride[x->rank - 2];
     if (x->stride[x->rank - 1] != 1) return RAD_E_STRIDE;
-    if (rad_tensor_numel(x) < (T - 1) * xrow + conv_dim) return RAD_E_SHAPE;
+    if (x->shape[x->rank - 2] < T) return RAD_E_SHAPE;
     const int64_t w_s0 = w->rank >= 2 ? w->stride[w->rank - 2] : width;
     if (w->rank >= 2 && w->stride[w->rank - 1] != 1) return RAD_E_STRIDE;
     if (cb_on && (cb->rank == 0 || cb->stride[cb->rank - 1] != 1)) return RAD_E_STRIDE;
@@ -1868,6 +2055,9 @@ extern "C" int r3d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
     rc = vec_ok(dtb_on ? dtb : nullptr, Hv, &db_s1);   if (rc) return rc;
     rc = vec_ok(nw_on ? nw : nullptr, Vd, &w_s1);      if (rc) return rc;
 
+    bool q_on = false; R3dRow voq, vosc;
+    int rq = r3d_qpair_view(oq, osc, T, Hv, Vd, &q_on, &voq, &vosc); if (rq) return rq;
+
     const double scale_d = rad_args_getf_or(a, "scale", 1.0);
     const double eps_d   = rad_args_getf_or(a, "eps", 1e-6);
     const double l2_d    = rad_args_getf_or(a, "l2_eps", 1e-6);
@@ -1903,13 +2093,14 @@ extern "C" int r3d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
         rad_dtype_bytes(st->dtype, st_s2),
         sidx->data, sidx->dtype, rad_dtype_bytes(sidx->dtype, si_s0),
         rad_dtype_bytes(sidx->dtype, si_s1), sw,
-        nacc->data, nacc->dtype,
+        nacc ? nacc->data : nullptr, nacc ? nacc->dtype : 0,
         cu->data, cu->dtype,
         z_on ? (const uint8_t*)z->data : nullptr, z_on ? z->dtype : 0,
         z_on ? rad_dtype_bytes(z->dtype, z_s0) : 0, z_on ? rad_dtype_bytes(z->dtype, z_s1) : 0,
         nw_on ? (const uint8_t*)nw->data : nullptr, nw_on ? nw->dtype : 0,
         nw_on ? rad_dtype_bytes(nw->dtype, w_s1) : 0,
         (uint8_t*)o->data, o->dtype, rad_dtype_bytes(o->dtype, o_s0), rad_dtype_bytes(o->dtype, o_s1),
+        q_on ? (uint8_t*)oq->data : nullptr, voq, q_on ? (uint8_t*)osc->data : nullptr, vosc,
         Hg * Kd, 2 * Hg * Kd, Vd, Hv / Hg, w32,
         (float)scale_d, (float)l2_d, (float)eps_d, (float)thr_d, sigm);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
