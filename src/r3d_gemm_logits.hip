@@ -33,6 +33,7 @@
 #include <cstdlib>
 
 #include "rad_abi.h"
+#include "r3d_dump.h"
 #include "rad_plugin.h"   /* rad_arg_in / rad_tensor_numel (host-side entry helpers) */
 #include "rad_planes.h"
 
@@ -140,7 +141,10 @@ void logits_e4m3_kernel(const uint16_t* __restrict__ X, int64_t x_pitch,
 
 /* ------------------------------------------------------------------ row entry */
 
-extern "C" int r3d_rad_logits_gemm_e4m3(const RadArgs* a, RadStream s) {
+static int logits_gemm_e4m3_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_logits_gemm_e4m3(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("logits_gemm_e4m3", logits_gemm_e4m3_impl)
+static int logits_gemm_e4m3_impl(const RadArgs* a, RadStream s) {
     const RadTensor* X = rad_arg_in(a, 0);
     const RadTensor* W = rad_arg_in(a, 1);
     const RadTensor* Y = rad_arg_in(a, 2);

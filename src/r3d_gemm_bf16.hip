@@ -28,6 +28,7 @@
  */
 
 #include <hip/hip_runtime.h>
+#include "r3d_dump.h"
 
 #include <cstdlib>
 
@@ -271,10 +272,16 @@ static int gemm_nt_launch(const RadArgs* a, RadStream s, const char* n_name, con
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
-extern "C" int r3d_rad_gemm_nt(const RadArgs* a, RadStream s) {
+static int r3d_gemm_nt_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gemm_nt(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("gemm_nt_bf16", r3d_gemm_nt_impl)
+static int r3d_gemm_nt_impl(const RadArgs* a, RadStream s) {
     return gemm_nt_launch(a, s, "N", "K");
 }
 
-extern "C" int r3d_rad_logits_gemm(const RadArgs* a, RadStream s) {
+static int r3d_logits_gemm_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_logits_gemm(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("logits_gemm_bf16", r3d_logits_gemm_impl)
+static int r3d_logits_gemm_impl(const RadArgs* a, RadStream s) {
     return gemm_nt_launch(a, s, "n_vocab", "n_embd");
 }

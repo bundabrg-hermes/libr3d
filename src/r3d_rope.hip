@@ -26,6 +26,7 @@
  */
 
 #include <cstring>
+#include "r3d_dump.h"
 
 #include <hip/hip_runtime.h>
 
@@ -128,7 +129,10 @@ __global__ __launch_bounds__(kThreads) void rope_imrope_kernel(
 } /* anonymous namespace */
 
 /* Launch entry. Operands positional in the rope schema: qkv (INOUT), positions (IN). */
-extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
+static int r3d_rope_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("rope_bf16", r3d_rope_impl)
+static int r3d_rope_impl(const RadArgs* a, RadStream s) {
     const RadTensor* qkv = rad_arg_in(a, 0);   /* INOUT role: read as descriptor, written via data */
     const RadTensor* pos = rad_arg_in(a, 1);
     if (!qkv || !pos) return RAD_E_INVAL;
@@ -308,7 +312,10 @@ __global__ __launch_bounds__(kThreads) void rope_table_kernel(
     }
 }
 
-extern "C" int r3d_rad_rope_table(const RadArgs* a, RadStream s) {
+static int r3d_rope_table_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_rope_table(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("rope_table_f32", r3d_rope_table_impl)
+static int r3d_rope_table_impl(const RadArgs* a, RadStream s) {
     const RadTensor* pos = rad_arg_in(a, 0);
     const RadTensor* cs  = rad_arg_in(a, 1);
     if (!pos || !cs) return RAD_E_INVAL;

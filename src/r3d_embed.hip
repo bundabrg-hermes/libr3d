@@ -20,6 +20,7 @@
  */
 
 #include <hip/hip_runtime.h>
+#include "r3d_dump.h"
 
 #include "rad_abi.h"
 #include "rad_plugin.h"
@@ -60,7 +61,10 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_kernel(
 } /* anonymous namespace */
 
 /* Launch entry, operands positional in libref's embed_lookup schema order: tokens, wte, x. */
-extern "C" int r3d_rad_embed_lookup(const RadArgs* a, RadStream s) {
+static int r3d_embed_lookup_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_embed_lookup(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("embed_lookup", r3d_embed_lookup_impl)
+static int r3d_embed_lookup_impl(const RadArgs* a, RadStream s) {
     const RadTensor* tok = rad_arg_in(a, 0);
     const RadTensor* wte = rad_arg_in(a, 1);
     const RadTensor* x   = rad_arg_in(a, 2);

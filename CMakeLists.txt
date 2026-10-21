@@ -63,7 +63,7 @@ rad_add_plugin(libr3d kernels
               src/r3d_attn_paged.hip
               src/r3d_attn_paged_wmma.hip src/r3d_attn_paged_decode.hip
               src/r3d_sample.hip
-              src/r3d_band.hip src/r3d_more.hip src/r3d_gdn.hip
+              src/r3d_band.hip src/r3d_more.hip src/r3d_gdn.hip src/r3d_dump.hip
   GPU_TARGETS ${R3D_GPU_TARGETS}
   INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR}/src)
 

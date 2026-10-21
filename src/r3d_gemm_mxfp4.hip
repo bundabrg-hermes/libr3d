@@ -48,6 +48,7 @@
  */
 
 #include <hip/hip_runtime.h>
+#include "r3d_dump.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -342,7 +343,10 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_m64_kernel(
  * Positions follow oGemmNtQ (a, a_scale, b, b_scale, y, a_sum?, b_ref?). Every refusal
  * is RAD_E_UNSUPPORTED so the engine may answer from another row or the reference --
  * this is a format gate first, a shape gate second. */
-extern "C" int r3d_rad_gemm_nt_q(const RadArgs* a, RadStream s) {
+static int r3d_gemm_nt_q_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gemm_nt_q(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("gemm_nt_q", r3d_gemm_nt_q_impl)
+static int r3d_gemm_nt_q_impl(const RadArgs* a, RadStream s) {
     static const bool no_mxfp4 = getenv("R3D_NO_MXFP4") != nullptr;
     if (no_mxfp4) return RAD_E_UNSUPPORTED;
 

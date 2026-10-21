@@ -52,6 +52,7 @@
 #include <hip/hip_runtime.h>
 
 #include "rad_abi.h"
+#include "r3d_dump.h"
 #include "rad_plugin.h"
 
 namespace {
@@ -239,9 +240,12 @@ __device__ __forceinline__ int64_t ldi_g(uint32_t dt, const void* p, int64_t i) 
  * ref_gdn.cpp's spec, and the 27B chunked path's second op (head_k 128, chunk 64, k/A bf16,
  * beta/g f32, cu i32/i64, M 1..512 in the recorded band).
  *
- * One block per (chunk, sequence, v head): chunks are independent by construction (each one's
- * A reads only its own tokens' k/beta/g), so the chunk index is a free grid axis -- it is what
- * fills the CUs at prefill M, where ref's N*H parallelism would idle most of the card.
+ * One block per (v head, sequence, chunk): chunks are independent by construction (each one's
+ * A reads only its own tokens' k/beta/g), so every axis is free — heads ride x because
+ * radiance's AQL backend loses dispatches whose gridDim.x is 1 (serve27dmp4: with a short
+ * prefill (T <= chunk, chunks == 1) the head-outer grid put x=1, the dispatch reached no
+ * hardware — poison in A survived the whole window — while the same entry on the raw
+ * default stream solved A byte-exact). At prefill M the head axis is also what fills the CUs.
  *
  * BIT-EXACT BY CONSTRUCTION against ref's forward substitution, which is why this row skips
  * libr4d's WMMA 16->32->64 blocked merge: ref's inverse chain per column is
@@ -270,16 +274,23 @@ __global__ __launch_bounds__(kKktThreads) void gdn_kkt_solve_kernel(
     uint8_t* __restrict__ A,        uint32_t dtA, int64_t A_s0b, int64_t A_s1b,
     const void* __restrict__ cu, uint32_t dtC,
     int64_t grp, int64_t Kd) {
-    const int64_t h = blockIdx.z, n = blockIdx.y;
+    const int64_t h = blockIdx.x, n = blockIdx.y;
     const int64_t bos  = ldi_g(dtC, cu, n), slen = ldi_g(dtC, cu, n + 1) - bos;
-    const int64_t c0 = (int64_t)blockIdx.x * kKktChunk;
+    const int64_t c0 = (int64_t)blockIdx.z * kKktChunk;
     if (c0 >= slen) return;
     const int64_t L = (slen - c0 < kKktChunk) ? slen - c0 : kKktChunk;
     const int64_t hk = h / grp, tb = bos + c0;
     const uint8_t* __restrict__ kbh = k + hk * k_s1b;
 
-    __shared__ float s_M[kKktTri];                    /* strict lower M[i][j], j < i, at i*(i-1)/2+j */
-    __shared__ float s_col[kKktChunk * (kKktChunk + 1)]; /* per-thread column, stride kKktChunk+1 */
+    /* One dynamic array, carved by hand — the gdn_chunk_scan pattern, which radiance's AQL
+     * backend dispatches verbatim under serve. The kkt row's all-static 25 KB version was
+     * the ONLY row in the 27B band set whose dispatch reached no hardware (poison in the
+     * output span survived the whole launch window, while the identical entry launched
+     * from the raw default stream solved A byte-exact). Small statics stay static, as in
+     * chunk_scan; only the two large arrays go through the dynamic argument. */
+    extern __shared__ float s_dyn[];                    /* [kKktTri + chunk*(chunk+1)] */
+    float* const s_M   = s_dyn;                         /* strict lower M[i][j], j < i, at i*(i-1)/2+j */
+    float* const s_col = s_dyn + kKktTri;               /* per-thread column, stride kKktChunk+1 */
     __shared__ float s_g[kKktChunk], s_b[kKktChunk];
 
     if ((int64_t)threadIdx.x < L) {
@@ -1160,7 +1171,10 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kern
 
 } /* anonymous namespace */
 
-extern "C" int r3d_rad_gdn_gated_rmsnorm(const RadArgs* a, RadStream s) {
+static int r3d_gdn_gated_rmsnorm_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gdn_gated_rmsnorm(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("gdn_gated_rmsnorm_bf16", r3d_gdn_gated_rmsnorm_impl)
+static int r3d_gdn_gated_rmsnorm_impl(const RadArgs* a, RadStream s) {
     const RadTensor* x = rad_arg_in(a, 0);
     const RadTensor* z = rad_arg_in(a, 1);
     const RadTensor* w = rad_arg_in(a, 2);
@@ -1246,7 +1260,10 @@ static inline int idx_dt_ok(uint32_t dt) {
     return dt == RAD_I32 || dt == RAD_U32 || dt == RAD_I64;
 }
 
-extern "C" int r3d_rad_gdn_conv_update(const RadArgs* a, RadStream s) {
+static int r3d_gdn_conv_update_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gdn_conv_update(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("gdn_conv_update_bf16", r3d_gdn_conv_update_impl)
+static int r3d_gdn_conv_update_impl(const RadArgs* a, RadStream s) {
     const RadTensor* x   = rad_arg_in(a, 0);
     const RadTensor* w   = rad_arg_in(a, 1);
     const RadTensor* b   = rad_arg_in(a, 2);          /* optional */
@@ -1350,7 +1367,10 @@ extern "C" int r3d_rad_gdn_conv_update(const RadArgs* a, RadStream s) {
 /* gdn_kkt_solve: verbatim libref operand list (k, beta, g, cu in; A out). The derivation
  * rule (H = numel(beta)/T, Hg = numel(k)/(T*head_k)) is ref's, and so is chunk's fallback
  * to A's trailing shape when the derived parameter is absent. */
-extern "C" int r3d_rad_gdn_kkt_solve(const RadArgs* a, RadStream s) {
+static int gdn_kkt_solve_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gdn_kkt_solve(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("gdn_kkt_solve_bf16", gdn_kkt_solve_impl)
+static int gdn_kkt_solve_impl(const RadArgs* a, RadStream s) {
     const RadTensor* k   = rad_arg_in(a, 0);
     const RadTensor* bt  = rad_arg_in(a, 1);
     const RadTensor* g   = rad_arg_in(a, 2);
@@ -1409,8 +1429,13 @@ extern "C" int r3d_rad_gdn_kkt_solve(const RadArgs* a, RadStream s) {
     const int64_t A_s1 = A->rank >= 3 ? A->stride[A->rank - 2] : chunk;
     if (A->rank >= 3 && A->stride[A->rank - 1] != 1) return RAD_E_STRIDE;
 
-    gdn_kkt_solve_kernel<<<dim3((uint32_t)chunks, (uint32_t)N, (uint32_t)H),
-                           dim3(kKktThreads), 0, (hipStream_t)(uintptr_t)s>>>(
+    /* Dynamic smem: the carved s_M + s_col (see the kernel). radiance's AQL backend dropped
+     * the all-static-LDS form of this dispatch under serve — the carve is chunk_scan's
+     * proven pattern; the bytes are identical, only their reservation moves. */
+    constexpr uint32_t kKktShm = (uint32_t)((size_t)kKktTri +
+                                            (size_t)kKktChunk * (kKktChunk + 1)) * sizeof(float);
+    gdn_kkt_solve_kernel<<<dim3((uint32_t)H, (uint32_t)N, (uint32_t)chunks),
+                           dim3(kKktThreads), kKktShm, (hipStream_t)(uintptr_t)s>>>(
         (const uint8_t*)k->data,  k->dtype,  rad_dtype_bytes(k->dtype, k_s0),  rad_dtype_bytes(k->dtype, k_s1),
         (const uint8_t*)bt->data, bt->dtype, rad_dtype_bytes(bt->dtype, b_s0),
         (const uint8_t*)g->data,  g->dtype,  rad_dtype_bytes(g->dtype, g_s0),
@@ -1430,7 +1455,10 @@ extern "C" int r3d_rad_gdn_kkt_solve(const RadArgs* a, RadStream s) {
  * the scan reads column 0 at stride[0] and a negative slot skips the whole (n, h) row --
  * o included, exactly as ref's `continue` does. `state_fp16` is accepted and ignored, as ref
  * ignores it. */
-extern "C" int r3d_rad_gdn_chunk_scan(const RadArgs* a, RadStream s) {
+static int gdn_chunk_scan_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gdn_chunk_scan(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("gdn_chunk_scan_bf16", gdn_chunk_scan_impl)
+static int gdn_chunk_scan_impl(const RadArgs* a, RadStream s) {
     const RadTensor* q    = rad_arg_in(a, 0);
     const RadTensor* k    = rad_arg_in(a, 1);
     const RadTensor* v    = rad_arg_in(a, 2);
@@ -1593,7 +1621,10 @@ static int r3d_qpair_view(const RadTensor* oq, const RadTensor* osc, int64_t T, 
     return RAD_OK;
 }
 
-extern "C" int r3d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
+static int gdn_recurrent_update_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("gdn_recurrent_update_bf16", gdn_recurrent_update_impl)
+static int gdn_recurrent_update_impl(const RadArgs* a, RadStream s) {
     const RadTensor* q    = rad_arg_in(a, 0);
     const RadTensor* k    = rad_arg_in(a, 1);
     const RadTensor* v    = rad_arg_in(a, 2);
@@ -1759,7 +1790,10 @@ extern "C" int r3d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
  * ldt2 reads -- plain single-plane in this container, no layout hook, same discovery that
  * unblocked the recurrent row. The three launches (conv+commit, l2 norms, gate) preserve ref's
  * phase order: norm reads what the conv stored, exactly as ref's re-read does. */
-extern "C" int r3d_rad_gdn_conv_prep(const RadArgs* a, RadStream s) {
+static int gdn_conv_prep_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gdn_conv_prep(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("gdn_conv_prep_bf16", gdn_conv_prep_impl)
+static int gdn_conv_prep_impl(const RadArgs* a, RadStream s) {
     const RadTensor* x    = rad_arg_in(a, 0);
     const RadTensor* w    = rad_arg_in(a, 1);
     const RadTensor* b    = rad_arg_in(a, 2);        /* optional */
@@ -1929,7 +1963,10 @@ extern "C" int r3d_rad_gdn_conv_prep(const RadArgs* a, RadStream s) {
  * head_k 128, head_v <= 128, per_candidate only, quantiser pair refused. conv_width up to 4
  * (the fused window lives in registers). The staging smem is sized from the ONE bound a
  * launcher can see: the conv contract caps a sequence at state_len - conv_width + 2 tokens. */
-extern "C" int r3d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) {
+static int gdn_conv_recurrent_update_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("gdn_conv_recurrent_update_bf16", gdn_conv_recurrent_update_impl)
+static int gdn_conv_recurrent_update_impl(const RadArgs* a, RadStream s) {
     const RadTensor* x    = rad_arg_in(a, 0);
     const RadTensor* w    = rad_arg_in(a, 1);
     const RadTensor* cb   = rad_arg_in(a, 2);        /* optional */

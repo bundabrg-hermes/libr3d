@@ -19,6 +19,7 @@
  */
 
 #include <hip/hip_runtime.h>
+#include "r3d_dump.h"
 
 #include "rad_abi.h"
 #include "rad_plugin.h"
@@ -58,7 +59,10 @@ __global__ __launch_bounds__(kThreads) void kv_store_kernel(
 
 /* Launch entry, operands positional in libref's kv_store schema order: k, v, slot_mapping,
  * kv_cache (INOUT: read as a descriptor, written through data). */
-extern "C" int r3d_rad_kv_store(const RadArgs* a, RadStream s) {
+static int r3d_kv_store_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_kv_store(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("kv_store_bf16", r3d_kv_store_impl)
+static int r3d_kv_store_impl(const RadArgs* a, RadStream s) {
     const RadTensor* k   = rad_arg_in(a, 0);
     const RadTensor* v   = rad_arg_in(a, 1);
     const RadTensor* sm  = rad_arg_in(a, 2);

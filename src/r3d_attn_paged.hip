@@ -34,6 +34,7 @@
  */
 
 #include <hip/hip_runtime.h>
+#include "r3d_dump.h"
 
 #include "rad_abi.h"
 #include "rad_plugin.h"
@@ -360,7 +361,10 @@ int r3d_attn_v1_launch(const R3dAttnParams& P, hipStream_t stream) {
 
 /* Launch entry; operands positional in the attn_paged schema (rad_arg_in), scalars via
  * r3d_attn_fill. */
-extern "C" int r3d_rad_attn_paged(const RadArgs* a, RadStream s) {
+static int r3d_attn_paged_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_attn_paged(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("attn_paged_bf16", r3d_attn_paged_impl)
+static int r3d_attn_paged_impl(const RadArgs* a, RadStream s) {
     AttnParams P{};
     const int rc = r3d_attn_fill(a, P);
     if (rc != RAD_OK) return rc;

@@ -26,6 +26,7 @@
  * rows are a follow-up; the bands' first duty is making the graph start.
  */
 #include <hip/hip_runtime.h>
+#include "r3d_dump.h"
 #include <cstring>
 #include <cmath>
 
@@ -364,7 +365,10 @@ static inline double param_f(const RadArgs* a, const char* k, double fb) {
 } /* anonymous namespace */
 
 /* ------------------------------------------------------------------ entries */
-extern "C" int r3d_rad_silu_mul(const RadArgs* a, RadStream s) {
+static int r3d_silu_mul_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_silu_mul(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("silu_mul", r3d_silu_mul_impl)
+static int r3d_silu_mul_impl(const RadArgs* a, RadStream s) {
     const RadTensor* gu = rad_arg_in(a, 0);
     const RadTensor* y  = rad_arg_in(a, 1);
     if (!gu || !y) return RAD_E_INVAL;
@@ -386,7 +390,10 @@ extern "C" int r3d_rad_silu_mul(const RadArgs* a, RadStream s) {
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
-extern "C" int r3d_rad_quant_act_i8(const RadArgs* a, RadStream s) {
+static int r3d_quant_act_i8_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_quant_act_i8(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("quant_act_i8", r3d_quant_act_i8_impl)
+static int r3d_quant_act_i8_impl(const RadArgs* a, RadStream s) {
     const RadTensor* x = rad_arg_in(a, 0);
     const RadTensor* q = rad_arg_in(a, 1);
     const RadTensor* sc = rad_arg_in(a, 2);
@@ -427,7 +434,10 @@ extern "C" int r3d_rad_quant_act_i8(const RadArgs* a, RadStream s) {
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
-extern "C" int r3d_rad_row_topk(const RadArgs* a, RadStream s) {
+static int r3d_row_topk_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_row_topk(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("row_topk", r3d_row_topk_impl)
+static int r3d_row_topk_impl(const RadArgs* a, RadStream s) {
     const RadTensor* x = rad_arg_in(a, 0);
     const RadTensor* idx = rad_arg_in(a, 1);
     const RadTensor* val = rad_arg_in(a, 2);
@@ -466,7 +476,10 @@ extern "C" int r3d_rad_row_topk(const RadArgs* a, RadStream s) {
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
-extern "C" int r3d_rad_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
+static int r3d_rmsnorm_quant_fp8_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_rmsnorm_quant_fp8(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("rmsnorm_quant_fp8", r3d_rmsnorm_quant_fp8_impl)
+static int r3d_rmsnorm_quant_fp8_impl(const RadArgs* a, RadStream s) {
     if (a->n_t < 5) return RAD_E_INVAL;                      /* ref requires x, res?, w, q, scale */
     const RadTensor* x  = rad_arg_in(a, 0);
     const RadTensor* res = (a->n_t > 1 && a->t[1].data) ? &a->t[1] : nullptr;

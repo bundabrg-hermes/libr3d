@@ -21,6 +21,7 @@
  */
 
 #include <cstring>
+#include "r3d_dump.h"
 
 #include <hip/hip_runtime.h>
 
@@ -84,7 +85,10 @@ __global__ __launch_bounds__(kThreads) void act_mul_kernel(
 } /* anonymous namespace */
 
 /* Launch entry, operands positional in the act_mul schema: a (gate), b, y. */
-extern "C" int r3d_rad_act_mul(const RadArgs* a, RadStream s) {
+static int r3d_act_mul_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_act_mul(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("act_mul", r3d_act_mul_impl)
+static int r3d_act_mul_impl(const RadArgs* a, RadStream s) {
     const RadTensor* A = rad_arg_in(a, 0);
     const RadTensor* B = rad_arg_in(a, 1);
     const RadTensor* Y = rad_arg_in(a, 2);

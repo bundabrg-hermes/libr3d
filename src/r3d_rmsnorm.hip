@@ -19,6 +19,7 @@
  */
 
 #include <hip/hip_runtime.h>
+#include "r3d_dump.h"
 
 #include "rad_abi.h"
 #include "rad_plugin.h"
@@ -101,7 +102,10 @@ __global__ __launch_bounds__(kThreads) void rmsnorm_kernel(
 
 /* The launch entry, named by the row table. Operands are positional in libref's rmsnorm schema
  * order: x, w (optional), y. A launch must not allocate and must not synchronise. */
-extern "C" int r3d_rad_rmsnorm(const RadArgs* a, RadStream s) {
+static int r3d_rmsnorm_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_rmsnorm(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("rmsnorm_bf16", r3d_rmsnorm_impl)
+static int r3d_rmsnorm_impl(const RadArgs* a, RadStream s) {
     const RadTensor* x = rad_arg_in(a, 0);
     const RadTensor* w = rad_arg_in(a, 1);
     const RadTensor* y = rad_arg_in(a, 2);

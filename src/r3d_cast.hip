@@ -16,6 +16,7 @@
  */
 
 #include <hip/hip_runtime.h>
+#include "r3d_dump.h"
 
 #include "rad_abi.h"
 #include "rad_plugin.h"
@@ -52,7 +53,10 @@ __global__ __launch_bounds__(kThreads) void cast_kernel(
 } /* anonymous namespace */
 
 /* Launch entry, operands positional in the cast schema: x, y. */
-extern "C" int r3d_rad_cast(const RadArgs* a, RadStream s) {
+static int r3d_cast_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_cast(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("cast", r3d_cast_impl)
+static int r3d_cast_impl(const RadArgs* a, RadStream s) {
     const RadTensor* X = rad_arg_in(a, 0);
     const RadTensor* Y = rad_arg_in(a, 1);
     if (!X || !Y) return RAD_E_INVAL;
