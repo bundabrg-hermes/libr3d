@@ -265,9 +265,24 @@ static inline int row2_pitch(const RadTensor* t, int64_t cols, int64_t* pitch) {
         *pitch = 0;
         return 0;
     }
-    if (t->rank != 2 || t->shape[1] != cols || t->stride[1] != 1) return -3;
-    *pitch = t->stride[0];
-    return 0;
+    if (t->rank == 2) {
+        if (t->stride[1] != 1) return -3;
+        /* ref's rowoff: shape[1] == cols reads the row stride; otherwise the linear
+         * fallback r*cols (a view into wider rows is read flat, as ref reads it). */
+        *pitch = (t->shape[1] == cols) ? t->stride[0] : cols;
+        return 0;
+    }
+    if (t->rank >= 3) {
+        if (t->stride[t->rank - 1] != 1) return -3;
+        if (t->shape[t->rank - 1] != cols) { *pitch = cols; return 0; }   /* ref's linear fallback */
+        /* shape[last] == cols: the leading-dim walk degenerates to r*cols exactly when
+         * the leading dims are contiguous; refuse anything else (ref walks, this kernel
+         * class pitches). */
+        for (int i = 0; i + 1 < (int)t->rank - 1; ++i)
+            if (t->stride[i] != t->shape[i + 1] * t->stride[i + 1]) return -4;
+        *pitch = cols;
+        return 0;
+    }
 }
 static inline int64_t param_i(const RadArgs* a, const char* k, int64_t fb) {
     long long v;

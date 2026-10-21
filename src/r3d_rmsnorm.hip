@@ -117,14 +117,31 @@ extern "C" int r3d_rad_rmsnorm(const RadArgs* a, RadStream s) {
         n = w ? rad_tensor_lastdim(w) : rad_tensor_lastdim(y);
     if (n <= 0 || n > 0x7fffffffLL) return RAD_E_SHAPE;
 
-    /* The row's element extent must be n (a sliced row wider than n is v2 work), and a gain,
-     * when present, is read contiguously as one plane. */
-    if (rad_tensor_lastdim(x) != n || rad_tensor_lastdim(y) != n) return RAD_E_SHAPE;
+    /* Ref's rowoff: a last extent of n reads the row stride; a wider last extent (a flat
+     * [T, m*n] viewed as [T*m, n]) reads the flat pitch n, unit in-row stride. A rank-3+
+     * with last extent n is served only when the leading dims are contiguous, so the flat
+     * walk r*n lands where ref's per-dim walk lands. */
+    if (rad_tensor_lastdim(x) != n && rad_tensor_lastdim(x) % n != 0) return RAD_E_SHAPE;
+    if (rad_tensor_lastdim(y) != n && rad_tensor_lastdim(y) % n != 0) return RAD_E_SHAPE;
+    const int64_t x_ls = x->rank ? x->stride[x->rank - 1] : 0;
+    const int64_t y_ls = y->rank ? y->stride[y->rank - 1] : 0;
+    if (x_ls != 1 || y_ls != 1) return RAD_E_STRIDE;
     if (w && (w->rank != 1 || w->stride[0] != 1 || rad_tensor_lastdim(w) < n))
         return RAD_E_STRIDE;
+    auto ld_row_pitch = [&](const RadTensor* t) -> uint32_t {
+        if (t->rank <= 1) return (uint32_t)n;
+        const int64_t ld = t->shape[t->rank - 1];
+        if (ld != n) return (uint32_t)n;                      /* flat view: pitch = n */
+        if (t->rank >= 3) {
+            for (int i = 0; i + 1 < (int)t->rank - 1; ++i)    /* walk == flat only contiguous */
+                if (t->stride[i] != t->shape[i + 1] * t->stride[i + 1]) return 0;
+        }
+        return (uint32_t)t->stride[t->rank - 2];
+    };
 
-    const int64_t M = rad_tensor_rows(x);
-    if (M <= 0 || rad_tensor_rows(y) < M) return RAD_E_SHAPE;
+    /* Rows count numel/n, exactly as ref: a flat wide view is cut into n-wide rows. */
+    const int64_t M = rad_tensor_numel(x) / n;
+    if (M <= 0 || rad_tensor_numel(y) < M * n) return RAD_E_SHAPE;
 
     const double eps  = rad_args_getf_or(a, "eps", 1e-6);
     const double wadd = rad_args_getf_or(a, "wadd", 0.0);
@@ -132,8 +149,9 @@ extern "C" int r3d_rad_rmsnorm(const RadArgs* a, RadStream s) {
     /* ref refuses `wadd` without a gain; so does this row, for the same reason. */
     if (!w && wadd != 0.0) return RAD_E_INVAL;
 
-    const uint32_t x_ld = (uint32_t)(x->rank == 1 ? n : rad_tensor_row_pitch(x));
-    const uint32_t y_ld = (uint32_t)(y->rank == 1 ? n : rad_tensor_row_pitch(y));
+    const uint32_t x_ld = ld_row_pitch(x);
+    const uint32_t y_ld = ld_row_pitch(y);
+    if (!x_ld || !y_ld) return RAD_E_STRIDE;     /* rank-3+ with non-contiguous leading dims */
     if ((int64_t)(M - 1) + n > (int64_t)0x7fffffffLL) return RAD_E_SHAPE;
 
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
