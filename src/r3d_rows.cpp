@@ -838,6 +838,17 @@ static const RadConstraint cFp8A8Row[] = {
     { "group", RAD_C_EQ, 128, nullptr },
 };
 
+/* gemm_nt_q fp8a8 decode band (issue #4): the width row's band is M <= 8 -- decode and
+ * speculative verify. Same format gates as the plain row (K closing on a scale block is
+ * what lets the GEMV skip a group tail); the entry re-checks every dtype and the band's
+ * own M bound. */
+static const RadConstraint cFp8A8DecodeRow[] = {
+    { "dtype", RAD_C_IN, 0, "fp8a8" },
+    { "M",     RAD_C_LE, 8, nullptr },
+    { "K",     RAD_C_DIV, 128, nullptr },
+    { "group", RAD_C_EQ, 128, nullptr },
+};
+
 /* gemm_nt_q_gated fp8a8: the composed row (tile into scratch, gated_quant epilogue)
  * sizes its arena at the band's M bound, so the band stops at 64 -- the whole dflash
  * drafter M range this container declares. act silu and sigmoid both compile in the
@@ -862,6 +873,8 @@ static const RadConstraint cKvStore[] = {
 enum { R3D_PRIO_ONLY = 1000 };
 enum { R3D_PRIO_ATTN_DECODE = 1100 };   /* split-KV rows win the decode band from the
                                            any-length tile; nothing else is ranked */
+enum { R3D_PRIO_FP8_DECODE  = 1100 };   /* same law for gemm_nt_q: the width row wins
+                                           M <= 8 from the m64 tile (issue #4) */
 
 /* act_mul: the bf16 gated MLP, all four oracle activations this kernel ports. */
 static const RadConstraint cActMul[] = {
@@ -1013,6 +1026,7 @@ extern "C" int r3d_rad_gemm_nt(const RadArgs*, RadStream);
 extern "C" int r3d_rad_logits_gemm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q_fp8(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gemm_nt_q_fp8_decode(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q_gated_fp8(const RadArgs*, RadStream);
 extern "C" int64_t r3d_rad_gemm_nt_q_gated_fp8_scratch(const RadArgs*);
 extern "C" int r3d_rad_logits_gemm_e4m3(const RadArgs*, RadStream);
@@ -1219,6 +1233,21 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cFp8A8Row, 3, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gemm_nt_q_fp8 },
+
+{ "gemm_nt_q_fp8a8_decode", "gemm_nt_q", "gemm",
+  "fp8a8 decode-band width row: warp per weight row, four codes per lane (one aligned "
+  "dword), the activation rows staged per 128-of-K group through LDS, every weight byte "
+  "read exactly once; the group partial folds through a butterfly and flushes as "
+  "(sub * a_scale) * b_scale in the oracle's order",
+  "M <= 8 (decode and speculative verify -- the band the m64 tile wastes at ragged M); "
+  "K a multiple of 128; N any (dead warps clamp their load row and never store); "
+  "b_scale either the 128x128 checkpoint block grid or a per-row grid",
+  "fp8_e4m3 a with f32 a_scale per (row, 128 K), fp8_e4m3 b with bf16 scale per 128x128 "
+  "tile (or per row), bf16 y; a_sum and b_ref refused; a B whose row pitch or base "
+  "breaks the dword walk resolves to the m64 row",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_FP8_DECODE,
+  cFp8A8DecodeRow, 4, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gemm_nt_q_fp8_decode },
 
 { "gemm_nt_q_gated_fp8a8", "gemm_nt_q_gated", "gemm",
   "the fp8a8 tile writing its bf16 gate_up plane into the launch scratch, closed by the "

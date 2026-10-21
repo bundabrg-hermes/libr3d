@@ -126,6 +126,25 @@ __device__ __forceinline__ float fp8e4m3_f8(uint8_t b) {
     return f;
 }
 
+/* Loop-free e4m3 decode, bit-equivalent to fp8e4m3_f8 above (the subnormal branch is
+ * m * 2^-9 exactly; same arithmetic form the logits GEMV ships). No per-byte divergent
+ * while-loop: this sits in the bandwidth row's hot load path. */
+__device__ __forceinline__ float fp8e4m3_gemv(uint8_t b) {
+    const uint32_t s = (uint32_t)(b >> 7) << 31;
+    const uint32_t e = (uint32_t)(b >> 3) & 0xfu, m = (uint32_t)b & 0x7u;
+    uint32_t u;
+    if (e == 0u) {
+        if (m == 0u) return __uint_as_float(s);
+        const float f = (float)m / 512.0f;                                /* m * 2^-9 */
+        u = s | (__float_as_uint(f) & 0x7fffffffu);
+    } else if (e == 0xfu && m == 0x7u) {
+        u = s | 0x7fc00000u;                                              /* the NaN */
+    } else {
+        u = s | ((e - 7u + 127u) << 23) | (m << 20);
+    }
+    return __uint_as_float(u);
+}
+
 /* One 64x64 output tile per workgroup, K in 16-wide slices, flushed per 128-of-K scale
  * group through LDS. Both planes stage DECODED; the two scales ride the flush. */
 template <bool DBUF>
@@ -271,6 +290,97 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_m64_kernel(
     }
 }
 
+/* ---- the decode-band width row (issue #4) ------------------------------------------
+ *
+ * The m64 tile at M = 1..8 stages every B row through a 64-row slab it uses M rows of
+ * and pays the LDS round trip per slice: ~98 GB/s effective on a ~368 GB/s card. This
+ * row reads every weight byte exactly once instead -- warp per weight row, four codes
+ * per lane (one aligned dword, the logits GEMV's load pattern), the MT activation rows
+ * staged through LDS per 128-of-K group (an fp8 row walk would be one dword per lane
+ * from an L1-hot page eight times per block; staging decodes once and reads conflict-
+ * free). The flush keeps the oracle's group structure: sub accumulates ascending per
+ * lane over its four k, folds across the wave through a butterfly, and
+ *     acc += (sub * sa[m, grp]) * sb
+ * in quant_dot's order. The butterfly reassociates the k chain inside a group -- the
+ * GEMM house line (r3d_gemm_bf16.hip): rel_l2, not bit-exactness, kbench adjudicates,
+ * and the same fp8_9b.rkb pack that passed the tile at 3.7e-04 vs tol 3e-2 decides.
+ *
+ * K % 128 == 0 is the row's own constraint, so there is no group tail. Ragged N is
+ * handled by clamping dead warps' load row, NOT an early return: every warp must
+ * reach the block's barriers (the logits GEMV's `if (r >= N) return` is safe there
+ * only because that kernel's staging loop could never miss an element for vocab rows;
+ * here the clamp is the honest form).
+ */
+template <int MT>
+__global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
+    const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, uint16_t* __restrict__ Y,
+    const float* __restrict__ AS, const uint16_t* __restrict__ BS,
+    int M, int N, int K, int as_cols, int bs_cols,
+    int64_t a_pitch, int64_t b_pitch,
+    int64_t y_pitch, int64_t as_pitch, int64_t bs_pitch,
+    int rblk)
+{
+    __shared__ __align__(16) float xs[MT][128];
+
+    const int w    = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int r    = blockIdx.x * (kThreads / 32) + w;
+    const int rr   = r < N ? r : N - 1;              /* dead warps load a live row */
+    const int live = M < MT ? M : MT;
+
+    const uint8_t* crow = B + (int64_t)rr * b_pitch;
+    const int srow = (rblk > 1) ? (rr / rblk) : rr;  /* same grid fold as the tile */
+
+    for (int i = threadIdx.x; i < MT * 128; i += kThreads)
+        xs[i >> 7][i & 127] = 0.0f;
+    float acc[MT];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) acc[m] = 0.0f;
+    __syncthreads();
+
+    const int ngrp = K >> 7;                          /* K % 128 == 0 is the row gate */
+    for (int grp = 0; grp < ngrp; ++grp) {
+        const int kbase = grp << 7;
+        for (int i = threadIdx.x; i < live * 128; i += kThreads) {
+            const int m = i >> 7, k = i & 127;
+            xs[m][k] = fp8e4m3_gemv(A[(int64_t)m * a_pitch + kbase + k]);
+        }
+        __syncthreads();
+
+        /* One aligned dword per lane: k = lane*4 + 0..3, ascending within the lane. */
+        const uint32_t b4 = *(const uint32_t*)(crow + kbase + (lane << 2));
+        float sub[MT];
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+            const float4 xv = ((const float4*)xs[m])[lane];
+            const float x4[4] = { xv.x, xv.y, xv.z, xv.w };
+            float s = 0.0f;
+#pragma unroll
+            for (int t = 0; t < 4; ++t)
+                s = __fmaf_rn(x4[t], fp8e4m3_gemv((uint8_t)(b4 >> (8 * t))), s);
+            sub[m] = s;
+        }
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+#pragma unroll
+            for (int off = 16; off; off >>= 1)
+                sub[m] += __shfl_xor(sub[m], off);
+            if (m < live) {
+                const float sa = AS[(int64_t)m * as_pitch + grp];
+                const float sb = __uint_as_float((uint32_t)BS[(int64_t)srow * bs_pitch + grp] << 16);
+                acc[m] += (sub[m] * sa) * sb;         /* quant_dot's two-multiply order */
+            }
+        }
+        __syncthreads();                              /* xs is rewritten next group */
+    }
+
+    if (lane == 0 && r < N) {
+#pragma unroll
+        for (int m = 0; m < MT; ++m)
+            if (m < live) Y[(int64_t)m * y_pitch + r] = f32_to_bf16_f8(acc[m]);
+    }
+}
+
 } /* anonymous namespace */
 
 #else  /* non-RDNA3: host-visible no-op, the launcher never dispatches it */
@@ -278,6 +388,10 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_m64_kernel(
 namespace {
 template <bool DBUF>
 __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_m64_kernel(
+    const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint16_t*,
+    int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int) {}
+template <int MT>
+__global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint16_t*,
     int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int) {}
 } /* anonymous namespace */
@@ -513,7 +627,36 @@ int f8_plan(const RadArgs* a, const RadTensor* A, const RadTensor* AS,
 void f8_launch_tile(const F8Plan& P, void* ydata, int64_t y_pitch, RadStream s,
                     const char* trace) {
     static const bool no_dbuf = getenv("R3D_GEMM_NO_DBUF") != nullptr;
+    static const bool no_dec  = getenv("R3D_NO_FP8_DEC") != nullptr;
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
+
+    /* Decode band (issue #4): at M <= 8 the width row reads every weight byte once.
+     * The dword-per-lane load pins B's alignment; anything odd rides the tile.
+     * R3D_NO_FP8_DEC=1 puts both this dispatch and the plain decode row back to the
+     * m64 arm -- the serve A/B kill switch for the band. */
+    if (!no_dec && P.M <= 8 && (P.b_pitch % 4) == 0 && (((uintptr_t)P.B & 3) == 0)) {
+        const int mt = P.M >= 8 ? 8 : P.M >= 4 ? 4 : P.M >= 2 ? 2 : 1;
+        dim3 grid((unsigned)((P.N + 7) / 8));
+        #define R3D_F8_GEMV(MT_)                                                        \
+            hipLaunchKernelGGL((gemm_nt_fp8a8_gemv_kernel<MT_>), grid, dim3(kThreads),  \
+                               0, stream, P.A, P.B, (uint16_t*)ydata, P.AS, P.BS,       \
+                               (int)P.M, (int)P.N, (int)P.K, P.as_cols, P.bs_cols,      \
+                               P.a_pitch, P.b_pitch, y_pitch, P.as_pitch, P.bs_pitch,   \
+                               P.rblk)
+        switch (mt) {
+            case 1: R3D_F8_GEMV(1); break;
+            case 2: R3D_F8_GEMV(2); break;
+            case 4: R3D_F8_GEMV(4); break;
+            default: R3D_F8_GEMV(8); break;
+        }
+        #undef R3D_F8_GEMV
+        if (getenv("R3D_DEBUG_GEMM")) {
+            static bool once = false;
+            if (!once) { once = true; fprintf(stderr, "libr3d: fp8a8 decode gemv launched (mt=%d)\n", mt); }
+        }
+        return;
+    }
+
     dim3 grid((unsigned)((P.N + kNB - 1) / kNB), (unsigned)((P.M + kMB - 1) / kMB));
     if (no_dbuf)
         hipLaunchKernelGGL((gemm_nt_fp8a8_m64_kernel<false>), grid, dim3(kThreads), 0, stream,
@@ -568,6 +711,50 @@ static int r3d_gemm_nt_q_fp8_impl(const RadArgs* a, RadStream s) {
     int rc = f8_plan(a, A, AS, B, BS, Yn / Np, &P);
     if (rc) return rc;
     f8_launch_tile(P, Y->data, f8_row_stride(Y, Np), s, "fp8a8 m64");
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* ---- gemm_nt_q at fp8a8, the decode band (issue #4) ---------------------------------
+ *
+ * Same plan, same oracle order; the row's constraint band is M <= 8 so the resolver
+ * hands it the decode shapes and the m64 row keeps prefill. R3D_NO_FP8_DEC=1 refuses
+ * the row outright (the resolver then gives the band to gemm_nt_q_fp8a8); the refusal
+ * of a misaligned B keeps the dword-per-lane load honest -- the tile takes bytes.
+ * The gated row shares the dispatch: its scratch tile rides the same GEMV at M <= 8,
+ * which is what carries the FFN gate_up plane's two-thirds of decode weight traffic. */
+
+static int r3d_gemm_nt_q_fp8_dec_impl(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gemm_nt_q_fp8_decode(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("gemm_nt_q_fp8_decode", r3d_gemm_nt_q_fp8_dec_impl)
+static int r3d_gemm_nt_q_fp8_dec_impl(const RadArgs* a, RadStream s) {
+    static const bool no_fp8 = getenv("R3D_NO_FP8A8") != nullptr ||
+                               getenv("R3D_NO_FP8_DEC") != nullptr;
+    if (no_fp8) return RAD_E_UNSUPPORTED;
+
+    const RadTensor* A    = rad_arg_in(a, 0);
+    const RadTensor* AS   = rad_arg_in(a, 1);
+    const RadTensor* B    = rad_arg_in(a, 2);
+    const RadTensor* BS   = rad_arg_in(a, 3);
+    const RadTensor* Y    = rad_arg_in(a, 4);
+    const RadTensor* ASUM = rad_arg_in(a, 5);
+    const RadTensor* BREF = rad_arg_in(a, 6);
+    if (!A || !AS || !B || !BS || !Y) return RAD_E_UNSUPPORTED;
+    if (ASUM || BREF) return RAD_E_UNSUPPORTED;      /* the plain row's refusals, same */
+    if (Y->dtype != RAD_BF16) return RAD_E_UNSUPPORTED;
+
+    long long Np = 0;
+    if (!rad_args_geti(a, "N", &Np) || Np <= 0) return RAD_E_SHAPE;
+    const long long Yn = rad_tensor_numel(Y);
+    if (Yn <= 0 || Yn % Np) return RAD_E_SHAPE;
+    if (Yn / Np > 8) return RAD_E_UNSUPPORTED;       /* the band's own bound, re-checked */
+
+    if (Y->rank >= 2 && Y->stride[Y->rank - 1] != 1) return RAD_E_STRIDE;
+
+    F8Plan P{};
+    int rc = f8_plan(a, A, AS, B, BS, Yn / Np, &P);
+    if (rc) return rc;
+    if ((P.b_pitch % 4) != 0 || ((uintptr_t)P.B & 3) != 0) return RAD_E_UNSUPPORTED;
+    f8_launch_tile(P, Y->data, f8_row_stride(Y, Np), s, "fp8a8 decode gemv");
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
