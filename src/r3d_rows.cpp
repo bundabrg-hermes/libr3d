@@ -972,14 +972,15 @@ static const RadConstraint cChunkScan[] = {
 };
 /* recurrent_update: the same register bounds as chunk_scan (r4d declares 128/128 outright;
  * the <= spelling keeps head_v under the one-column-per-thread block honest). The state_form
- * constraint is the scope gate: per_candidate is the form this kernel implements and the form
- * a non-speculative batch issues, and a constraint on a key the query lacks does not hold --
- * so anchor batches (speculation) and unnamed callers stay with libr4d's anchor kernel. */
-static const RadConstraint cRecurrent[] = {
+ * constraint admits both forms the arch block issues -- per_candidate (non-speculative decode)
+ * and anchor (the speculative fold/replay against libr4d's factor-block layout) -- and the
+ * rule that a constraint on a key the query lacks does not hold keeps unnamed callers with
+ * the reference. */
+static RadConstraint cRecurrent[] = {
     RAD_CEQ("head_k", 128),
     { "head_v", RAD_C_GE, 1,    nullptr },
     { "head_v", RAD_C_LE, 128,  nullptr },
-    RAD_CIN("state_form", "per_candidate"),
+    RAD_CIN("state_form", "per_candidate anchor"),
 };
 /* conv_prep: chunk 64 is the shared c64 value and the cumsum's reset unit; conv_width tops
  * at the kernel's LDS history bound; the l2 grid stages one head row, so head_k is bounded. */
@@ -991,14 +992,14 @@ static const RadConstraint cConvPrep[] = {
     { "conv_width", RAD_C_LE, 17, nullptr },
 };
 /* the fused pair: the recurrent row's register bounds, the window in registers (width <= 4),
- * and the same state_form scope gate -- anchor batches stay with libr4d. */
-static const RadConstraint cConvFused[] = {
+ * and the same state_form scope gate -- both forms. */
+static RadConstraint cConvFused[] = {
     RAD_CEQ("head_k", 128),
     { "head_v", RAD_C_GE, 1,    nullptr },
     { "head_v", RAD_C_LE, 128,  nullptr },
     { "conv_width", RAD_C_GE, 1, nullptr },
     { "conv_width", RAD_C_LE, 4, nullptr },
-    RAD_CIN("state_form", "per_candidate"),
+    RAD_CIN("state_form", "per_candidate anchor"),
 };
 
 extern "C" int r3d_rad_rmsnorm(const RadArgs*, RadStream);
@@ -1512,8 +1513,9 @@ static const RadKernelInfo kRows[] = {
   "norms, the q readout and the gated rms norm in one launch; one block per (sequence, v head), "
   "the transposed f32 state in one-column-per-thread register arrays, every token walking the "
   "oracle's order",
-  "head_k 128 (register bound, as on chunk_scan), head_v up to 128; state_form per_candidate "
-  "only -- anchor batches stay with libr4d's anchor kernel, and the constraint says so; the "
+  "head_k 128 (register bound, as on chunk_scan), head_v up to 128; state_form both forms -- "
+  "per_candidate walks the per-token slots, anchor folds the accepted prefix from libr4d's "
+  "factor-block layout (six state_idx columns, the stamped window), and the constraint says so; the "
   "state cache's slot/head/column strides are read off the tensor (a paged cache is page-"
   "padded); state_idx rows may be wider than one column (the accepted-prefix walk clamps to the "
   "last), a negative input slot skips the (sequence, head) row whole and a negative output slot "
@@ -1549,7 +1551,7 @@ static const RadKernelInfo kRows[] = {
   "rule over it, one launch per (sequence, v head); the conv window commits before the "
   "state-idx skip, in the oracle's order -- the pair commits the conv state even when the "
   "recurrent leg then skips the row",
-  "the recurrent row's scope exactly: head_k 128, head_v up to 128, per_candidate only, the "
+  "the recurrent row's scope exactly: head_k 128, head_v up to 128, both state_form shapes, the "
   "o_q/o_scale quantiser pair honoured (ref's e4m3 group epilogue); conv_width up to 4 (the "
   "window is register-resident); the staging smem follows the conv contract's own sequence "
   "bound, state_len - conv_width + 2",
@@ -1628,12 +1630,31 @@ const RadOpSchema* rad_kernel_schema_at(int i) {
     return nullptr;
 }
 
+/* R3D_NO_ANCHOR=1 narrows both recurrent rows' state_form constraint to per_candidate: the
+ * anchor query then resolves to the host reference row while every other band stays on the
+ * device. The A/B lever for "the recurrent anchor arithmetic runs on the host" -- the full
+ * R3D_NO_GDN lever cannot boot a speculative serve because kkt/chunk_scan have no host
+ * placement. Unset is untouched behaviour. */
+static void r3d_anchor_gate(void) {
+    static const bool once = [] {
+        if (getenv("R3D_NO_ANCHOR")) {
+            for (RadConstraint& c : cRecurrent)
+                if (!strcmp(c.key, "state_form")) c.sval = "per_candidate";
+            for (RadConstraint& c : cConvFused)
+                if (!strcmp(c.key, "state_form")) c.sval = "per_candidate";
+        }
+        return true; }();
+    (void)once;
+}
+
 int rad_kernel_count(void) {
+    r3d_anchor_gate();
     int n = 0;
     for (const RadKernelInfo& k : kRows) if (!r3d_row_hidden(k.op)) ++n;
     return n;
 }
 const RadKernelInfo* rad_kernel_at(int i) {
+    r3d_anchor_gate();
     if (i < 0) return nullptr;
     for (const RadKernelInfo& k : kRows) if (!r3d_row_hidden(k.op) && i-- == 0) return &k;
     return nullptr;
