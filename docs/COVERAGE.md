@@ -1264,3 +1264,50 @@ Two lessons paid for:
   seq0's commit and seq1's read; BOTH arms raced (diff sets shifted run to
   run). That is a legal-violation detector worth keeping in mind for real
   batch construction, not just tests.
+
+## gemm_nt_q + gemm_nt_q_gated at fp8a8: FP8 containers place fully on device (2026-10-21)
+
+`qwen3.5-9b-fp8.rad` (rtn e4m3 128x128, bf16 scales) resolved both rows host on
+gfx1100, so the planner put every projection's arithmetic on the host and the
+mapped-tier group pin refused startup outright ("'blk.0.attn_norm.weight' was
+placed on the mapped tier"). With libr3d mounted, `--debug-selection` at spec 0
++ mm 0 named EXACTLY these two ops as host-only and zero missing device bands —
+the scope was the pair, no more.
+
+`r3d_gemm_fp8a8.hip`: the m64 WMMA skeleton with an exact e4m3→bf16 LUT on both
+planes (products of decoded e4m3 are exact in bf16, so only the accumulation
+order differs from ref and the kbench tolerance covers it). The scale law is
+ref_gemm.h quant_dot verbatim: per 128-of-K group, sub = ascending f32 of exact
+products, acc += (sub * sa) * sb — two flush multiplies in that order, sa from
+the f32 a_scale plane, sb from the bf16 b_scale grid (128-row block grid OR
+per-row grid, make_scales' rblk rule). The weight scale CANNOT fold into the
+bf16 fragment the way mxfp4's e8m0 exponent did: rtn scales are arbitrary
+floats, not powers of two.
+
+`gemm_nt_q_gated` composes rather than fuses: the tile writes its bf16 [M,N]
+gate_up plane into the launch scratch (hook: 64*N*2, band M <= 64 — recorded
+drafter bands are exactly M ∈ {1..64}), the ported gated_quant_fp8 epilogue
+closes it into the code pair. Byte-identical to the unfused pair by
+construction (the epilogue is that kernel), which is the whole argument for
+composing first and fusing later.
+
+Evidence: fixture `fp8_9b.rkb` (1461 cases, recorded from the container's
+skeleton — the skeleton keeps fp8 planes whole, so weights are the real ones);
+attribution home (libr3d+libref only): gemm_nt_q 536/536 worst rel_l2 3.7e-04
+vs 5e-3 tol; gemm_nt_q_gated 56/56 worst 8.6e-06 vs 3e-2; 0 OOB; stock
+1995/1995 and full 4713/4713 unchanged. Serve acceptance: `--placement
+all_vram --num-speculative-tokens 0 --mm-max-patches 0`, "9.29 GiB placed from
+9.29 GiB of container read", no host-only line, health 200, "capital of
+Australia" -> Canberra. Decode 9.8 tok/s = ~98 GB/s effective: the m64 arm
+covers ~27% of the card's bandwidth — the decode-shaped tile is the open perf
+lever (llama.cpp Q4_K_XL same card: 75.8 t/s no-draft).
+
+Two schema/pitch traps paid for:
+- **operand ROLES differ per op**: gemm_nt_q's a_scale is optional,
+  gemm_nt_q_gated's is REQUIRED. Copying the plain table into the gated schema
+  made the loader refuse libref entirely at load ("two different schemas ...
+  refusing libref") — every libref row vanished with it, not just the one op.
+- **band kernels index through BYTE offsets**: the epilogue's gu/ob pitches are
+  bytes (the kernel offsets a byte pointer, then indexes elements), while the
+  f32 scale pitch is element units. Passing element pitches strides every row
+  by half a row — silent, plausible-looking garbage.
