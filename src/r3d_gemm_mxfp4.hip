@@ -48,6 +48,7 @@
  */
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include "r3d_dump.h"
 
 #include <cstdio>
@@ -543,6 +544,142 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
     }
 }
 
+/* ---- the dot2 leg (issue #6) ---------------------------------------------------------
+ *
+ * The #5 register leg re-decodes the SHARED fp8 activation row inside every warp's
+ * inner loop: ~24 VALU per weight byte, which is exactly the 143 GB/s wall it hit
+ * (4 VALU/cy/SIMD over 96 CUs). The activation row is ONE vector per token, read by
+ * hundreds of weight-row warps -- every warp re-pays the decode.
+ *
+ * e2m1 codes and e4m3 activations are both EXACT in f16 (mantissas 2 and 3 bits,
+ * exponents and max 448 all inside f16's range), and gfx11 has V_DOT2_F32_F16
+ * (VOP3P, ISA p.363). So: a tiny per-dispatch prologue converts the activation row
+ * to packed f16 pairs ONCE, and the weight byte's two nibbles (low = even k, the
+ * tile's own rule) are exactly one dot2 operand pair -- a 256-entry LDS gather into
+ * an f16-pair LUT plus one v_dot2c per weight byte. ~2 VALU + 1 LDS per byte vs ~24.
+ *
+ * Products of exact-f16 operands are EXACT in f32 (5 significand bits max), so the
+ * only deviation from the shipped leg is the addition order inside a lane: whether
+ * v_dot2c accumulates src3 + (p0 + p1) or (src3 + p0) + p1 is not spelled out in the
+ * ISA, so this leg is graded on the same 3e-02 tolerance as #5 -- the attribution
+ * gate settles empirically whether it is in fact bit-exact. Everything the oracle
+ * order DOES own -- the per-32-of-K group ownership (lane pair), the pair butterfly,
+ * the (sub * sa) * 2^(x-127) two-multiply flush, the e8m0 0xFF-NaN/0x00-subnormal
+ * rules, the warp fold -- is the #5 leg verbatim.
+ *
+ * The prologue's f16 conversion is exact (e4m3 embeds in f16 with no rounding,
+ * subnormals included; the single e4m3 NaN becomes a quiet f16 NaN and still poisons
+ * every product, like the fp32 NaN poisons the FFMA chain). A16 is the plugin's own
+ * buffer, so the walk needs no odd-base arms: the prologue takes the odd-A scalars.
+ */
+__device__ __forceinline__ uint32_t f16_pair_m4(float lo, float hi) {
+    __half2 h = __floats2half2_rn(lo, hi);        /* .x = lo -> low half */
+    uint32_t u;
+    memcpy(&u, &h, 4);
+    return u;
+}
+
+__device__ __forceinline__ float dot2c_f16_m4(uint32_t a, uint32_t b, float acc) {
+    /* The ROCm 10.1 assembler spells the accumulate form THREE operands: dst is both
+     * destination and src3, and it resolves to v_dot2acc_f32_f16 in the 16-bit VOP1
+     * encoding -- no CLAMP bit exists there at all. (Measured at the first link: the
+     * 4-operand forms -- bare and _e64 -- are rejected, and __ockl_fdot2 lowers to a
+     * VOP3P dot2 WITH clamp. The e32-suffixed 4-operand form is rejected too.) */
+    asm ("v_dot2c_f32_f16 %0, %1, %2" : "+v"(acc) : "v"(a), "v"(b));
+    return acc;
+}
+
+/* e2m1 as f16 bit patterns: the bf16 table's values, f16-biased (all exact). */
+__device__ const uint16_t kE2M1F16[16] = {
+    0x0000u, 0x3800u, 0x3C00u, 0x3E00u, 0x4000u, 0x4200u, 0x4400u, 0x4600u,
+    0x8000u, 0xB800u, 0xBC00u, 0xBE00u, 0xC000u, 0xC400u, 0xC600u, 0xC800u,
+};
+
+__global__ __launch_bounds__(256) void m4_act_f16_kernel(
+    const uint8_t* __restrict__ A, uint32_t* __restrict__ D, int K, int64_t a_pitch)
+{
+    const int half = K >> 1;                       /* K even: the plan gate says K % 128 */
+    for (int i = blockIdx.x * 256 + threadIdx.x; i < half; i += gridDim.x * 256) {
+        const uint8_t* ap = A + a_pitch + 2 * i;   /* M == 1: row 0 only */
+        if (!(((uintptr_t)ap) & 1u)) {
+            const uint16_t two = *(const uint16_t*)ap;
+            D[i] = f16_pair_m4(fp8e4m3_m4((uint8_t)(two & 0xffu)),
+                               fp8e4m3_m4((uint8_t)(two >> 8)));
+        } else {                                   /* odd A base: scalar, this kernel is tiny */
+            D[i] = f16_pair_m4(fp8e4m3_m4(ap[0]), fp8e4m3_m4(ap[1]));
+        }
+    }
+}
+
+__global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv1_f16_kernel(
+    const uint32_t* __restrict__ A16, const uint8_t* __restrict__ B, uint16_t* __restrict__ Y,
+    const float* __restrict__ AS, const uint8_t* __restrict__ BS,
+    int N, int K,
+    int64_t b_pitch, int64_t y_pitch, int64_t bs_pitch)
+{
+    __shared__ uint32_t LUT[256];                  /* byte of two codes -> f16 pair */
+    LUT[threadIdx.x] = (uint32_t)kE2M1F16[threadIdx.x & 15u]
+                     | ((uint32_t)kE2M1F16[threadIdx.x >> 4] << 16);  /* low nibble = even k */
+
+    const int w    = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int r    = blockIdx.x * (kThreads / 32) + w;
+    const int rr   = r < N ? r : N - 1;
+
+    const uint8_t* crow = B + (int64_t)rr * b_pitch;
+    const uint8_t* brow = BS + (int64_t)rr * bs_pitch;
+
+    __syncthreads();                               /* LUT visible */
+
+    float a0 = 0.0f;
+    const int nspan = K >> 9;
+    const int tail  = K & 511;                     /* K % 128 == 0 gate: 128 or 384 */
+    for (int it = 0; it < nspan + (tail ? 1 : 0); ++it) {
+        const int kb  = it << 9;
+        const int rem = (it < nspan) ? 512 : tail;
+        const bool act = (lane << 4) < rem;
+        uint2  b8 = make_uint2(0u, 0u);
+        uint4  av0 = make_uint4(0u, 0u, 0u, 0u), av1 = make_uint4(0u, 0u, 0u, 0u);
+        if (act) {
+            const uint8_t* bp = crow + (kb >> 1) + (lane << 3);
+            if (!(((uintptr_t)bp) & 7u))
+                b8 = *(const uint2*)bp;
+            else {                                 /* 4-odd B (rare): two dwords */
+                b8.x = *(const uint32_t*)bp;
+                b8.y = *(const uint32_t*)(bp + 4);
+            }
+            const uint4* ap = (const uint4*)(A16 + (kb >> 1) + (lane << 3));
+            av0 = ap[0]; av1 = ap[1];              /* A16 is ours: always 16B aligned */
+        }
+        const int p     = lane >> 1;
+        const bool gact = (p << 5) < rem;
+        const int  g    = (it << 4) + (gact ? p : ((rem >> 5) - 1));
+        float sc = 0.0f;
+        if (gact) {
+            const uint8_t x = brow[g];
+            sc = (x == 0xffu) ? __uint_as_float(0x7fc00000u)
+               : (x == 0x00u) ? 0x1p-127f
+                              : __uint_as_float((uint32_t)x << 23);
+        }
+        float s = 0.0f;
+        if (act) {
+            const uint8_t* bx = (const uint8_t*)&b8;
+            const uint32_t av[8] = { av0.x, av0.y, av0.z, av0.w, av1.x, av1.y, av1.z, av1.w };
+#pragma unroll
+            for (int t = 0; t < 8; ++t)
+                s = dot2c_f16_m4(LUT[bx[t]], av[t], s);
+        }
+        s += __shfl_xor(s, 1);                     /* the pair owns group g */
+        const float sa = AS[g >> 2];
+        float c = gact ? (s * sa) * sc : 0.0f;
+#pragma unroll
+        for (int off = 2; off < kWave; off <<= 1)
+            c += __shfl_xor(c, off);
+        a0 += c;
+    }
+    if (lane == 0 && r < N) Y[r] = f32_to_bf16_m4(a0);
+}
+
 } /* anonymous namespace */
 
 #else  /* non-RDNA3: host-visible no-op, the launcher never dispatches it */
@@ -556,6 +693,10 @@ template <int MT>
 __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint8_t*,
     int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t) {}
+__global__ void m4_act_f16_kernel(const uint8_t*, uint32_t*, int, int64_t) {}
+__global__ void gemm_nt_mxfp4_gemv1_f16_kernel(
+    const uint32_t*, const uint8_t*, uint16_t*, const float*, const uint8_t*,
+    int, int, int64_t, int64_t, int64_t) {}
 } /* anonymous namespace */
 
 #endif
@@ -742,6 +883,41 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s) {
 
     const int mt = P.M >= 8 ? 8 : P.M >= 4 ? 4 : P.M >= 2 ? 2 : 1;
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
+
+    /* ---- dot2 leg (issue #6): M == 1 only, the decode step proper. The A16 plane is
+     * the plugin's OWN buffer: one lazy 1 MiB allocation (K <= 524288 covers every
+     * band this engine drives), never freed. Allocation failure falls back to the #5
+     * leg -- a mid-band UNSUPPORTED here would be the issue #4 "selected wrongly"
+     * abort, so this branch refuses nothing, it only chooses a kernel. R3D_NO_FP4_DOT2=1
+     * keeps the #5 leg: the shipped row stays byte-identical, the A/B arms are one env
+     * apart. 1 MiB of VRAM is invisible to the engine's budget; the serve's headroom
+     * (96 MiB as deployed) is the room it lands in. */
+    static const bool no_dot2 = getenv("R3D_NO_FP4_DOT2") != nullptr;
+    static uint32_t* a16 = nullptr;
+    static bool a16_dead = false;
+    if (mt == 1 && !no_dot2 && !a16_dead && P.K <= 524288) {
+        if (!a16) {
+            if (hipMalloc(&a16, 1u << 20) != hipSuccess) { a16 = nullptr; a16_dead = true; }
+        }
+        if (a16) {
+            const dim3 pgrid((unsigned)((P.K / 2 + 255) / 256));
+            hipLaunchKernelGGL(m4_act_f16_kernel, pgrid, dim3(256), 0, stream,
+                               P.A, a16, (int)P.K, P.a_pitch);
+            dim3 grid((unsigned)((P.N + 7) / 8));
+            hipLaunchKernelGGL(gemm_nt_mxfp4_gemv1_f16_kernel, grid, dim3(kThreads),
+                               0, stream, a16, P.B, (uint16_t*)Y->data, P.AS, P.BS,
+                               (int)P.N, (int)P.K, P.b_pitch, P.y_pitch, P.bs_pitch);
+            const hipError_t le = hipGetLastError();
+            if (le != hipSuccess) fprintf(stderr, "libr3d: mxfp4 dot2 leg launch FAILED (%s)\n",
+                                          hipGetErrorName(le));
+            else if (getenv("R3D_DEBUG_GEMM")) {
+                static bool once = false;
+                if (!once) { once = true; fprintf(stderr, "libr3d: mxfp4 dot2 leg launched\n"); }
+            }
+            return le == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+        }
+    }
+
     dim3 grid((unsigned)((P.N + 7) / 8));
     #define R3D_M4_GEMV(MT_)                                                        \
         hipLaunchKernelGGL((gemm_nt_mxfp4_gemv_kernel<MT_>), grid, dim3(kThreads),  \

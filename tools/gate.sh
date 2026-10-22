@@ -27,16 +27,17 @@ set -euo pipefail
 REPO="$HOME/projects/libr3d/libr3d"
 SCRATCH="$HOME/scratch/r3d"
 IMG=radiance-dev:v1.8.1
+BUILD="${R3D_BUILD:-build13}"   # pin the staged build dir; bump only after gates pass on it
 DEVS=(--device /dev/kfd --device /dev/dri --group-add video)
 
 stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
     local home=$1; shift
     local libs=(); while [ "$1" != "--" ]; do libs+=("$1"); shift; done; shift
-    docker run --rm "${DEVS[@]}" --shm-size=4g -v "$SCRATCH":/scratch -v "$REPO/build13":/build13:ro \
+    docker run --rm "${DEVS[@]}" --shm-size=4g -v "$SCRATCH":/scratch -v "$REPO/$BUILD":/build:ro \
         --entrypoint /bin/bash "$IMG" -c "
             mkdir -p /scratch/$home/kernels /scratch/$home/architectures
             rm -f /scratch/$home/kernels/*.so
-            cp /build13/radiance_home/kernels/libr3d.so /scratch/$home/kernels/
+            cp /build/radiance_home/kernels/libr3d.so /scratch/$home/kernels/
             for l in ${libs[*]}; do
                 [ \"\$l\" = libr3d.so ] || cp /opt/radiance/share/radiance/kernels/\$l /scratch/$home/kernels/
             done
