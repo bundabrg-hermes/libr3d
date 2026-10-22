@@ -56,13 +56,14 @@ import argparse
 import codecs
 import json
 import math
+import os
 import sys
 import time
 import urllib.error
 import urllib.request
 
 DEFAULT_URL = "http://localhost:9005"
-CORPUS_PATH = "/home/devuser/projects/libr3d/libr3d/tools/kldgate/corpus.jsonl"
+CORPUS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus.jsonl")
 
 GATE_MEAN_KLD = 2e-3
 GATE_P99_KLD = 5e-3

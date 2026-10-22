@@ -24,8 +24,8 @@
 # dir. radiance-co-tenant is production -- this script touches neither.
 set -euo pipefail
 
-REPO=/home/devuser/projects/libr3d/libr3d
-SCRATCH=/home/devuser/scratch/r3d
+REPO="$HOME/projects/libr3d/libr3d"
+SCRATCH="$HOME/scratch/r3d"
 IMG=radiance-dev:v1.8.1
 DEVS=(--device /dev/kfd --device /dev/dri --group-add video)
 

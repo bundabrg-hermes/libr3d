@@ -13,7 +13,7 @@
 set -euo pipefail
 
 IMG=radiance-dev:v1.8.1
-RHOME=/home/devuser/projects/libr3d/build/radiance_home
+RHOME="$HOME/projects/libr3d/build/radiance_home"
 NAME=libr3d-serve
 OUT=/tmp/kldgate-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
