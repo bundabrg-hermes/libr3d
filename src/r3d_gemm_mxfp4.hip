@@ -589,18 +589,21 @@ __device__ __forceinline__ float dot2c_f16_m4(uint32_t a, uint32_t b, float acc)
     return acc;
 }
 
-/* e2m1 as f16 bit patterns: the bf16 table's values, f16-biased (all exact). */
+/* e2m1 as f16 bit patterns: each negative is its positive | 0x8000 -- NOT a stride.
+ * (First ship had -3,-4,-6 as 0xC400/0xC600/0xC800, which are -4,-6,-8: the table
+ * is where the LUT lives, so random-code gates fail loudly while uniform-nibble
+ * probes with positive codes only pass silently.) */
 __device__ const uint16_t kE2M1F16[16] = {
     0x0000u, 0x3800u, 0x3C00u, 0x3E00u, 0x4000u, 0x4200u, 0x4400u, 0x4600u,
-    0x8000u, 0xB800u, 0xBC00u, 0xBE00u, 0xC000u, 0xC400u, 0xC600u, 0xC800u,
+    0x8000u, 0xB800u, 0xBC00u, 0xBE00u, 0xC000u, 0xC200u, 0xC400u, 0xC600u,
 };
 
 __global__ __launch_bounds__(256) void m4_act_f16_kernel(
-    const uint8_t* __restrict__ A, uint32_t* __restrict__ D, int K, int64_t a_pitch)
+    const uint8_t* __restrict__ A, uint32_t* __restrict__ D, int K)
 {
     const int half = K >> 1;                       /* K even: the plan gate says K % 128 */
     for (int i = blockIdx.x * 256 + threadIdx.x; i < half; i += gridDim.x * 256) {
-        const uint8_t* ap = A + a_pitch + 2 * i;   /* M == 1: row 0 only */
+        const uint8_t* ap = A + 2 * i;             /* M == 1: ROW 0 -- a_pitch is an offset FROM row 0 */
         if (!(((uintptr_t)ap) & 1u)) {
             const uint16_t two = *(const uint16_t*)ap;
             D[i] = f16_pair_m4(fp8e4m3_m4((uint8_t)(two & 0xffu)),
@@ -634,22 +637,38 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv1_f16_kernel(
     float a0 = 0.0f;
     const int nspan = K >> 9;
     const int tail  = K & 511;                     /* K % 128 == 0 gate: 128 or 384 */
-    for (int it = 0; it < nspan + (tail ? 1 : 0); ++it) {
+    const int nit   = nspan + (tail ? 1 : 0);
+
+    /* Double-buffered walk (#5's documented headroom): the span's GLOBAL loads are
+     * issued for it+1 before the current chain runs, so the ~600-cycle load latency
+     * overlaps the dot2 chain instead of stalling every wave at every span edge.
+     * (Both the #5 leg and the un-prefetched dot2 leg plateau near the same ~150
+     * GB/s -- the tell was that removing 20 VALU/byte bought only +5%.) */
+    const uint8_t* bp0 = crow + (lane << 3);
+    const uint4*  ap0 = (const uint4*)(A16 + (lane << 3));
+    bool actn = (lane << 4) < ((nspan ? 512 : tail));
+    uint2  b8n = make_uint2(0u, 0u);
+    uint4  av0n = make_uint4(0u, 0u, 0u, 0u), av1n = make_uint4(0u, 0u, 0u, 0u);
+    if (actn) {
+        const uint8_t* bp = bp0;
+        if (!(((uintptr_t)bp) & 7u)) b8n = *(const uint2*)bp;
+        else { b8n.x = *(const uint32_t*)bp; b8n.y = *(const uint32_t*)(bp + 4); }
+        av0n = ap0[0]; av1n = ap0[1];
+    }
+    for (int it = 0; it < nit; ++it) {
         const int kb  = it << 9;
         const int rem = (it < nspan) ? 512 : tail;
-        const bool act = (lane << 4) < rem;
-        uint2  b8 = make_uint2(0u, 0u);
-        uint4  av0 = make_uint4(0u, 0u, 0u, 0u), av1 = make_uint4(0u, 0u, 0u, 0u);
-        if (act) {
-            const uint8_t* bp = crow + (kb >> 1) + (lane << 3);
-            if (!(((uintptr_t)bp) & 7u))
-                b8 = *(const uint2*)bp;
-            else {                                 /* 4-odd B (rare): two dwords */
-                b8.x = *(const uint32_t*)bp;
-                b8.y = *(const uint32_t*)(bp + 4);
-            }
-            const uint4* ap = (const uint4*)(A16 + (kb >> 1) + (lane << 3));
-            av0 = ap[0]; av1 = ap[1];              /* A16 is ours: always 16B aligned */
+        const bool act = actn;
+        uint2  b8 = b8n;
+        uint4  av0 = av0n, av1 = av1n;
+        const int kbn = kb + 512;
+        actn = (it + 1 < nit) && ((lane << 4) < ((it + 1 < nspan) ? 512 : tail));
+        if (actn) {
+            const uint8_t* bp = crow + (kbn >> 1) + (lane << 3);
+            if (!(((uintptr_t)bp) & 7u)) b8n = *(const uint2*)bp;
+            else { b8n.x = *(const uint32_t*)bp; b8n.y = *(const uint32_t*)(bp + 4); }
+            const uint4* ap = (const uint4*)(A16 + (kbn >> 1) + (lane << 3));
+            av0n = ap[0]; av1n = ap[1];
         }
         const int p     = lane >> 1;
         const bool gact = (p << 5) < rem;
@@ -693,7 +712,7 @@ template <int MT>
 __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint8_t*,
     int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t) {}
-__global__ void m4_act_f16_kernel(const uint8_t*, uint32_t*, int, int64_t) {}
+__global__ void m4_act_f16_kernel(const uint8_t*, uint32_t*, int) {}
 __global__ void gemm_nt_mxfp4_gemv1_f16_kernel(
     const uint32_t*, const uint8_t*, uint16_t*, const float*, const uint8_t*,
     int, int, int64_t, int64_t, int64_t) {}
@@ -884,25 +903,27 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s) {
     const int mt = P.M >= 8 ? 8 : P.M >= 4 ? 4 : P.M >= 2 ? 2 : 1;
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
 
-    /* ---- dot2 leg (issue #6): M == 1 only, the decode step proper. The A16 plane is
-     * the plugin's OWN buffer: one lazy 1 MiB allocation (K <= 524288 covers every
-     * band this engine drives), never freed. Allocation failure falls back to the #5
-     * leg -- a mid-band UNSUPPORTED here would be the issue #4 "selected wrongly"
-     * abort, so this branch refuses nothing, it only chooses a kernel. R3D_NO_FP4_DOT2=1
-     * keeps the #5 leg: the shipped row stays byte-identical, the A/B arms are one env
-     * apart. 1 MiB of VRAM is invisible to the engine's budget; the serve's headroom
-     * (96 MiB as deployed) is the room it lands in. */
-    static const bool no_dot2 = getenv("R3D_NO_FP4_DOT2") != nullptr;
+    /* ---- dot2 leg (issue #6): M == 1 only. OPT-IN (R3D_FP4_DOT2=1): measured on the
+     * ctx-512 serve A/B, one binary one env apart, it is +5% at best (pair medians
+     * BASE 22.6/23.0 vs DOT2 24.2), 0% at ctx-3.3k -- the leg is correct and gated
+     * but the GEMV wall is NOT instruction issue (24->2.6 VALU/byte bought 5%) and
+     * not span latency (double-buffering bought 0%). Default-off keeps the shipped
+     * #5 behaviour byte-identical until profiling finds the real bound. The A16 plane
+     * is the plugin's OWN buffer: one lazy 1 MiB allocation, never freed; failure
+     * falls back to the #5 leg -- never a mid-band refusal (the issue #4 lesson).
+     * 1 MiB of VRAM is invisible to the engine's budget; the serve headroom is the
+     * room it lands in. */
+    static const bool dot2_on = getenv("R3D_FP4_DOT2") != nullptr;
     static uint32_t* a16 = nullptr;
     static bool a16_dead = false;
-    if (mt == 1 && !no_dot2 && !a16_dead && P.K <= 524288) {
+    if (mt == 1 && dot2_on && !a16_dead && P.K <= 524288) {
         if (!a16) {
             if (hipMalloc(&a16, 1u << 20) != hipSuccess) { a16 = nullptr; a16_dead = true; }
         }
         if (a16) {
             const dim3 pgrid((unsigned)((P.K / 2 + 255) / 256));
             hipLaunchKernelGGL(m4_act_f16_kernel, pgrid, dim3(256), 0, stream,
-                               P.A, a16, (int)P.K, P.a_pitch);
+                               P.A, a16, (int)P.K);
             dim3 grid((unsigned)((P.N + 7) / 8));
             hipLaunchKernelGGL(gemm_nt_mxfp4_gemv1_f16_kernel, grid, dim3(kThreads),
                                0, stream, a16, P.B, (uint16_t*)Y->data, P.AS, P.BS,

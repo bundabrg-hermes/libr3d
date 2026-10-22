@@ -33,7 +33,8 @@ DEVS=(--device /dev/kfd --device /dev/dri --group-add video)
 stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
     local home=$1; shift
     local libs=(); while [ "$1" != "--" ]; do libs+=("$1"); shift; done; shift
-    docker run --rm "${DEVS[@]}" --shm-size=4g -v "$SCRATCH":/scratch -v "$REPO/$BUILD":/build:ro \
+    local envs=(); [ -n "${R3D_FP4_DOT2:-}" ] && envs+=(-e R3D_FP4_DOT2="$R3D_FP4_DOT2")
+    docker run --rm "${DEVS[@]}" "${envs[@]}" --shm-size=4g -v "$SCRATCH":/scratch -v "$REPO/$BUILD":/build:ro \
         --entrypoint /bin/bash "$IMG" -c "
             mkdir -p /scratch/$home/kernels /scratch/$home/architectures
             rm -f /scratch/$home/kernels/*.so
