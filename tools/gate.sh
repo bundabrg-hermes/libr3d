@@ -29,14 +29,22 @@ SCRATCH="$HOME/scratch/r3d"
 IMG=radiance-dev:v1.8.1
 BUILD="${R3D_BUILD:-build13}"   # pin the staged build dir; bump only after gates pass on it
 DEVS=(--device /dev/kfd --device /dev/dri --group-add video)
+# ROCr index of the gfx1100 XTX on this box. NEVER rely on device 0: after the slot
+# move the enumeration is [gfx1201, gfx1100, gfx1201], and kbench on device 0 silently
+# drops libr3d's 49 gfx11 code objects and reports a phantom all-libref pass (2026-10-23).
+# Re-verify with: docker run --rm "${DEVS[@]}" radiance-dev:v1.8.1 rad-kbench --fixture ...
+# (the 'device:' line lists indices) or rocm-smi --showproductname. Override: R3D_ROCR=<idx>.
+ROCR="${R3D_ROCR:-1}"
 
 stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
     local home=$1; shift
     local libs=(); while [ "$1" != "--" ]; do libs+=("$1"); shift; done; shift
-    local envs=(); [ -n "${R3D_FP4_DOT2:-}" ] && envs+=(-e R3D_FP4_DOT2="$R3D_FP4_DOT2")
+    local envs=(-e ROCR_VISIBLE_DEVICES="$ROCR")
+    [ -n "${R3D_FP4_DOT2:-}" ] && envs+=(-e R3D_FP4_DOT2="$R3D_FP4_DOT2")
     [ -n "${R3D_NO_GEMV_PF:-}" ] && envs+=(-e R3D_NO_GEMV_PF="$R3D_NO_GEMV_PF")
     [ -n "${R3D_GEMV_PF_W:-}" ] && envs+=(-e R3D_GEMV_PF_W="$R3D_GEMV_PF_W")
     [ -n "${R3D_FP4_GEMV_PF:-}" ] && envs+=(-e R3D_FP4_GEMV_PF="$R3D_FP4_GEMV_PF")
+    local out rc; out=$(mktemp); rc=0
     docker run --rm "${DEVS[@]}" "${envs[@]}" --shm-size=4g -v "$SCRATCH":/scratch -v "$REPO/$BUILD":/build:ro \
         --entrypoint /bin/bash "$IMG" -c "
             mkdir -p /scratch/$home/kernels /scratch/$home/architectures
@@ -46,7 +54,16 @@ stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
                 [ \"\$l\" = libr3d.so ] || cp /opt/radiance/share/radiance/kernels/\$l /scratch/$home/kernels/
             done
             rad-kbench --home /scratch/$home \"\$@\"
-        " _ "$@"
+        " _ "$@" > "$out" 2>&1 || rc=$?
+    # HARD assertion: kbench must have seen ONLY the XTX as its device 0. A gate that
+    # ran anywhere else is a phantom (libr3d rows silently excluded), never a result.
+    if ! grep -q "1 device(s) \[0:gfx1100\]" "$out"; then
+        echo "FATAL: kbench did not run on the gfx1100 alone (R3D_ROCR=$ROCR is wrong?)." >&2
+        grep -m2 -E "device:|no device code" "$out" >&2
+        rm -f "$out"; return 3
+    fi
+    cat "$out"; rm -f "$out"
+    return $rc
 }
 
 tee_log() {  # tee_log <stem>: console + $SCRATCH/<stem>.log (the host name of /scratch)
