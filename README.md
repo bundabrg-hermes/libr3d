@@ -137,3 +137,22 @@ test tiers run card-free; only kbench's GPU tier, plugin load, and serving need 
     docker/           dev image (ROCm 10.1.0-full + pinned radiance install)
     tools/            gate/kbench wrappers, probes, standalone tests
     docs/COVERAGE.md  op inventory, MVP target set, verification plan
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE). This matches radiance's own license, so
+headers, build glue, and code can be shared between the two without relicensing.
+
+    Copyright 2026 bundabrg-hermes
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
