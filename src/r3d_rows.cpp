@@ -291,6 +291,20 @@ static const RadOperandSpec oDry[] = {
     { "history",  RAD_OPD_IN,    0 },
     { "breakers", RAD_OPD_IN,    1 },
 };
+/* The n-gram ban's own plane: one i32 {n-gram length, window} pair a row (n 0 = off,
+ *  window <= 0 = the whole staged history). A plane beside `params` rather than fields
+ *  in it, because the params row is the fixed 24-word RadSampleParams every sampler op
+ *  shares. */
+/* `whitelist` is optional: a bitmask plane a row (a SET bit exempts that column from
+ *  the ban, the reference's whitelist), [M, ceil(n_vocab/32)] i32/u32, contiguous.
+ *  Absent, nothing is exempt. */
+static const RadOperandSpec oNgramBan[] = {
+    { "logits",    RAD_OPD_INOUT, 0 },
+    { "params",    RAD_OPD_IN,    0 },
+    { "history",   RAD_OPD_IN,    0 },
+    { "ngram",     RAD_OPD_IN,    0 },
+    { "whitelist", RAD_OPD_IN,    1 },
+};
 static const RadParamSpec pLogprobs[] = {
     { "M",         RAD_P_INT, RAD_REQUIRED },
     { "n_vocab",   RAD_P_INT, RAD_REQUIRED },
@@ -788,6 +802,14 @@ static const RadOpSchema kSchemas[] = {
         "the DRY repetition-suffix penalty: the longest suffix of the window that repeats "
         "before each continuation, multiplier times base^(length - allowed), capped at the "
         "float overflow boundary. An optional breaker plane exempts positions." },
+      { "sample_ngram_ban", pPenal, (int)(sizeof(pPenal)/sizeof(pPenal[0])),
+        oNgramBan, (int)(sizeof(oNgramBan)/sizeof(oNgramBan[0])),
+        "the windowed no-repeat-ngram ban: every token completing an n-gram the last "
+        "`window` tokens of the row's history contain is set to -infinity. `ngram` is "
+        "one i32 {n, window} pair a row; the window bounds the n-gram's START index, as "
+        "in the reference, window <= 0 searches the whole span and n 0 is off. The "
+        "optional `whitelist` bitmask exempts a token whose column bit is set; absent, "
+        "nothing is exempt." },
       { "sample_typical", pMCand, (int)(sizeof(pMCand)/sizeof(pMCand[0])),
         oNarrow, (int)(sizeof(oNarrow)/sizeof(oNarrow[0])),
         "locally typical narrowing: keep the candidates whose |surprisal - entropy| mass "
@@ -1163,6 +1185,7 @@ extern "C" int r3d_rad_sample_pick(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_penalties(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_dry(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_typical(const RadArgs*, RadStream);
+extern "C" int r3d_rad_sample_ngram_ban(const RadArgs*, RadStream);
 extern "C" int r3d_rad_dflash_conv(const RadArgs*, RadStream);
 extern "C" int r3d_rad_dflash_select(const RadArgs*, RadStream);
 extern "C" int r3d_rad_logit_rerank(const RadArgs*, RadStream);
@@ -1806,6 +1829,22 @@ static const RadKernelInfo kRows[] = {
   cLogitRerank, 6, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_logit_rerank },
 
+{ "sample_ngram_ban_f32", "sample_ngram_ban", "sample",
+  "the windowed no-repeat-ngram ban (Unlimited-OCR's "
+  "SlidingWindowNoRepeatNgramProcessor): every token that would complete an n-gram "
+  "the last `window` tokens of the row's history contain is set to -infinity",
+  "any vocabulary; ONE BLOCK A ROW, the search positions dealt across its threads, "
+  "the n-1-token prefix staged in LDS (plane reads past 256); integer comparisons "
+  "and one constant store, so it is bit-identical to libref, and the same column "
+  "written by two positions is an idempotent -infinity; history is a dense i32 "
+  "[M, hmax] with numel == M * hmax, the pair plane is dense pairs or [rows, 2] at "
+  "its pitch, the whitelist [rows, ceil(n_vocab/32)] at unit column stride",
+  "f32 logits in place, i32 history, i32/u32 {n, window} pair, optional i32/u32 "
+  "whitelist bitmask, per-row params",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cSampleVoc, 1, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_sample_ngram_ban },
+
 };
 
 /* R3D_NO_GDN=1 withdraws the five GDN rows/schemas from the registration, which is the
@@ -1841,6 +1880,8 @@ static bool r3d_band_row_hidden(const RadKernelInfo& k) {
     static const bool no_mx   = getenv("R3D_NO_MXFP4") != nullptr;
     static const bool no_mxd  = getenv("R3D_NO_FP4_DEC") != nullptr;
     static const bool no_df   = getenv("R3D_NO_DFLASH") != nullptr;
+    static const bool no_ngb  = getenv("R3D_NO_NGRAM_BAN") != nullptr;
+    if (no_ngb && !strcmp(k.op, "sample_ngram_ban")) return true;   /* engine sampler band */
     if (no_df && (!strcmp(k.op, "dflash_conv") || !strcmp(k.op, "dflash_select") ||
                   !strcmp(k.op, "logit_rerank"))) return true;   /* drafter family (issue #9) */
     if (!strcmp(k.name, "gemm_nt_q_fp8a8_decode")) return no_fp8 || no_f8d;
