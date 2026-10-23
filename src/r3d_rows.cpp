@@ -983,6 +983,18 @@ static const RadConstraint cMxfp4DecodeRow[] = {
     { "K",     RAD_C_DIV, 128, nullptr },
 };
 
+/* gemm_nt_q w2a8 decode band: the DFlash2 draft head (the container declares the
+ * grid only when the draft weight carries its 2-bit recipe). libr4d's cGemmNtW2A8
+ * (K DIV 128, N DIV 16, dtype w2a8) plus the decode band M <= 8 and the checkpoint's
+ * group; the entry re-checks every dtype, the band's bound, and the dword walk. */
+static const RadConstraint cW2A8DecodeRow[] = {
+    { "dtype", RAD_C_IN,  0,    "w2a8" },
+    { "K",     RAD_C_DIV, 128,  nullptr },
+    { "N",     RAD_C_DIV, 16,   nullptr },
+    { "M",     RAD_C_LE,  8,    nullptr },
+    { "group", RAD_C_EQ,  128,  nullptr },
+};
+
 /* gemm_nt_q_gated fp8a8: the composed row (tile into scratch, gated_quant epilogue)
  * sizes its arena at the band's M bound, so the band stops at 64 -- the whole dflash
  * drafter M range this container declares. act silu and sigmoid both compile in the
@@ -1010,6 +1022,8 @@ enum { R3D_PRIO_ATTN_DECODE = 1100 };   /* split-KV rows win the decode band fro
 enum { R3D_PRIO_FP8_DECODE  = 1100 };   /* same law for gemm_nt_q: the width row wins
                                            M <= 8 from the m64 tile (issue #4) */
 enum { R3D_PRIO_MXFP4_DECODE = 1100 };  /* the mxfp4 band's own width row (issue #5) */
+enum { R3D_PRIO_W2A8_DECODE = 1100 };   /* same law: the width row owns the band; nothing
+                                         * else in this plugin claims w2a8 at all */
 
 /* act_mul: the bf16 gated MLP, all four oracle activations this kernel ports. */
 static const RadConstraint cActMul[] = {
@@ -1186,6 +1200,15 @@ extern "C" int r3d_rad_sample_penalties(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_dry(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_typical(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_ngram_ban(const RadArgs*, RadStream);
+extern "C" int r3d_rad_logit_rerank_e4m3(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gemm_nt_q_w2a8_decode(const RadArgs*, RadStream);
+extern "C" int r3d_layout_gemm_w2a8(const RadParam*, int, int, const RadEncoding*,
+                                    const int*, const RadTensor*, int, RadLayout*);
+extern "C" int r3d_relayout_gemm_w2a8(const RadParam*, int, int, const RadEncoding*,
+                                      const int*, const RadTensor*, int, void*, int64_t);
+extern "C" int r3d_unrelayout_gemm_w2a8(const RadParam*, int, int, const RadEncoding*,
+                                        const int*, const void*, int64_t,
+                                        const RadTensor*, int);
 extern "C" int r3d_rad_dflash_conv(const RadArgs*, RadStream);
 extern "C" int r3d_rad_dflash_select(const RadArgs*, RadStream);
 extern "C" int r3d_rad_logit_rerank(const RadArgs*, RadStream);
@@ -1404,6 +1427,29 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_MXFP4_DECODE,
   cMxfp4DecodeRow, 3, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gemm_nt_q_mxfp4_decode },
+
+{ "gemm_nt_q_w2a8_decode", "gemm_nt_q", "gemm",
+  "w2a8 decode-band GEMV (the DFlash2 draft head): warp per weight row, one aligned "
+  "dword per lane per four scale groups -- sixteen unsigned 2-bit codes per lane -- "
+  "the int8 activation staged per 512-of-K window through LDS with quant_act_i8's "
+  "step order de-permuted in the staging index; each group's partial folds through "
+  "an octet butterfly and flushes as (sub * a_scale) * b_scale in the oracle's "
+  "order, sub = is - zero * a_sum first -- every value before the scales is an exact "
+  "f32 integer, so the fold is bit-exact to ref_gemm's gemm_zp, not merely close",
+  "M <= 8 (the drafter's whole gemm_nt_q band; everything else resolves past the "
+  "row); K a multiple of 128; N a multiple of 16 (libr4d's rule); group exactly "
+  "128; M derives from numel(y)/N; a B whose base or row pitch breaks the dword "
+  "walk resolves past the row, as everything past the band does -- to the host",
+  "int8 a with an f32 per-row scale (quant_act_i8's step order), u2 b (the codes "
+  "plane stored as it is) with an f16 scale and a u8/u4 zero per 128 K in the "
+  "canonical rad.planes join (libref's own layout), f32 a_sum = quant_act_i8's "
+  "group-major [K/128][Mpad] sums (REQUIRED -- the zero point's correction), bf16 "
+  "y; b_ref refused; pb1/pb2 refused; an encoding transform declines at declare",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_W2A8_DECODE,
+  cW2A8DecodeRow, 5, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gemm_nt_q_w2a8_decode,
+  nullptr, r3d_layout_gemm_w2a8, r3d_relayout_gemm_w2a8, nullptr,
+  r3d_unrelayout_gemm_w2a8 },
 
 { "gemm_nt_q_gated_fp8a8", "gemm_nt_q_gated", "gemm",
   "the fp8a8 tile writing its bf16 gate_up plane into the launch scratch, closed by the "
@@ -1829,6 +1875,25 @@ static const RadKernelInfo kRows[] = {
   cLogitRerank, 6, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_logit_rerank },
 
+{ "logit_rerank_e4m3", "logit_rerank", "select",
+  "R candidates a row rescored exactly against the joined e4m3 lm_head; one wave "
+  "per row, thread r owning candidate r's whole chain over codes*scale read "
+  "element by element, then the oracle's selection sort",
+  "any M, R <= 32; the joined e4m3 head r3d_layout_head admits -- codes [n_vocab, "
+  "n_embd] e4m3 dense + one float scale per (1 or 128 rows, 128 cols), untrans"
+  "formed affine; plain and i8 heads resolve elsewhere by the hook's own answers; "
+  "M derives from numel(x)/n_embd; idx_in/idx/val at their own row pitches, pairs "
+  "only densely packed (ref reads it flat)",
+  "bf16/f32 x, joined e4m3+bf16/f16/f32 head, f32 values + i32 ids out, optional "
+  "f32 pairs plane; code*scale is ONE f32 rounding (ref_planes.h ScaledRows), the "
+  "dots accumulate in DOUBLE ascending k (ref_common.h's named exception) and "
+  "narrow once -- bit-exact by construction, the exact-chain sibling of "
+  "logits_gemm_e4m3's bandwidth f32 chain",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cLogitRerank, 6, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_logit_rerank_e4m3,
+  nullptr, r3d_layout_head, r3d_relayout_head, nullptr, r3d_unrelayout_head },
+
 { "sample_ngram_ban_f32", "sample_ngram_ban", "sample",
   "the windowed no-repeat-ngram ban (Unlimited-OCR's "
   "SlidingWindowNoRepeatNgramProcessor): every token that would complete an n-gram "
@@ -1883,7 +1948,8 @@ static bool r3d_band_row_hidden(const RadKernelInfo& k) {
     static const bool no_ngb  = getenv("R3D_NO_NGRAM_BAN") != nullptr;
     if (no_ngb && !strcmp(k.op, "sample_ngram_ban")) return true;   /* engine sampler band */
     if (no_df && (!strcmp(k.op, "dflash_conv") || !strcmp(k.op, "dflash_select") ||
-                  !strcmp(k.op, "logit_rerank"))) return true;   /* drafter family (issue #9) */
+                  !strcmp(k.op, "logit_rerank") ||
+                  !strcmp(k.name, "gemm_nt_q_w2a8_decode"))) return true;   /* drafter family (issue #9) */
     if (!strcmp(k.name, "gemm_nt_q_fp8a8_decode")) return no_fp8 || no_f8d;
     if (!strcmp(k.name, "gemm_nt_q_mxfp4_decode")) return no_mx || no_mxd;
     if (!strcmp(k.name, "gemm_nt_q_mxfp4"))        return no_mx;
