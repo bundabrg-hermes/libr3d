@@ -44,6 +44,7 @@ stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
     [ -n "${R3D_NO_GEMV_PF:-}" ] && envs+=(-e R3D_NO_GEMV_PF="$R3D_NO_GEMV_PF")
     [ -n "${R3D_GEMV_PF_W:-}" ] && envs+=(-e R3D_GEMV_PF_W="$R3D_GEMV_PF_W")
     [ -n "${R3D_FP4_GEMV_PF:-}" ] && envs+=(-e R3D_FP4_GEMV_PF="$R3D_FP4_GEMV_PF")
+    [ -n "${R3D_FP4_CHAIN:-}" ] && envs+=(-e R3D_FP4_CHAIN="$R3D_FP4_CHAIN")
     local out rc; out=$(mktemp); rc=0
     docker run --rm "${DEVS[@]}" "${envs[@]}" --shm-size=4g -v "$SCRATCH":/scratch -v "$REPO/$BUILD":/build:ro \
         --entrypoint /bin/bash "$IMG" -c "

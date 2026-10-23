@@ -383,8 +383,20 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_m64_kernel(
  * MT>=2 lost 15%). The #5 loop is already self-pipelined by the scheduler and the
  * family is not MLP-starved — the profile prescription is falsified for this GEMV.
  * Default dispatch is therefore W=1 (the #5 arm verbatim); R3D_FP4_GEMV_PF=1 opts
- * into W=4 for re-measurement. fp8 is the opposite story and ships W=8. */
-template <int MT, int W>
+ * into W=4 for re-measurement. fp8 is the opposite story and ships W=8.
+ *
+ * CH (issue #8, MT == 1 leg): the #7 follow-up probe (tools/probe_mlp.hip) pinned the
+ * model-band plateau on the SERIAL 16-FMA chain per lane -- one dependent chain of
+ * ~80 cycles covering only 2 loads per span. Tiers: loads without math run 448-1123
+ * GB/s at every model shape; the verbatim span body drops to 124-286; splitting the
+ * chain into 2-4 interleaved partials recovers 1.27-1.90x at model shapes (chain x2
+ * at 4096^2: 235 vs 124) because the loads that feed DRAM finally issue back-to-back.
+ * sq[t%CH] with a fixed-order combine reduces to the ORIGINAL order verbatim at CH=1
+ * (bit-exact default); CH>1 re-associates the 16-term sum, so the CH arms are
+ * tolerance-graded against libref, not bit-exact (#6 precedent). Giant out-of-serve
+ * shapes lose ~11% at CH>1 (DRAM-bound there); the serve never runs one.
+ * Opt-in: R3D_FP4_CHAIN=2|4 (W=1 arm only; the W=4 PF arm stays CH=1). */
+template <int MT, int W, int CH = 1>
 __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, uint16_t* __restrict__ Y,
     const float* __restrict__ AS, const uint8_t* __restrict__ BS,
@@ -477,15 +489,23 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
             const int  g   = (it << 4) + (gact ? p : ((rem >> 5) - 1));
             uint4 av;
             load_act(it, av);
-            float s = 0.0f;
+            /* CH interleaved accumulator chains (#8): CH=1 reduces to the oracle's
+             * single 16-term chain verbatim (bit-exact); CH>1 splits it into CH
+             * independent chains summed in fixed order. */
+            float sq[CH];
+#pragma unroll
+            for (int q = 0; q < CH; ++q) sq[q] = 0.0f;
             if (act) {
                 const uint8_t* ax = (const uint8_t*)&av;
 #pragma unroll
                 for (int t = 0; t < 16; ++t) {
                     const uint32_t nib = (t < 8 ? b8.x : b8.y) >> (4 * (t & 7));
-                    s = __fmaf_rn(fp8e4m3_gemv(ax[t]), L16[nib & 15u], s);
+                    sq[t % CH] = __fmaf_rn(fp8e4m3_gemv(ax[t]), L16[nib & 15u], sq[t % CH]);
                 }
             }
+            float s = sq[0];
+#pragma unroll
+            for (int q = 1; q < CH; ++q) s += sq[q];
             s += __shfl_xor(s, 1);                   /* the pair owns group g */
             const float sa = AS[g >> 2];
             float c = gact ? (s * sa) * sc : 0.0f;
@@ -1016,28 +1036,41 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s) {
     dim3 grid((unsigned)((P.N + 7) / 8));
     static const bool pf4 = getenv("R3D_FP4_GEMV_PF") != nullptr &&
                             getenv("R3D_NO_GEMV_PF") == nullptr;        /* opt-in, issue #7 */
-    #define R3D_M4_GEMV(MT_, W_)                                                 \
-        hipLaunchKernelGGL((gemm_nt_mxfp4_gemv_kernel<MT_, W_>), grid,           \
-                           dim3(kThreads),                                        \
-                           0, stream, P.A, P.B, (uint16_t*)Y->data, P.AS, P.BS,   \
-                           (int)P.M, (int)P.N, (int)P.K,                          \
+    static const int  ch4 = [] {                                          /* opt-in, issue #8 */
+        const char* e = getenv("R3D_FP4_CHAIN");
+        return (e && e[0] == '4') ? 4 : (e && e[0] == '2') ? 2 : 1;
+    }();
+    #define R3D_M4_GEMV(MT_, W_, CH_)                                          \
+        hipLaunchKernelGGL((gemm_nt_mxfp4_gemv_kernel<MT_, W_, CH_>), grid,    \
+                           dim3(kThreads),                                     \
+                           0, stream, P.A, P.B, (uint16_t*)Y->data, P.AS, P.BS,\
+                           (int)P.M, (int)P.N, (int)P.K,                       \
                            P.a_pitch, P.b_pitch, P.y_pitch, P.as_pitch, P.bs_pitch)
-    #define R3D_M4_GEMV_SW(W_)                            \
-        switch (mt) {                                      \
-            case 1: R3D_M4_GEMV(1, W_); break;             \
-            case 2: R3D_M4_GEMV(2, W_); break;             \
-            case 4: R3D_M4_GEMV(4, W_); break;             \
-            default: R3D_M4_GEMV(8, W_); break;            \
+    if (pf4) {
+        switch (mt) {
+            case 1: R3D_M4_GEMV(1, 4, 1); break;      /* PF arm stays CH=1 */
+            case 2: R3D_M4_GEMV(2, 4, 1); break;
+            case 4: R3D_M4_GEMV(4, 4, 1); break;
+            default: R3D_M4_GEMV(8, 4, 1); break;
         }
-    if (pf4) { R3D_M4_GEMV_SW(4) } else { R3D_M4_GEMV_SW(1) }
-    #undef R3D_M4_GEMV_SW
+    } else {
+        switch (mt) {
+            case 1: if (ch4 == 4)      R3D_M4_GEMV(1, 1, 4);
+                    else if (ch4 == 2) R3D_M4_GEMV(1, 1, 2);
+                    else               R3D_M4_GEMV(1, 1, 1);
+                    break;
+            case 2: R3D_M4_GEMV(2, 1, 1); break;
+            case 4: R3D_M4_GEMV(4, 1, 1); break;
+            default: R3D_M4_GEMV(8, 1, 1); break;
+        }
+    }
     #undef R3D_M4_GEMV
     const hipError_t le = hipGetLastError();
     if (le != hipSuccess) fprintf(stderr, "libr3d: mxfp4 decode gemv launch FAILED (%s)\n",
                                   hipGetErrorName(le));
     else if (getenv("R3D_DEBUG_GEMM")) {
         static bool once = false;
-        if (!once) { once = true; fprintf(stderr, "libr3d: mxfp4 decode gemv launched (mt=%d)\n", mt); }
+        if (!once) { once = true; fprintf(stderr, "libr3d: mxfp4 decode gemv launched (mt=%d ch=%d)\n", mt, ch4); }
     }
     return le == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
