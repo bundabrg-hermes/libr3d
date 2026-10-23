@@ -78,8 +78,9 @@ case "${1:-}" in
     op)
         op=${2:?usage: gate.sh op <op-name> [report-stem]}
         stem=${3:-gate_$op}
+        fix="${R3D_FIXTURE:-/scratch/mxfp4_nodraft.rkb}"
         stage_and_run home_attr libr3d.so libref.so -- \
-            --fixture /scratch/mxfp4_nodraft.rkb --op "$op" --report "/scratch/$stem.md" \
+            --fixture "$fix" --op "$op" --report "/scratch/$stem.md" \
             | tee_log "$stem"
         ;;
     stock)
