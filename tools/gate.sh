@@ -34,6 +34,7 @@ stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
     local home=$1; shift
     local libs=(); while [ "$1" != "--" ]; do libs+=("$1"); shift; done; shift
     local envs=(); [ -n "${R3D_FP4_DOT2:-}" ] && envs+=(-e R3D_FP4_DOT2="$R3D_FP4_DOT2")
+    [ -n "${R3D_NO_GEMV_PF:-}" ] && envs+=(-e R3D_NO_GEMV_PF="$R3D_NO_GEMV_PF")
     docker run --rm "${DEVS[@]}" "${envs[@]}" --shm-size=4g -v "$SCRATCH":/scratch -v "$REPO/$BUILD":/build:ro \
         --entrypoint /bin/bash "$IMG" -c "
             mkdir -p /scratch/$home/kernels /scratch/$home/architectures

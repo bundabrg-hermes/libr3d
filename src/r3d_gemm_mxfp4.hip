@@ -376,7 +376,7 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_m64_kernel(
  * quads 4..7 predicate off entirely (no OOB scale byte, no OOB row read), so a K that is
  * a multiple of 128 but not of 256 costs one half-width span, not a row refusal.
  */
-template <int MT>
+template <int MT, bool PF>
 __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, uint16_t* __restrict__ Y,
     const float* __restrict__ AS, const uint8_t* __restrict__ BS,
@@ -418,12 +418,21 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
         float a0 = 0.0f;
         const int nspan = K >> 9;
         const int tail  = K & 511;                   /* K % 128 == 0 gate: 128 or 384 */
-        for (int it = 0; it < nspan + (tail ? 1 : 0); ++it) {
+        const int ntot  = nspan + (tail ? 1 : 0);
+        /* PF (issue #7 MLP fix, same story as the fp8 GEMV): the profile counted ~1
+         * outstanding load per lane; here each span issues a uint2 of codes + a uint4
+         * of activations + a scale byte and consumes them immediately. PF batches W
+         * spans' loads -- the SAME bytes, same lane mapping, same predicates, all
+         * independent -- so 96 B/lane fly before the first FFMA of the window. */
+        constexpr int W = PF ? 4 : 1;
+
+        auto load_span = [&](int it, uint2& b8, uint4& av, float& sc) {
             const int kb  = it << 9;
             const int rem = (it < nspan) ? 512 : tail;
             const bool act = (lane << 4) < rem;
-            uint2  b8 = make_uint2(0u, 0u);
-            uint4  av = make_uint4(0u, 0u, 0u, 0u);
+            b8 = make_uint2(0u, 0u);
+            av = make_uint4(0u, 0u, 0u, 0u);
+            sc = 0.0f;
             if (act) {
                 const uint8_t* bp = crow + (kb >> 1) + (lane << 3);
                 if (!(((uintptr_t)bp) & 7u))
@@ -444,13 +453,19 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
             const int p    = lane >> 1;              /* this pair's slot inside the span */
             const bool gact = (p << 5) < rem;
             const int  g   = (it << 4) + (gact ? p : ((rem >> 5) - 1));
-            float sc = 0.0f;
             if (gact) {
                 const uint8_t x = brow[g];
                 sc = (x == 0xffu) ? __uint_as_float(0x7fc00000u)
                    : (x == 0x00u) ? 0x1p-127f
                                   : __uint_as_float((uint32_t)x << 23);
             }
+        };
+        auto consume_span = [&](int it, const uint2& b8, const uint4& av, float sc) {
+            const int rem = (it < nspan) ? 512 : tail;
+            const bool act = (lane << 4) < rem;
+            const int p    = lane >> 1;
+            const bool gact = (p << 5) < rem;
+            const int  g   = (it << 4) + (gact ? p : ((rem >> 5) - 1));
             float s = 0.0f;
             if (act) {
                 const uint8_t* ax = (const uint8_t*)&av;
@@ -467,39 +482,64 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
             for (int off = 2; off < kWave; off <<= 1)
                 c += __shfl_xor(c, off);
             a0 += c;
+        };
+
+        struct M4Win { uint2 b8; uint4 av; float sc; };
+        for (int gbase = 0; gbase < ntot; gbase += W) {
+            const int remw = (ntot - gbase < W) ? (ntot - gbase) : W;
+            M4Win win[W];
+            if constexpr (PF) {
+#pragma unroll
+                for (int d = 0; d < W; ++d)
+                    if (d < remw) load_span(gbase + d, win[d].b8, win[d].av, win[d].sc);
+            }
+            for (int d = 0; d < remw; ++d) {
+                const int it = gbase + d;
+                if constexpr (PF) consume_span(it, win[d].b8, win[d].av, win[d].sc);
+                else {
+                    uint2 b8; uint4 av; float sc;
+                    load_span(it, b8, av, sc);
+                    consume_span(it, b8, av, sc);
+                }
+            }
         }
         if (lane == 0 && r < N) Y[r] = f32_to_bf16_m4(a0);
         return;
     }
 
-    for (int it = 0; it < n256 + (partial ? 1 : 0); ++it) {
+    /* MT >= 2 leg, PF (issue #7): window the per-span dword + scale byte the same
+     * way as the M==1 leg. The xs staging keeps its per-span barriers (xs is
+     * single-buffered); the burst just issues W spans ahead of them, so the weight
+     * stream flies across every barrier the staging must pay. */
+    const int ntot2 = n256 + (partial ? 1 : 0);
+    constexpr int W2 = PF ? 4 : 1;
+
+    auto load_sp2 = [&](int it, uint32_t& b4, float& sc) {
         const int kb   = it << 8;
         const int rem  = (it < n256) ? 256 : 128;
-        const int shift = (rem == 256) ? 8 : 7;
-        for (int i = threadIdx.x; i < live << shift; i += kThreads) {
-            const int m = i >> shift, k = i & (rem - 1);
-            xs[m][k] = fp8e4m3_gemv(A[(int64_t)m * a_pitch + kb + k]);
-        }
-        __syncthreads();
-
         /* One aligned dword per lane: nibbles kb + lane*8 + 0..7. Nibble k lives in byte
          * k>>1 (the tile's rule), so the dword is at byte (kb>>1) + lane*4 -- indexing
          * the packed row by k DOUBLES the stride, the nibble form of the byte-pitch trap. */
         const bool act = (lane << 3) < rem;
-        uint32_t b4 = 0u;
+        b4 = 0u;
         if (act) b4 = *(const uint32_t*)(crow + (kb >> 1) + (lane << 2));
-
         const int sg = lane >> 2;                 /* this quad's group inside the span */
         const bool qact = sg < (rem >> 5);
         const int  g32 = (it << 3) + (qact ? sg : (rem >> 5) - 1);
-        float sc = 0.0f;
+        sc = 0.0f;
         if (qact) {
             const uint8_t x = brow[g32];
             sc = (x == 0xffu) ? __uint_as_float(0x7fc00000u)
                : (x == 0x00u) ? 0x1p-127f
                               : __uint_as_float((uint32_t)x << 23);
         }
-
+    };
+    auto consume_sp2 = [&](int it, uint32_t b4, float sc) {
+        const int rem  = (it < n256) ? 256 : 128;
+        const bool act = (lane << 3) < rem;
+        const int sg = lane >> 2;
+        const bool qact = sg < (rem >> 5);
+        const int  g32 = (it << 3) + (qact ? sg : (rem >> 5) - 1);
         float sub[MT];
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
@@ -534,7 +574,31 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
                 c += __shfl_xor(c, off);
             acc[m] += c;
         }
+    };
+
+    struct M4Win2 { uint32_t b4; float sc; };
+    for (int gbase = 0; gbase < ntot2; gbase += W2) {
+        const int remw = (ntot2 - gbase < W2) ? (ntot2 - gbase) : W2;
+        M4Win2 win[W2];
+        if constexpr (PF) {
+#pragma unroll
+            for (int d = 0; d < W2; ++d)
+                if (d < remw) load_sp2(gbase + d, win[d].b4, win[d].sc);
+        }
+        for (int d = 0; d < remw; ++d) {
+        const int it   = gbase + d;
+        const int kb   = it << 8;
+        const int rem  = (it < n256) ? 256 : 128;
+        const int shift = (rem == 256) ? 8 : 7;
+        for (int i = threadIdx.x; i < live << shift; i += kThreads) {
+            const int m = i >> shift, k = i & (rem - 1);
+            xs[m][k] = fp8e4m3_gemv(A[(int64_t)m * a_pitch + kb + k]);
+        }
+        __syncthreads();
+        if constexpr (PF) consume_sp2(it, win[d].b4, win[d].sc);
+        else { uint32_t b4; float sc; load_sp2(it, b4, sc); consume_sp2(it, b4, sc); }
         __syncthreads();                                       /* xs is rewritten next span */
+        } /* d */
     }
 
     if (lane == 0 && r < N) {
@@ -708,7 +772,7 @@ template <bool DBUF>
 __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_m64_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint8_t*,
     int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int, int) {}
-template <int MT>
+template <int MT, bool PF>
 __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint8_t*,
     int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t) {}
@@ -940,17 +1004,22 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s) {
     }
 
     dim3 grid((unsigned)((P.N + 7) / 8));
-    #define R3D_M4_GEMV(MT_)                                                        \
-        hipLaunchKernelGGL((gemm_nt_mxfp4_gemv_kernel<MT_>), grid, dim3(kThreads),  \
-                           0, stream, P.A, P.B, (uint16_t*)Y->data, P.AS, P.BS,     \
-                           (int)P.M, (int)P.N, (int)P.K,                            \
+    static const bool no_pf = getenv("R3D_NO_GEMV_PF") != nullptr;   /* issue #7 A/B */
+    #define R3D_M4_GEMV(MT_, PF_)                                                 \
+        hipLaunchKernelGGL((gemm_nt_mxfp4_gemv_kernel<MT_, PF_>), grid,           \
+                           dim3(kThreads),                                        \
+                           0, stream, P.A, P.B, (uint16_t*)Y->data, P.AS, P.BS,   \
+                           (int)P.M, (int)P.N, (int)P.K,                          \
                            P.a_pitch, P.b_pitch, P.y_pitch, P.as_pitch, P.bs_pitch)
-    switch (mt) {
-        case 1: R3D_M4_GEMV(1); break;
-        case 2: R3D_M4_GEMV(2); break;
-        case 4: R3D_M4_GEMV(4); break;
-        default: R3D_M4_GEMV(8); break;
-    }
+    #define R3D_M4_GEMV_SW(PF_)                            \
+        switch (mt) {                                      \
+            case 1: R3D_M4_GEMV(1, PF_); break;            \
+            case 2: R3D_M4_GEMV(2, PF_); break;            \
+            case 4: R3D_M4_GEMV(4, PF_); break;            \
+            default: R3D_M4_GEMV(8, PF_); break;           \
+        }
+    if (!no_pf) { R3D_M4_GEMV_SW(true) } else { R3D_M4_GEMV_SW(false) }
+    #undef R3D_M4_GEMV_SW
     #undef R3D_M4_GEMV
     const hipError_t le = hipGetLastError();
     if (le != hipSuccess) fprintf(stderr, "libr3d: mxfp4 decode gemv launch FAILED (%s)\n",
