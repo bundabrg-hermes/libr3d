@@ -26,7 +26,7 @@ set -euo pipefail
 
 REPO="$HOME/projects/libr3d/libr3d"
 SCRATCH="$HOME/scratch/r3d"
-IMG=radiance-dev:v1.8.1
+IMG="${R3D_IMG:-radiance-dev:v1.8.1}"
 BUILD="${R3D_BUILD:-build13}"   # pin the staged build dir; bump only after gates pass on it
 DEVS=(--device /dev/kfd --device /dev/dri --group-add video)
 # ROCr index of the gfx1100 XTX on this box. NEVER rely on device 0: after the slot
@@ -46,6 +46,8 @@ stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
     [ -n "${R3D_FP4_GEMV_PF:-}" ] && envs+=(-e R3D_FP4_GEMV_PF="$R3D_FP4_GEMV_PF")
     [ -n "${R3D_FP4_CHAIN:-}" ] && envs+=(-e R3D_FP4_CHAIN="$R3D_FP4_CHAIN")
     [ -n "${R3D_FP4_RP:-}" ] && envs+=(-e R3D_FP4_RP="$R3D_FP4_RP")
+    [ -n "${R3D_NO_DFLASH:-}" ] && envs+=(-e R3D_NO_DFLASH="$R3D_NO_DFLASH")
+    [ -n "${R3D_DEBUG_DFLASH:-}" ] && envs+=(-e R3D_DEBUG_DFLASH="$R3D_DEBUG_DFLASH")
     local out rc; out=$(mktemp); rc=0
     docker run --rm "${DEVS[@]}" "${envs[@]}" --shm-size=4g -v "$SCRATCH":/scratch -v "$REPO/$BUILD":/build:ro \
         --entrypoint /bin/bash "$IMG" -c "
