@@ -172,6 +172,9 @@ static const RadParamSpec pGemmNtQ[] = {
     { "dtype", RAD_P_STR, RAD_REQUIRED },
     { "pb1",   RAD_P_INT, RAD_OPTIONAL },
     { "pb2",   RAD_P_INT, RAD_OPTIONAL },
+    /* v1.11: libr4d's K-split hint (docs/OPS.md). Accept and ignore -- libr3d never
+     * splits K, and both plugins must agree on the list or the engine refuses them. */
+    { "split_n", RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oGemmNtQ[] = {
     { "a",       RAD_OPD_IN,     0 },
@@ -236,6 +239,10 @@ static const RadParamSpec pAttnPaged[] = {
     { "max_ctx",    RAD_P_INT, RAD_OPTIONAL },
     { "n_head",     RAD_P_INT, RAD_OPTIONAL },
     { "max_seqs",   RAD_P_INT, RAD_OPTIONAL },
+    /* v1.11: the e4m3 products a caller accepts. A permission, not a request -- libr3d's
+     * rows compute the spelling they always computed; it is declared so the schema
+     * matches libavx/libref, which refuse to load otherwise (ABI 26 rule). */
+    { "prefill_fp8", RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oAttnPaged[] = {
     { "q",           RAD_OPD_IN,  0 },
