@@ -35,6 +35,8 @@ stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
     local libs=(); while [ "$1" != "--" ]; do libs+=("$1"); shift; done; shift
     local envs=(); [ -n "${R3D_FP4_DOT2:-}" ] && envs+=(-e R3D_FP4_DOT2="$R3D_FP4_DOT2")
     [ -n "${R3D_NO_GEMV_PF:-}" ] && envs+=(-e R3D_NO_GEMV_PF="$R3D_NO_GEMV_PF")
+    [ -n "${R3D_GEMV_PF_W:-}" ] && envs+=(-e R3D_GEMV_PF_W="$R3D_GEMV_PF_W")
+    [ -n "${R3D_FP4_GEMV_PF:-}" ] && envs+=(-e R3D_FP4_GEMV_PF="$R3D_FP4_GEMV_PF")
     docker run --rm "${DEVS[@]}" "${envs[@]}" --shm-size=4g -v "$SCRATCH":/scratch -v "$REPO/$BUILD":/build:ro \
         --entrypoint /bin/bash "$IMG" -c "
             mkdir -p /scratch/$home/kernels /scratch/$home/architectures
@@ -71,5 +73,14 @@ case "${1:-}" in
             --fixture /scratch/mxfp4.rkb --report "/scratch/$stem.md" \
             | tee_log "$stem"
         ;;
-    *) echo "usage: gate.sh op <op> [stem] | stock [stem] | full [stem]" >&2; exit 2 ;;
+    fp8)
+        # issue #4 pack: fp8_9b rows attributed libr3d-vs-libref only (no libavx
+        # siblings). The #7 PF arms are selected with R3D_NO_GEMV_PF=1 / R3D_GEMV_PF_W
+        # in the caller's environment.
+        stem=${2:-gate_fp8}
+        stage_and_run home_attr8 libr3d.so libref.so -- \
+            --fixture /scratch/fp8_9b.rkb --op gemm_nt_q --report "/scratch/$stem.md" \
+            | tee_log "$stem"
+        ;;
+    *) echo "usage: gate.sh op <op> [stem] | stock [stem] | full [stem] | fp8 [stem]" >&2; exit 2 ;;
 esac
