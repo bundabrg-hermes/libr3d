@@ -313,15 +313,13 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_m64_kernel(
  */
 /* PF (issue #7, the MLP fix): the profile showed ~1 outstanding global load per lane
  * at MODEL shapes — the dword-per-group walk is one 128B wavefront issued immediately
- * before its FFMAs consume it, so a latency-bound machine idles at ~140 GB/s while the
- * standalone sweep runs 312 at 16K shapes where far more waves are resident. PF
- * batches the SAME loads (same lane->byte mapping, so the fold tree and every FP op
- * are untouched — schedule-only, bit-exact by construction) into a window of W
- * independent dwordx1 issues at the top of each window, BEFORE the block touches LDS.
- * All W fly across the staging barriers: 32 B in flight per lane instead of 4.
- * The !PF arm is the #4 row verbatim; both instantiate in one TU, R3D_NO_GEMV_PF=1
- * selects it (same-binary paired A/B rule). */
-template <int MT, bool PF>
+ * before its FFMAs consume it. W dwords (same loads, same lane->byte mapping, so the
+ * fold tree and every FP op are untouched — schedule-only, bit-exact by construction)
+ * are issued back-to-back at the top of each window BEFORE the block touches LDS, so
+ * all W fly across the staging barriers. Measured on the shape sweep: fp8 M==1 bands
+ * gain +8..17% at W=8 (this family really was starved); W=1 is the #4 arm verbatim.
+ * R3D_NO_GEMV_PF=1 selects W=1; R3D_GEMV_PF_W=16 probes a wider window (bench only). */
+template <int MT, int W>
 __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, uint16_t* __restrict__ Y,
     const float* __restrict__ AS, const uint16_t* __restrict__ BS,
@@ -349,12 +347,11 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
     __syncthreads();
 
     const int ngrp = K >> 7;                          /* K % 128 == 0 is the row gate */
-    constexpr int W = PF ? 8 : 1;
     const uint8_t* cwin = crow + (lane << 2);         /* this lane's dword stream base */
     for (int gbase = 0; gbase < ngrp; gbase += W) {
         const int rem = (ngrp - gbase < W) ? (ngrp - gbase) : W;
         uint32_t bwin[W];
-        if constexpr (PF) {
+        if constexpr (W > 1) {
             /* Window burst: W independent dwords issued back to back, none consumed
              * until its group's turn -- the MLP the profile said was missing. */
 #pragma unroll
@@ -371,7 +368,7 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
         __syncthreads();
 
         /* One aligned dword per lane: k = lane*4 + 0..3, ascending within the lane. */
-        const uint32_t b4 = PF ? bwin[d] : *(const uint32_t*)(crow + kbase + (lane << 2));
+        const uint32_t b4 = (W > 1) ? bwin[d] : *(const uint32_t*)(crow + kbase + (lane << 2));
         float sub[MT];
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
@@ -414,7 +411,7 @@ template <bool DBUF>
 __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_m64_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint16_t*,
     int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int) {}
-template <int MT, bool PF>
+template <int MT, int W>
 __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint16_t*,
     int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int) {}
@@ -653,6 +650,7 @@ void f8_launch_tile(const F8Plan& P, void* ydata, int64_t y_pitch, RadStream s,
     static const bool no_dbuf = getenv("R3D_GEMM_NO_DBUF") != nullptr;
     static const bool no_dec  = getenv("R3D_NO_FP8_DEC") != nullptr;
     static const bool no_pf   = getenv("R3D_NO_GEMV_PF") != nullptr;   /* issue #7 A/B */
+    static const int  pf_w    = getenv("R3D_GEMV_PF_W") ? atoi(getenv("R3D_GEMV_PF_W")) : 8;
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
 
     /* Decode band (issue #4): at M <= 8 the width row reads every weight byte once.
@@ -662,21 +660,23 @@ void f8_launch_tile(const F8Plan& P, void* ydata, int64_t y_pitch, RadStream s,
     if (!no_dec && P.M <= 8 && (P.b_pitch % 4) == 0 && (((uintptr_t)P.B & 3) == 0)) {
         const int mt = P.M >= 8 ? 8 : P.M >= 4 ? 4 : P.M >= 2 ? 2 : 1;
         dim3 grid((unsigned)((P.N + 7) / 8));
-        #define R3D_F8_GEMV(MT_, PF_)                                                  \
-            hipLaunchKernelGGL((gemm_nt_fp8a8_gemv_kernel<MT_, PF_>), grid,            \
+        #define R3D_F8_GEMV(MT_, W_)                                                   \
+            hipLaunchKernelGGL((gemm_nt_fp8a8_gemv_kernel<MT_, W_>), grid,             \
                                dim3(kThreads),                                         \
                                0, stream, P.A, P.B, (uint16_t*)ydata, P.AS, P.BS,      \
                                (int)P.M, (int)P.N, (int)P.K, P.as_cols, P.bs_cols,     \
                                P.a_pitch, P.b_pitch, y_pitch, P.as_pitch, P.bs_pitch,  \
                                P.rblk)
-        #define R3D_F8_GEMV_SW(PF_)                         \
-            switch (mt) {                                   \
-                case 1: R3D_F8_GEMV(1, PF_); break;         \
-                case 2: R3D_F8_GEMV(2, PF_); break;         \
-                case 4: R3D_F8_GEMV(4, PF_); break;         \
-                default: R3D_F8_GEMV(8, PF_); break;        \
+        #define R3D_F8_GEMV_SW(W_)                            \
+            switch (mt) {                                     \
+                case 1: R3D_F8_GEMV(1, W_); break;            \
+                case 2: R3D_F8_GEMV(2, W_); break;            \
+                case 4: R3D_F8_GEMV(4, W_); break;            \
+                default: R3D_F8_GEMV(8, W_); break;           \
             }
-        if (!no_pf) { R3D_F8_GEMV_SW(true) } else { R3D_F8_GEMV_SW(false) }
+        if (no_pf)        { R3D_F8_GEMV_SW(1)  }
+        else if (pf_w == 16) { R3D_F8_GEMV_SW(16) }
+        else              { R3D_F8_GEMV_SW(8)  }
         #undef R3D_F8_GEMV_SW
         #undef R3D_F8_GEMV
         if (getenv("R3D_DEBUG_GEMM")) {
