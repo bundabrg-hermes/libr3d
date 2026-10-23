@@ -54,6 +54,9 @@ set_source_files_properties(src/r3d_more.hip PROPERTIES COMPILE_OPTIONS "-ffp-co
 set_source_files_properties(src/r3d_gemm_mxfp4.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
 set_source_files_properties(src/r3d_gemm_logits.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 set_source_files_properties(src/r3d_gdn.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
+set_source_files_properties(src/r3d_dflash_conv.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
+set_source_files_properties(src/r3d_dflash_select.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
+set_source_files_properties(src/r3d_logit_rerank.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
 
 rad_add_plugin(libr3d kernels
   SOURCES     src/r3d_rows.cpp
@@ -64,6 +67,7 @@ rad_add_plugin(libr3d kernels
               src/r3d_attn_paged_wmma.hip src/r3d_attn_paged_decode.hip
               src/r3d_sample.hip
               src/r3d_band.hip src/r3d_more.hip src/r3d_gdn.hip src/r3d_dump.hip
+              src/r3d_dflash_conv.hip src/r3d_dflash_select.hip src/r3d_logit_rerank.hip
   GPU_TARGETS ${R3D_GPU_TARGETS}
   INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR}/src)
 

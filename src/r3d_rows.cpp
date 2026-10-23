@@ -616,6 +616,81 @@ static const RadOperandSpec oRmsNormQuantFp8[] = {
     { "out_bf16", RAD_OPD_OUT,    1 },   /* layers with a bf16 consumer of the post-norm tensor */
 };
 
+/* Drafter ops (radiance 1.11 DFlash2 / MTP rerank). Schema tables verbatim libref's
+ * pDflashConv/pDflashSelect/pLogitRerank + operands -- the loader refuses the whole
+ * library on any disagreement (ABI 26 rule, learned the hard way on the retarget). */
+static const RadParamSpec pDflashConv[] = {
+    { "T",           RAD_P_INT, RAD_REQUIRED },
+    { "hidden_size", RAD_P_INT, RAD_REQUIRED },
+    { "taps",        RAD_P_INT, RAD_REQUIRED },
+    { "group_size",  RAD_P_INT, RAD_REQUIRED },
+    { "NG",          RAD_P_INT, RAD_REQUIRED },
+    { "block_size",  RAD_P_INT, RAD_REQUIRED },
+    { "dtype",       RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oDflashConv[] = {
+    { "x",     RAD_OPD_IN,     0 },
+    { "delta", RAD_OPD_IN,     0 },
+    { "base",  RAD_OPD_WEIGHT, 0 },
+    { "out",   RAD_OPD_OUT,    0 },
+};
+static const RadConstraint cDflashConv[] = {
+    { "taps",        RAD_C_EQ,  2,   nullptr },
+    { "group_size",  RAD_C_EQ,  16,  nullptr },
+    { "hidden_size", RAD_C_DIV, 128, nullptr },
+    { "dtype",       RAD_C_IN,  0,   "bf16" },
+};
+static const RadParamSpec pDflashSelect[] = {
+    { "M",       RAD_P_INT, RAD_REQUIRED },
+    { "steps",   RAD_P_INT, RAD_REQUIRED },
+    { "top_k",   RAD_P_INT, RAD_REQUIRED },
+    { "rank",    RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab", RAD_P_INT, RAD_REQUIRED },
+    { "anchor_stride", RAD_P_INT, RAD_OPTIONAL },
+    { "dtype",   RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oDflashSelect[] = {
+    { "cand",   RAD_OPD_IN,     0 },
+    { "unary",  RAD_OPD_IN,     0 },
+    { "hp",     RAD_OPD_IN,     1 },
+    { "anchor", RAD_OPD_IN,     0 },
+    { "pred",   RAD_OPD_WEIGHT, 0 },
+    { "succ",   RAD_OPD_WEIGHT, 0 },
+    { "tokens", RAD_OPD_OUT,    0 },
+};
+static const RadConstraint cDflashSelect[] = {
+    { "steps",   RAD_C_GE, 1,   nullptr },
+    { "top_k",   RAD_C_GE, 1,   nullptr },
+    { "top_k",   RAD_C_LE, 32,  nullptr },
+    { "rank",    RAD_C_DIV, 32, nullptr },
+    { "rank",    RAD_C_LE, 512, nullptr },
+    { "dtype",   RAD_C_IN, 0,   "bf16" },
+};
+static const RadParamSpec pLogitRerank[] = {
+    { "M",         RAD_P_INT, RAD_REQUIRED },
+    { "R",         RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab",   RAD_P_INT, RAD_REQUIRED },
+    { "n_embd",    RAD_P_INT, RAD_REQUIRED },
+    { "vocab_off", RAD_P_INT, RAD_OPTIONAL },
+    { "dtype",     RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oLogitRerank[] = {
+    { "x",      RAD_OPD_IN,     0 },
+    { "head",   RAD_OPD_WEIGHT, 0 },
+    { "idx_in", RAD_OPD_IN,     0 },
+    { "idx",    RAD_OPD_OUT,    0 },
+    { "val",    RAD_OPD_OUT,    0 },
+    { "pairs",  RAD_OPD_OUT,    1 },
+};
+static const RadConstraint cLogitRerank[] = {
+    { "M",       RAD_C_GE, 1,   nullptr },
+    { "R",       RAD_C_GE, 1,   nullptr },
+    { "R",       RAD_C_LE, 32,  nullptr },
+    { "n_vocab", RAD_C_GE, 1,   nullptr },
+    { "n_embd",  RAD_C_GE, 1,   nullptr },
+    { "dtype",   RAD_C_IN, 0,   "bf16" },
+};
+
 static const RadOpSchema kSchemas[] = {
     { "rmsnorm", pRmsNorm, (int)(sizeof(pRmsNorm)/sizeof(pRmsNorm[0])),
       oRmsNorm,  (int)(sizeof(oRmsNorm)/sizeof(oRmsNorm[0])),
@@ -804,6 +879,26 @@ static const RadOpSchema kSchemas[] = {
         oRmsNormQuantFp8, (int)(sizeof(oRmsNormQuantFp8)/sizeof(oRmsNormQuantFp8[0])),
         "RMS norm and the fp8 activation quantiser in one pass over the row. The bf16 norm "
         "output the unfused pair wrote is still written, and the codes are taken over it." },
+    { "dflash_conv", pDflashConv, (int)(sizeof(pDflashConv)/sizeof(pDflashConv[0])),
+      oDflashConv, (int)(sizeof(oDflashConv)/sizeof(oDflashConv[0])),
+      "DFlash2 grouped dynamic depthwise convolution, coefficient add and both taps in "
+      "one pass." },
+    { "dflash_select", pDflashSelect,
+      (int)(sizeof(pDflashSelect)/sizeof(pDflashSelect[0])),
+      oDflashSelect, (int)(sizeof(oDflashSelect)/sizeof(oDflashSelect[0])),
+      "DFlash2's candidate selector: the low-rank edge score between consecutive draft "
+      "positions, and the greedy walk that turns a block of independent top-k sets into "
+      "one path. Only the K edges leaving the previous pick are scored, because the walk "
+      "is serial and the other K-1 rows of the score matrix are never read." },
+    { "logit_rerank", pLogitRerank,
+      (int)(sizeof(pLogitRerank)/sizeof(pLogitRerank[0])),
+      oLogitRerank, (int)(sizeof(oLogitRerank)/sizeof(oLogitRerank[0])),
+      "R candidate ids a row rescored EXACTLY against the full-precision head and "
+      "re-sorted on those values -- the second half of a coarse top-R. `idx_in` "
+      "carries global ids as row_topk reports them, `vocab_off` is this rank's first "
+      "column, and an id outside its rows becomes a pad. Ties break on the LOWER id, "
+      "the rule row_topk and row_topk_merge use, so a tie inside a shard and one "
+      "between shards resolve alike." },
       };
 
 /* The rmsnorm row. Field order is RadKernelInfo's positional form (rad_abi.h): after the prose,
@@ -1068,6 +1163,9 @@ extern "C" int r3d_rad_sample_pick(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_penalties(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_dry(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_typical(const RadArgs*, RadStream);
+extern "C" int r3d_rad_dflash_conv(const RadArgs*, RadStream);
+extern "C" int r3d_rad_dflash_select(const RadArgs*, RadStream);
+extern "C" int r3d_rad_logit_rerank(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_xtc(const RadArgs*, RadStream);
 extern "C" int r3d_rad_sample_logprobs(const RadArgs*, RadStream);
 extern "C" int r3d_rad_quant_act_fp8(const RadArgs*, RadStream);
@@ -1666,6 +1764,48 @@ static const RadKernelInfo kRows[] = {
   cRmsNormQuantFp8, 3, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_rmsnorm_quant_fp8 },
 
+{ "dflash_conv_t2_g16_bf16", "dflash_conv", "dflash",
+  "DFlash2 grouped dynamic depthwise conv: coefficient add, both taps and the "
+  "block-position mask in one pass, one thread per (t, h)",
+  "taps 2, group_size 16, hidden_size divisible by 128; delta is a slice of the "
+  "[T, 2, taps, NG] projection read at its own row pitch (rank 3 at its own strides "
+  "also served); base and out at their own row pitches; out must not alias x",
+  "bf16 x / delta / base / out, fp32 accumulate in the oracle's tap order -- "
+  "bit-exact by construction under -ffp-contract=off",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cDflashConv, 4, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_dflash_conv },
+
+{ "dflash_select_bf16", "dflash_select", "dflash",
+  "DFlash2 candidate selector: the low-rank edge scores and the greedy walk over "
+  "them, one workgroup a sequence and no launch between steps",
+  "top_k <= 32 and rank a multiple of 32 and <= 512, both being LDS extents; "
+  "cand/unary/hp share the row numbering s*steps+l; M derives from numel(cand)/"
+  "(steps*top_k) with the parameter as a ceiling; anchor is a dense rank-1 i32 "
+  "plane read at anchor_stride",
+  "i32 candidate ids, f32 unary logits, bf16 hp and both codebooks, i32 tokens "
+  "out; every f32 product and ascending-i sum is the oracle's own chain -- "
+  "bit-exact by construction",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cDflashSelect, 6, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_dflash_select },
+
+{ "logit_rerank_bf16", "logit_rerank", "select",
+  "R candidates a row rescored exactly against the full-precision head; one wave "
+  "per row, thread r owning candidate r's whole chain, then the oracle's "
+  "selection sort",
+  "any M, R <= 32; plain dense bf16 or f32 [n_vocab, n_embd] head (a joined e4m3 "
+  "head declines this hookless row at declare time, as for logits_gemm_bf16); M "
+  "derives from numel(x)/n_embd; idx_in/idx/val at their own row pitches, pairs "
+  "only densely packed (ref reads it flat)",
+  "bf16/f32 x and head, f32 values + i32 ids out, optional f32 pairs plane; the "
+  "dots accumulate in DOUBLE ascending k (ref_common.h's named exception) and "
+  "narrow once -- bit-exact by construction, the double-chain sibling of libr4d's "
+  "fp8-plane row",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cLogitRerank, 6, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_logit_rerank },
+
 };
 
 /* R3D_NO_GDN=1 withdraws the five GDN rows/schemas from the registration, which is the
@@ -1700,6 +1840,9 @@ static bool r3d_band_row_hidden(const RadKernelInfo& k) {
     static const bool no_f8d  = getenv("R3D_NO_FP8_DEC") != nullptr;
     static const bool no_mx   = getenv("R3D_NO_MXFP4") != nullptr;
     static const bool no_mxd  = getenv("R3D_NO_FP4_DEC") != nullptr;
+    static const bool no_df   = getenv("R3D_NO_DFLASH") != nullptr;
+    if (no_df && (!strcmp(k.op, "dflash_conv") || !strcmp(k.op, "dflash_select") ||
+                  !strcmp(k.op, "logit_rerank"))) return true;   /* drafter family (issue #9) */
     if (!strcmp(k.name, "gemm_nt_q_fp8a8_decode")) return no_fp8 || no_f8d;
     if (!strcmp(k.name, "gemm_nt_q_mxfp4_decode")) return no_mx || no_mxd;
     if (!strcmp(k.name, "gemm_nt_q_mxfp4"))        return no_mx;
