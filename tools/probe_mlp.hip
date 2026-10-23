@@ -96,13 +96,33 @@ __global__ __launch_bounds__(256) void walk(const uint8_t* __restrict__ B,
             }
             if constexpr (TIER >= 50) {
                 /* ---- real MT=1 consume_span, off == the lane's weight byte ---- */
-                const uint2 b8 = act ? *(const uint2*)(B + (int64_t)row * b_pitch + off)
-                                     : make_uint2(0u, 0u);
+                uint2 b8 = make_uint2(0u, 0u);
                 uint4 av = make_uint4(0u, 0u, 0u, 0u);
-                if (act && off * 2 + 16 <= hi * 2) av = *(const uint4*)(A + off * 2);
+                const int64_t kb2 = (int64_t)it * 512;            /* K units in span */
+                const bool wact = (lane << 3) < ((hi - lo) * 2);  /* lane's span slot */
+                if constexpr (TIER >= 55) {
+                    /* real load_span structure: runtime alignment branches + BS byte */
+                    const uint8_t* bp = B + (int64_t)row * b_pitch + (kb2 >> 1) + ((int64_t)lane << 3);
+                    if ((lane << 3) < hi - lo) {
+                        if (!(((uintptr_t)bp) & 7u)) b8 = *(const uint2*)bp;
+                        else { b8.x = *(const uint32_t*)bp; b8.y = *(const uint32_t*)(bp + 4); }
+                    }
+                    const uint8_t* ap2 = A + kb2 + ((int64_t)lane << 4);
+                    if ((lane << 4) < (hi - lo) * 2) {
+                        if (!(((uintptr_t)ap2) & 15u)) av = *(const uint4*)ap2;
+                        else { uint8_t* axw = (uint8_t*)&av;
+#pragma unroll
+                               for (int t = 0; t < 16; ++t) axw[t] = ap2[t]; }
+                    }
+                } else {
+                    b8 = act ? *(const uint2*)(B + (int64_t)row * b_pitch + off)
+                             : make_uint2(0u, 0u);
+                    if (act && off * 2 + 16 <= hi * 2) av = *(const uint4*)(A + off * 2);
+                }
+                (void)wact;
                 float sv;
                 const uint8_t* ax = (const uint8_t*)&av;
-                if constexpr (TIER == 53 || TIER == 54) {
+                if constexpr (TIER == 53 || TIER == 54 || TIER == 55) {
                     /* chain split: 2 (or 4) independent FMA chains, interleaved
                      * by the scheduler; s = sum of partials (re-associated) */
                     constexpr int NC = (TIER == 53) ? 2 : 4;
@@ -225,7 +245,11 @@ int main(int argc, char** argv)
         for (size_t i = 0; i < plane; ++i) h[i] = (uint8_t)rand();
         for (int r = 0; r < rot; ++r) CK(hipMemcpy(dB[r], h.data(), plane, hipMemcpyHostToDevice));
         uint8_t* dA; CK(hipMalloc((void**)&dA, (size_t)shp.K * 4));
-        CK(hipMemset(dA, 0x30, (size_t)shp.K * 4));
+        {   /* bench-realistic act bytes: random e4m3 codes, divergent decoder paths */
+            std::vector<uint8_t> ha((size_t)shp.K * 4);
+            for (size_t i = 0; i < ha.size(); ++i) ha[i] = (uint8_t)(rand() % 224) & 0x7e;
+            CK(hipMemcpy(dA, ha.data(), ha.size(), hipMemcpyHostToDevice));
+        }
         float* dAS; CK(hipMalloc((void**)&dAS, 4096));
         CK(hipMemset(dAS, 0x3c, 4096));
         float* dO; CK(hipMalloc((void**)&dO, 4 * 65536));
@@ -240,6 +264,8 @@ int main(int argc, char** argv)
         ARM(8, 52, 1, 1)
         ARM(8, 53, 1, 1)  /* chain split x2: the latency discriminator */
         ARM(8, 54, 1, 1)  /* chain split x4 */
+        ARM(8, 55, 1, 1)  /* chain split + real branchy load_span structure */
+        ARM(8, 56, 1, 1)  /* branchy loads + SINGLE chain: pairs with 55 */
         ARM(8, 53, 1, 2)  /* chain split + row pair */
         ARM(8, 4, 1, 1)
         ARM(16, 4, 1, 1)
