@@ -802,7 +802,7 @@ template <bool DBUF>
 __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_m64_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint8_t*,
     int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int, int) {}
-template <int MT, int W>
+template <int MT, int W, int CH = 1>
 __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint8_t*,
     int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t) {}
