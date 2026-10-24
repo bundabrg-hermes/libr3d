@@ -424,10 +424,12 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_q8_kernel(
 #pragma unroll
             for (int m = 0; m < MT; ++m) {
                 const uint4 av = *(const uint4*)&xs[(m << 9) + (jj << 7) + (oo << 4)];
-                int32_t is = __builtin_amdgcn_sudot4((int)av.x, (int)b4.x, 0);
-                is = __builtin_amdgcn_sudot4((int)av.y, (int)b4.y, is);
-                is = __builtin_amdgcn_sudot4((int)av.z, (int)b4.z, is);
-                is = __builtin_amdgcn_sudot4((int)av.w, (int)b4.w, is);
+                /* this ROCm's spelling carries the sign flags in the builtin: (sA, a,
+                 * sB, b, acc, clamp) -- lowers to v_dot4_i32_iu8 neg_lo:[1,0,0]. */
+                int32_t is = __builtin_amdgcn_sudot4(1, (int)av.x, 0, (int)b4.x, 0, 0);
+                is = __builtin_amdgcn_sudot4(1, (int)av.y, 0, (int)b4.y, is, 0);
+                is = __builtin_amdgcn_sudot4(1, (int)av.z, 0, (int)b4.z, is, 0);
+                is = __builtin_amdgcn_sudot4(1, (int)av.w, 0, (int)b4.w, is, 0);
                 isub[m] = is;                             /* integer, exact */
             }
 #pragma unroll
@@ -468,7 +470,7 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_q8_kernel(
 #pragma unroll
         for (int m = 0; m < MT; ++m)
             isub[m] = __builtin_amdgcn_sudot4(
-                (int)*(const uint32_t*)&xs[(m << 9) + (lane << 2)], (int)bb, 0);
+                1, (int)*(const uint32_t*)&xs[(m << 9) + (lane << 2)], 0, (int)bb, 0, 0);
 #pragma unroll
         for (int m = 0; m < MT; ++m) {                    /* full-wave fold */
             isub[m] += __shfl_xor(isub[m], 16);
@@ -669,20 +671,35 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
         if (!B8 && ncache < 4 && bytes <= (int64_t)15 << 28) {   /* 1.5 GiB ceiling */
             uint8_t* nb = nullptr;
             if (hipMalloc(&nb, (size_t)bytes) == hipSuccess) {
-                const int64_t nu = P.b_pitch >> 2;          /* sixteen-code units a row */
-                dim3 rg((unsigned)P.N, (unsigned)((nu + kThreads - 1) / kThreads));
-                hipLaunchKernelGGL(gemm_nt_w2a8_repack_kernel, rg, dim3(kThreads), 0,
-                                   stream, P.B, nb, P.b_pitch, P.b_pitch);
-                const hipError_t re = hipGetLastError();
-                if (re == hipSuccess) hipStreamSynchronize(stream);   /* once, at fill */
-                if (hipGetLastError() != hipSuccess || hipPeekAtLastError() != hipSuccess) {
-                    hipFree(nb);
-                    q8_dead = true;
-                    fprintf(stderr, "libr3d: w2a8 repack FAILED, u2 walk takes the band\n");
-                } else {
-                    cache[ncache++] = Q8Ent{P.B, nb, P.N, P.K, 4 * P.b_pitch};
-                    B8 = nb;
-                }
+                /* THE REPACK NEVER TOUCHES THE ENGINE'S STREAM. The drafter's pass
+                 * recorder records the issue pattern of the engine's streams on the first
+                 * play (kernel launches and stream syncs alike) and asserts the replay
+                 * matches; a once-per-process launch inside the recorded stream makes
+                 * every later replay short by that issue, and the engine stops the step
+                 * loop (observed 2026-10-24: 'draft pass 1 ... issued differently from its
+                 * recording'). So the fill runs on the plugin's OWN stream, fully joined
+                 * (a host sync on a private stream) before the recorded stream ever gets
+                 * its gemv. Weight bytes are arena-pinned long before the first draft
+                 * pass, so nothing else needs to be ordered against. */
+                static hipStream_t side = nullptr;
+                if (!side && hipStreamCreateWithFlags(&side, hipStreamNonBlocking) != hipSuccess)
+                    side = nullptr;
+                if (side) {
+                    const int64_t nu = P.b_pitch >> 2;      /* sixteen-code units a row */
+                    dim3 rg((unsigned)P.N, (unsigned)((nu + kThreads - 1) / kThreads));
+                    hipLaunchKernelGGL(gemm_nt_w2a8_repack_kernel, rg, dim3(kThreads), 0,
+                                       side, P.B, nb, P.b_pitch, P.b_pitch);
+                    const hipError_t re = hipGetLastError();
+                    if (re == hipSuccess) (void)hipStreamSynchronize(side); /* once, at fill */
+                    if (re != hipSuccess || hipGetLastError() != hipSuccess) {
+                        (void)hipFree(nb);
+                        q8_dead = true;
+                        fprintf(stderr, "libr3d: w2a8 repack FAILED, u2 walk takes the band\n");
+                    } else {
+                        cache[ncache++] = Q8Ent{P.B, nb, P.N, P.K, 4 * P.b_pitch};
+                        B8 = nb;
+                    }
+                } else q8_dead = true;
             } else q8_dead = true;
         }
     }
@@ -836,9 +853,14 @@ extern "C" int r3d_layout_gemm_w2a8(const RadParam* p, int n_p, int operand,
                                     const RadEncoding* enc, const int* sel,
                                     const RadTensor* planes, int n, RadLayout* out) {
     const int st = w2_layout_impl(p, n_p, operand, enc, sel, planes, n, out);
-    if (getenv("R3D_DEBUG_W2A8"))
+    if (getenv("R3D_DEBUG_W2A8")) {
         fprintf(stderr, "W2DBG layout operand=%d n=%d -> %d %s\n", operand, n, st,
                 st == RAD_OK && out && out->tag ? out->tag : "");
+        for (int i = 0; i < n_p; ++i)
+            fprintf(stderr, "  p[%d] %s = %lld %s\n", i, p[i].key, p[i].ival,
+                    p[i].sval ? p[i].sval : "");
+        if (enc) fprintf(stderr, "  enc scheme=%s n_planes=%d\n", enc->scheme, enc->n_planes);
+    }
     return st;
 }
 

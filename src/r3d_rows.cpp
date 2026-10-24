@@ -994,8 +994,13 @@ static const RadConstraint cMxfp4DecodeRow[] = {
 static const RadConstraint cW2A8DecodeRow[] = {
     { "dtype", RAD_C_IN,  0,    "w2a8" },
     { "K",     RAD_C_DIV, 128,  nullptr },
-    { "N",     RAD_C_DIV, 16,   nullptr },
-    { "M",     RAD_C_LE,  16,   nullptr },
+    /* PROBE: M constraint removed -- resolver-side M question. */
+    /* NO N constraint: the drafter's gemm op carries no N parameter at issue -- N rides the
+     * weight unit -- and a constraint on an absent key never holds (rad_types.h), which
+     * drops the row from serve resolution entirely while kbench (fixture-fed N) happily
+     * matches it (the 27B death of 2026-10-24: band to host, draft_head.scale onto the
+     * mapped tier, rad.planes cannot map, exit). The entry re-checks N % 16 -- libr4d's
+     * rule -- at plan time, where the real N is in hand. */
     { "group", RAD_C_EQ,  128,  nullptr },
 };
 
@@ -1455,7 +1460,7 @@ static const RadKernelInfo kRows[] = {
   "group-major [K/128][Mpad] sums (REQUIRED -- the zero point's correction), bf16 "
   "y; b_ref refused; pb1/pb2 refused; an encoding transform declines at declare",
   RAD_DOMAIN_DEVICE, R3D_PRIO_W2A8_DECODE,
-  cW2A8DecodeRow, 5, nullptr, 0, nullptr,
+  cW2A8DecodeRow, 3, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gemm_nt_q_w2a8_decode,
   nullptr, r3d_layout_gemm_w2a8, r3d_relayout_gemm_w2a8, nullptr,
   r3d_unrelayout_gemm_w2a8 },
