@@ -236,6 +236,17 @@ static void run_case(int HD, int QLEN, const int* CTX_ARR, int NSEQ, int WINDOW,
     }
     const double rel = den > 0 ? sqrt(num / den) : (num > 0 ? 1.0 : 0.0);
     const bool ok = rc == 0 && rel < 5e-3 && outliers * 1000 <= (int)want.size();
+    if (getenv("REPRO_DBG")) {                       // row-localization for bisect
+        for (int t = 0; t < QLEN; ++t) {
+            double rn = 0, rd = 0;
+            for (int h = 0; h < QH; ++h)
+                for (int d = 0; d < HD; ++d) {
+                    size_t e = (size_t)t * ROWW + h * HD + d;
+                    rn += pow(bf16_f(got[e]) - bf16_f(want[e]), 2); rd += pow(bf16_f(want[e]), 2);
+                }
+            if (rd > 0 && sqrt(rn / rd) > 1e-2) printf("  DBG row %d rel=%.3e\n", t, sqrt(rn / rd));
+        }
+    }
     printf("%s %s hd=%d qlen=%d ctx=%d(+%d) nseq=%d win=%d descale=%d: rc=%d rel_l2=%.3e worstULP=%d outliers=%d hash=%016llx\n",
            ok ? "PASS" : "FAIL", tag, HD, QLEN, CTX_ARR[0], NSEQ > 1 ? CTX_ARR[1] : 0,
            NSEQ, WINDOW, DESCALE_MODE, rc, rel, worst, outliers,
