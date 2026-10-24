@@ -246,7 +246,7 @@ static void run_case(int HD, int QLEN, const int* CTX_ARR, int NSEQ, int WINDOW,
                     size_t e = (size_t)t * ROWW + h * HD + d;
                     rn += pow(bf16_f(got[e]) - bf16_f(want[e]), 2); rd += pow(bf16_f(want[e]), 2);
                 }
-            if (rd > 0 && sqrt(rn / rd) > 1e-2) printf("  DBG row %d rel=%.3e\n", t, sqrt(rn / rd));
+            if (rd > 0 && sqrt(rn / rd) > (getenv("REPRO_DBG2") ? 0.0 : 1e-2)) printf("  DBG row %d rel=%.3e\n", t, sqrt(rn / rd));
         }
     }
     printf("%s %s hd=%d qlen=%d ctx=%d(+%d) nseq=%d win=%d descale=%d: rc=%d rel_l2=%.3e worstULP=%d outliers=%d hash=%016llx\n",
