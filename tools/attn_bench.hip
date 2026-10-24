@@ -48,10 +48,27 @@ int main() {
     auto entry = (int (*)(const RadArgs*, RadStream))dlsym(dl, "r3d_rad_attn_paged");
     if (!entry) { printf("dlsym: %s\n", dlerror()); return 1; }
 
+    // Device assertion: a bench run on the wrong card is phantom (PCI order shifts on
+    // reboot; the XTX is the 23983 MiB one). Every bench run must print and be checked.
+    {
+        int dev = -1; hipDeviceProp_t prop{};
+        if (hipGetDevice(&dev) != hipSuccess ||
+            hipGetDeviceProperties(&prop, dev) != hipSuccess) {
+            printf("device: QUERY FAILED -- phantom run\n"); return 1;
+        }
+        printf("device: %s (index %d, gcnArchName=%s, vram=%lld MiB)\n",
+               prop.name, dev, prop.gcnArchName, (long long)(prop.totalGlobalMem >> 20));
+    }
+
     const int QH = getenv("AB_QH") ? atoi(getenv("AB_QH")) : 16;
     const int KVH = getenv("AB_KVH") ? atoi(getenv("AB_KVH")) : 2;
     const int BS = 16;
     const int REPS = getenv("AB_REPS") ? atoi(getenv("AB_REPS")) : 15;
+    // L2 law: replaying ONE KV buffer smaller than the Infinity Cache measures a
+    // regime the serve never runs. AB_ROT>1 allocates that many DISTINCT KV planes
+    // (distinct random content) and rotates them rep to rep.
+    int ROT = getenv("AB_ROT") ? atoi(getenv("AB_ROT")) : 1;
+    if (ROT < 1) ROT = 1; if (ROT > 16) ROT = 16;
 
     char buf[512]; strncpy(buf, gl, sizeof buf - 1); buf[sizeof buf - 1] = 0;
     for (char* save = nullptr, *tok = strtok_r(buf, ",", &save); tok;
@@ -63,15 +80,22 @@ int main() {
 
         uint32_t st = 0x51ed2701u;
         auto rnd = [&]() { st ^= st << 13; st ^= st >> 17; st ^= st << 5; return st; };
-        std::vector<uint16_t> hq((size_t)QLEN * ROWW), hkv((size_t)NB * KVH * BS * SLOTW);
+        std::vector<uint16_t> hq((size_t)QLEN * ROWW);
         for (auto& v : hq)  v = (uint16_t)(rnd() & 0x3fff);   // small finite bf16 patterns
-        for (auto& v : hkv) v = (uint16_t)(rnd() & 0x3fff);
+        std::vector<std::vector<uint16_t>> hkv(ROT);          // distinct planes, same seed
+        for (int r = 0; r < ROT; ++r) {                       // law (both arms replay the
+            hkv[r].resize((size_t)NB * KVH * BS * SLOTW);     // same sequence -> hashes
+            for (auto& v : hkv[r]) v = (uint16_t)(rnd() & 0x3fff); }  // stay comparable)
         std::vector<int32_t> hbt(NB), hsu(1, CTX);
         for (int i = 0; i < NB; ++i) hbt[i] = i;
 
-        uint16_t *dq, *dkv, *dout; int32_t *dbt, *dsu;
+        uint16_t *dq, *dout; int32_t *dbt, *dsu;
+        std::vector<uint16_t*> kvbufs(ROT);
         hipMalloc(&dq, hq.size() * 2);   hipMemcpy(dq, hq.data(), hq.size() * 2, hipMemcpyHostToDevice);
-        hipMalloc(&dkv, hkv.size() * 2); hipMemcpy(dkv, hkv.data(), hkv.size() * 2, hipMemcpyHostToDevice);
+        for (int r = 0; r < ROT; ++r) {
+            hipMalloc(&kvbufs[r], hkv[r].size() * 2);
+            hipMemcpy(kvbufs[r], hkv[r].data(), hkv[r].size() * 2, hipMemcpyHostToDevice);
+        }
         hipMalloc(&dout, hq.size() * 2); hipMemset(dout, 0, hq.size() * 2);
         hipMalloc(&dbt, NB * 4);         hipMemcpy(dbt, hbt.data(), NB * 4, hipMemcpyHostToDevice);
         hipMalloc(&dsu, 4);              hipMemcpy(dsu, hsu.data(), 4, hipMemcpyHostToDevice);
@@ -82,7 +106,7 @@ int main() {
         t_q.data = dq; t_q.dtype = RAD_BF16; t_q.rank = 3;
         t_q.shape[0] = QLEN; t_q.shape[1] = QH; t_q.shape[2] = HD;
         t_q.stride[0] = ROWW; t_q.stride[1] = HD; t_q.stride[2] = 1;
-        t_kv.data = dkv; t_kv.dtype = RAD_BF16; t_kv.rank = 4;
+        t_kv.data = kvbufs[0]; t_kv.dtype = RAD_BF16; t_kv.rank = 4;
         t_kv.shape[0] = NB; t_kv.shape[1] = KVH; t_kv.shape[2] = BS; t_kv.shape[3] = SLOTW;
         t_kv.stride[0] = (int64_t)KVH * BS * SLOTW; t_kv.stride[1] = (int64_t)BS * SLOTW;
         t_kv.stride[2] = SLOTW; t_kv.stride[3] = 1;
@@ -93,7 +117,7 @@ int main() {
         t_o.data = dout; t_o.dtype = RAD_BF16; t_o.rank = 3;
         t_o.shape[0] = QLEN; t_o.shape[1] = QH; t_o.shape[2] = HD;
         t_o.stride[0] = ROWW; t_o.stride[1] = HD; t_o.stride[2] = 1;
-        const RadTensor tensors[8] = { t_q, t_kv, t_bt, t_su, t_kd, t_vd, t_cu, t_o };
+        RadTensor tensors[8] = { t_q, t_kv, t_bt, t_su, t_kd, t_vd, t_cu, t_o };
         RadParam pv[] = {
             RAD_INT("q_len", QLEN), RAD_INT("head_dim", HD), RAD_INT("gqa", GQA),
             RAD_INT("block_size", BS), RAD_INT("causal", 1), RAD_INT("window", 0),
@@ -104,13 +128,14 @@ int main() {
         a.t = tensors; a.n_t = 8;
 
         int rc = 0;
-        for (int i = 0; i < 2 + REPS; ++i) rc |= entry(&a, (RadStream)0);
+        for (int i = 0; i < 2 + REPS; ++i) { tensors[1].data = kvbufs[i % ROT]; rc |= entry(&a, (RadStream)0); }
         hipDeviceSynchronize();
         if (rc) { printf("geom %s: entry rc=%d\n", tok, rc); continue; }
 
         hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
         float best = 1e30f, all = 0.0f;
         for (int i = 0; i < REPS; ++i) {
+            tensors[1].data = kvbufs[i % ROT];
             hipEventRecord(e0);
             entry(&a, (RadStream)0);
             hipEventRecord(e1);
@@ -132,7 +157,8 @@ int main() {
                gflops / (best * 1e-3) / 1e9,
                (unsigned long long)fnv(got));
         fflush(stdout);
-        hipFree(dq); hipFree(dkv); hipFree(dout); hipFree(dbt); hipFree(dsu);
+        hipFree(dq); hipFree(dout); hipFree(dbt); hipFree(dsu);
+        for (auto* p : kvbufs) hipFree(p);
     }
     return 0;
 }
