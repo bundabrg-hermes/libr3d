@@ -50,6 +50,9 @@ stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
     [ -n "${R3D_NO_W2A8_Q8X:-}" ] && envs+=(-e R3D_NO_W2A8_Q8X="$R3D_NO_W2A8_Q8X")
     [ -n "${R3D_MXFP4_Q8X:-}" ] && envs+=(-e R3D_MXFP4_Q8X="$R3D_MXFP4_Q8X")
     [ -n "${R3D_DEBUG_DFLASH:-}" ] && envs+=(-e R3D_DEBUG_DFLASH="$R3D_DEBUG_DFLASH")
+    [ -n "${R3D_HD256:-}" ] && envs+=(-e R3D_HD256="$R3D_HD256")
+    [ -n "${R3D_HD256_PAD:-}" ] && envs+=(-e R3D_HD256_PAD="$R3D_HD256_PAD")
+    [ -n "${R3D_DEBUG_DECODE:-}" ] && envs+=(-e R3D_DEBUG_DECODE="$R3D_DEBUG_DECODE")
     local out rc; out=$(mktemp); rc=0
     docker run --rm "${DEVS[@]}" "${envs[@]}" --shm-size=4g -v "$SCRATCH":/scratch -v "$REPO/$BUILD":/build:ro \
         --entrypoint /bin/bash "$IMG" -c "
