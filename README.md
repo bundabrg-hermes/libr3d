@@ -7,17 +7,20 @@ card computes depends on an installed kernel library that serves it. There is no
 that missing library: an **out-of-tree kernel plugin** for RDNA3 (gfx1100–gfx1103 /
 gfx11-generic), built against radiance's ABI only, no engine fork.
 
-Pinned to **radiance v1.8.1** (`RAD_ABI_VERSION 22`). The ABI moves with releases; rebuild this
+Pinned to **radiance v1.11.0** (`RAD_ABI_VERSION 26`). The ABI moves with releases; rebuild this
 library against the radiance version you serve.
 
 ## Status
 
 Shipped: the bf16 model path (GEMMs, RoPE, RMSNorm, attention prefill + paged decode, sampler
-ops), quantised GEMMs for **fp8 and mxfp4** including dedicated decode GEMVs, and gated-delta-net
-recurrent rows. Every row is checked against radiance's `libref` host oracle via `rad-kbench`
-across recorded real-model geometries with OOB detection; the current verification pack runs
-several thousand cases green on an RX 7900 XTX. Measured on that card, the decode GEMV bands give
-a **2.2x** (fp8) to **2.9x** (mxfp4) serve-decode speedup over the fallback tile path.
+ops), quantised GEMMs for **fp8 and mxfp4** including dedicated decode GEMVs, gated-delta-net
+recurrent rows, and the speculative-drafter family (dflash conv/select, logit rerank, n-gram ban,
+w2a8 draft-head GEMV) that makes a DFlash2 drafter place fully on-device. Every row is checked
+against radiance's `libref` host oracle via `rad-kbench` across recorded real-model geometries
+with OOB detection; the current verification pack runs several thousand cases green on an
+RX 7900 XTX. Measured on that card, the decode GEMV bands give a **2.2x** (fp8) to **2.9x**
+(mxfp4) serve-decode speedup over the fallback tile path, and a 27B-mxfp4 drafter serve goes
+from 3.2 to **9.5 tok/s** once the draft pass runs on the card.
 
 ## Quick start: clone to serving
 
@@ -25,7 +28,7 @@ a **2.2x** (fp8) to **2.9x** (mxfp4) serve-decode speedup over the fallback tile
 
 - Linux with the ROCm 10.1 driver stack (`/dev/kfd`, `/dev/dri`) — only to *serve*; building is
   offline codegen and needs no RDNA3 card.
-- Docker — or a native radiance v1.8.1 install (see *Without Docker* below).
+- Docker — or a native radiance v1.11.0 install (see *Without Docker* below).
 - ~8 GB RAM to compile: a device-kernel translation unit takes 2–3 GB under hipcc
   (the dev image defaults to `-j2`; raise with `--build-arg JOBS=N` on bigger hosts).
 - A `.rad` model to serve — radiance's `rad-convert` converts checkpoints.
@@ -36,7 +39,7 @@ a **2.2x** (fp8) to **2.9x** (mxfp4) serve-decode speedup over the fallback tile
 docker build -t radiance-dev docker/
 ```
 
-Takes ~30 min: it builds radiance v1.8.1 from source inside ROCm's `dev-ubuntu-24.04:10.1.0-full`
+Takes ~30 min: it builds radiance v1.11.0 from source inside ROCm's `dev-ubuntu-24.04:10.1.0-full`
 and installs it at `/opt/radiance`, so `find_package(radiance)` just resolves. To follow another
 radiance release: `--build-arg RAD_REF=vX.Y.Z` — and rebuild this library against it (the ABI
 must match).
@@ -115,6 +118,11 @@ or to the host. Use them to A/B a band or bisect a suspect kernel:
 | `R3D_NO_FP4_DEC` | mxfp4 decode band returns to the m64 tile |
 | `R3D_NO_GDN` | gated-delta-net rows withdraw |
 | `R3D_NO_ANCHOR` | withdraws the recurrent rows' speculative anchor state-form |
+| `R3D_NO_DFLASH` | drafter family withdraws: dflash conv/select, logit rerank, w2a8 draft GEMV |
+| `R3D_NO_NGRAM_BAN` | the n-gram-ban sampler row withdraws (band resolves past the library) |
+| `R3D_NO_GEMV_PF` | decode GEMVs drop the prefetch window (fp8 ships W=8; mxfp4/w2a8 opt-in) |
+| `R3D_NO_SPLITK` | deep-ctx decode attention forces the single-pass tile (same row) |
+| `R3D_NO_GQA` | withdraws the GQA fold arm of decode attention |
 
 ## Verifying kernels
 

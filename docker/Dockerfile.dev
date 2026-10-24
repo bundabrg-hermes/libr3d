@@ -13,7 +13,7 @@
 
 FROM rocm/dev-ubuntu-24.04:10.1.0-full
 
-ARG RAD_REF=v1.8.1
+ARG RAD_REF=v1.11.0
 ARG GPU_TARGETS=gfx1101;gfx11-generic
 ARG JOBS=2
 

@@ -26,13 +26,13 @@ set -euo pipefail
 
 REPO="$HOME/projects/libr3d/libr3d"
 SCRATCH="$HOME/scratch/r3d"
-IMG="${R3D_IMG:-radiance-dev:v1.8.1}"
+IMG="${R3D_IMG:-radiance-dev:v1.11.0}"
 BUILD="${R3D_BUILD:-build13}"   # pin the staged build dir; bump only after gates pass on it
 DEVS=(--device /dev/kfd --device /dev/dri --group-add video)
 # ROCr index of the gfx1100 XTX on this box. NEVER rely on device 0: after the slot
 # move the enumeration is [gfx1201, gfx1100, gfx1201], and kbench on device 0 silently
 # drops libr3d's 49 gfx11 code objects and reports a phantom all-libref pass (2026-10-23).
-# Re-verify with: docker run --rm "${DEVS[@]}" radiance-dev:v1.8.1 rad-kbench --fixture ...
+# Re-verify with: docker run --rm "${DEVS[@]}" radiance-dev:v1.11.0 rad-kbench --fixture ...
 # (the 'device:' line lists indices) or rocm-smi --showproductname. Override: R3D_ROCR=<idx>.
 ROCR="${R3D_ROCR:-1}"
 

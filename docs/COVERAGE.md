@@ -1,6 +1,6 @@
 # libr3d coverage plan
 
-Sources: radiance v1.8.1 — `docs/PLUGIN.md` §10, `docs/OPS.md`, `arch/common/*` (the op set a
+Sources: radiance v1.11.0 — `docs/PLUGIN.md` §10, `docs/OPS.md`, `arch/common/*` (the op set a
 bf16 dense model issues), `core/` (the sampler ops the engine issues), `libref/` (the oracle).
 
 ## Ground rules
@@ -1351,3 +1351,51 @@ pattern. (2) This model container enables the MTP drafter by default — an A/B
 without --num-speculative-tokens 0 measured 1.35x, because verify/accept
 overhead dilutes GEMM bandwidth wins; match the evidence arm's spec setting,
 not just the flags you remember passing.
+
+## v1.11 retarget + the DFlash2 drafter family: issue #9 shipped (2026-10-24)
+
+`v1.11` fast-forwarded into main (`9d04d8a`..`cd92c7e`); the docs refresh the
+branch intentionally deferred ships here: the pin moves radiance
+v1.8.1/ABI 22 -> **v1.11.0/ABI 26** (README, `docker/Dockerfile.dev` `RAD_REF`,
+`tools/gate.sh` image default). Row count after the chain: **55**.
+
+Why (issue #9): the published 27B-mxfp4 container bundles a DFlash2 drafter and
+the engine defaults speculative tokens to auto, so its default startup crashed
+placement on gfx11 — `dflash_conv` / `dflash_select` / `logit_rerank` were
+host-only and their weight units force-mapped, which `rad.planes` tensors
+cannot survive. v1.11 additionally declares `sample_ngram_ban` a DEVICE band:
+weightless ops cannot host-place at all.
+
+Rows shipped (six), all behind `R3D_NO_DFLASH` (family, including the GEMV) or
+`R3D_NO_NGRAM_BAN`:
+
+| row | op | band |
+|---|---|---|
+| `dflash_conv_t2_g16_bf16` | dflash_conv | drafter conv pass (rank-3 base view arrives unsqueezed — the entry takes both) |
+| `dflash_select_bf16` | dflash_select | drafter token select |
+| `logit_rerank_bf16` / `logit_rerank_e4m3` | logit_rerank | rerank on the bf16 head and the joined-e4m3 head |
+| `sample_ngram_ban_f32` | sample_ngram_ban | engine sampler band: integer compares + idempotent -inf store, bit-identical to libref by construction |
+| `gemm_nt_q_w2a8_decode` | gemm_nt_q | w2a8 draft-head GEMV, `M <= 16`, `group == 128` |
+
+Gates on the retargeted build (radiance-dev:v1.11.0, gfx1100-pinned): stock
+kernels.rkb **2011/2011** (worst 3.135e-03), full mxfp4 pack **4737/4737**
+(2.859e-03), `--op gemm_nt_q` on the 27b_dflash2 pack **702/702** (9.299e-05),
+27b_df3 **768/768** (1.961e-04). Baselines intact. Serve with the DFlash2
+drafter ON: zero refusals, positive w2a8 launch proof, `finish=stop` coherent,
+**9.5 tok/s vs 3.2** with the GEMV row dead — the draft pass genuinely runs on
+the card.
+
+Lesson (standing rule): the first w2a8 GEMV passed a rel_l2 gate while reading
+entirely wrong memory — the fixture's weights were all-zero and zero x garbage
+is zero — and one revision before that it had never even launched (stub
+signature drift -> `hipErrorInvalidDeviceFunction` -> a silent
+`RAD_E_UNSUPPORTED` outside the engine). `tools/repro_w2a8.hip` is the new
+model: every new GEMV row gets a **random-operand** numeric gate against
+libref, plus an independent double oracle; an all-zero fixture proves wiring,
+nothing more. Two more load-bearing fixes rode along: the MT tile rounds UP
+(an M=7 pass must not bucket to MT=4 and silently drop rows 5-7), and the w2a8
+band is `M <= 16`, not 8 — the drafter's block pass collapses M at 14 (verify
+rows join draft rows) and an unfilled bucket sends the WHOLE op host-side,
+which its joined scale plane cannot survive. That band gap was the startup
+death; GDN's anchor floor moved with it (anchor state is a slot plane: numel
+floor = 1 plane, not T).
