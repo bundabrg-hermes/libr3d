@@ -129,7 +129,7 @@ static void run_case(int HD, int QLEN, const int* CTX_ARR, int NSEQ, int WINDOW,
                     for (int j = 0; j < ctx; ++j) {
                         if (j > pos) continue;
                         if (WINDOW > 0 && pos - j >= WINDOW) continue;
-                        const int blk = hbt[j / BS];
+                        const int blk = hbt[(size_t)s * NB + j / BS];   // per-seq row view
                         if (blk < 0) continue;
                         const int64_t kb = (int64_t)blk * KVH * BS * SLOTW + (int64_t)kh * BS * SLOTW
                                          + (j % BS) * SLOTW;
@@ -146,7 +146,7 @@ static void run_case(int HD, int QLEN, const int* CTX_ARR, int NSEQ, int WINDOW,
                     for (int j = 0; j < ctx; ++j, ++jj) {
                         if (j > pos) continue;
                         if (WINDOW > 0 && pos - j >= WINDOW) continue;
-                        const int blk = hbt[j / BS];
+                        const int blk = hbt[(size_t)s * NB + j / BS];   // per-seq row view
                         if (blk < 0) continue;
                         const float w = (float)std::exp((double)(sc[jj] - mx));
                         sum += w;
@@ -246,7 +246,24 @@ static void run_case(int HD, int QLEN, const int* CTX_ARR, int NSEQ, int WINDOW,
                     size_t e = (size_t)t * ROWW + h * HD + d;
                     rn += pow(bf16_f(got[e]) - bf16_f(want[e]), 2); rd += pow(bf16_f(want[e]), 2);
                 }
-            if (rd > 0 && sqrt(rn / rd) > (getenv("REPRO_DBG2") ? 0.0 : 1e-2)) printf("  DBG row %d rel=%.3e\n", t, sqrt(rn / rd));
+            if (rd > 0 && sqrt(rn / rd) > (getenv("REPRO_DBG2") ? 0.0 : 1e-2)) {
+                double best = 1e30; int bt2 = -1;
+                if (getenv("REPRO_DBG2")) {   // best-matching want row (shift detector)
+                    for (int u = 0; u < QLEN; ++u) {
+                        double sn = 0, sd = 0;
+                        for (int h = 0; h < QH; ++h)
+                            for (int d = 0; d < HD; ++d) {
+                                size_t e1 = (size_t)t * ROWW + h * HD + d;
+                                size_t e2 = (size_t)u * ROWW + h * HD + d;
+                                sn += pow(bf16_f(got[e1]) - bf16_f(want[e2]), 2);
+                                sd += pow(bf16_f(want[e2]), 2);
+                            }
+                        double sr = sd > 0 ? sqrt(sn / sd) : sn;
+                        if (sr < best) { best = sr; bt2 = u; }
+                    }
+                }
+                printf("  DBG row %d rel=%.3e bestmatch=%d(%.1e)\n", t, sqrt(rn / rd), bt2, best);
+            }
         }
     }
     printf("%s %s hd=%d qlen=%d ctx=%d(+%d) nseq=%d win=%d descale=%d: rc=%d rel_l2=%.3e worstULP=%d outliers=%d hash=%016llx\n",
