@@ -1399,3 +1399,87 @@ rows join draft rows) and an unfilled bucket sends the WHOLE op host-side,
 which its joined scale plane cannot survive. That band gap was the startup
 death; GDN's anchor floor moved with it (anchor state is a slot plane: numel
 floor = 1 plane, not T).
+
+
+
+## dot4 MXFP4 decode GEMV: the q8x arm on `phase-b-dot4` (2026-10-24)
+
+Hipfire Phase A/B lineage: the Phase A probe proved `v_dot4_i32_iu8` (via the
+6-arg `sudot4(1, act_i8, 0, codes, acc, 0)` builtin, the shipped w2a8 pattern)
+runs the MXFP4 decode walk as byte dots; the Phase B probe (ARM C: interleaved
+byte-plane, codes x2 with woven e8m0 group headers, pure signed sudot4 loop)
+measured **2.41-2.57x** over the shipped f32-flush walk at M=1 and
+**3.55-5.7x** in the M=4 verify band at model shapes (12288x4096,
+24576x4096, 4096x12288, 4096x4096), bit-exact vs float64 requant models. The
+binding term was *distinct DRAM streams per warp* (the scale-plane traversal),
+not bytes - only at roofline did bytes rank first. `tools/bench_dot4_seed.hip`
+is the probe seed.
+
+Shipped (branch `phase-b-dot4`, opt-in `R3D_MXFP4_Q8X=1`, default OFF): the
+decode row `gemm_nt_q_mxfp4_decode` gains a q8x leg. Three new kernels ride the
+w2a8 q8x precedent exactly:
+
+- `m4_repack_q8x_kernel` builds the ARM C interleaved plane (1 i8 per e2m1
+  code = value x2, e8m0 scales woven as group headers, 2.06x nibble bytes) -
+  plugin-owned, lazily built on the plugin's own non-blocking stream, event
+  joined before the engine-stream launch, never freed; alloc/launch failure or
+  a VRAM-headroom miss (free-VRAM query, 512 MiB floor) sets a per-tensor
+  permanent fallback and the f32-flush walk serves. 27B-class packs land on
+  the fallback cleanly.
+- `m4_act_i8_kernel` requantizes e4m3 x AS f32 to i8 + one f32 requant scale
+  per (m, 32-group) - per-dispatch (activations change per token), chained on
+  the engine stream exactly like the issue-#6 A16 f16 prologue precedent.
+- `gemm_nt_mxfp4_gemv_q8x_kernel` - the pure signed sudot4 dot loop, flush
+  `(dot * AS * (1/act_max)) * 2^(e8m0-127)` preserving the shipped two-multiply
+  quant_dot order.
+
+Band law held: no N/M keys in table constraints (entry re-checks M <= 8 via
+numel(Y)/N, K % 256 == 0 - the interleaved group-header stride doubles the
+table's K % 128 - at plan time); any rejection serves the old legs IN-PLACE.
+The existing `R3D_NO_MXFP4` / `R3D_NO_FP4_DEC` predicates already withdraw the
+whole row at registration; no new registration was added, so no new resolver
+law applied.
+
+The probe's "e2m1 code 7 is NaN" was a **table-vs-copy artifact**: the
+generator excluded code 7 and the model shared the same table, so it could
+never see it. `tools/dot4_fuzz_mxfp4.hip` (new) fuzzes the INTEGRATED constants
+against the independent ABI decoder (`rad_fp4e2m1_to_f32`) over random draws
+across all twelve valid codes - code 7 is +6.0, code 15 is -6.0 - plus the
+signed-sudot4 and device e8m0 rules. GREEN on cat.
+
+Gates on build_v114 (radiance-dev:v1.11.0, gfx1100-pinned): op `gemm_nt_q`
+arm-off 480/480 (7.581e-05), arm-ON 480/480 (worst 6.994e-03 - the
+i8-requant drift, inside the 3e-2 mxfp4a8 tol and the 1e-2 doctrine stop
+line); stock 2011/2011 (3.135e-03); full 4737/4737 off (2.859e-03) and
+**4737/4737 with the arm ON** (6.994e-03). Baselines intact.
+
+Serve A/B, one binary, env-flipped arms, alternating, spec-3 9b-mxfp4 at
+4096 ctx: boot proof identical pair `kernel selection libavx (host) 736,
+libr3d 736`, `0 host op(s)` on the recorded draft passes both arms, no
+`issued differently` - the prologue chains cleanly through the MTP recorded
+pass. Decode medians **32.8 -> 40.5 tok/s (+23.5%)**, every pair positive
+(+20.4%..+23.6%); ctx-512 500-token decode medians 27.9 -> 33.4 (+19.7%
+clean pairs). The arm's draft record count grows by the prologue dispatches
+and replays identically. KLD arm-ON vs arm-OFF: KLD gate (`kldgate.py` base-collect arm-OFF, teacher-forced score arm-ON,
+1258 forced positions over the 11-prompt corpus): **FAIL by design of the
+class** - aggregate mean KLD 0.00827 (gate 2e-3), p99 0.14714 (gate 5e-3),
+top-1 0.975 (gate 0.98), per-corpus means 0.0020-0.0187, worst max 1.806
+(prose-long). Same-arm noise floor on this harness is mean ~2e-4: the i8
+requant genuinely shifts every decode-row output at 1e-3..7e-3 rel (the
+6.994e-03 worst rel_l2 the pack gate tolerated), and ~40x floor KLD is that drift
+compounding, not wiring (0 plane fallbacks, 0 launch failures, one-shot
+launch proof; +23.5% serve rate is the arm alive). The strict KLD class
+belongs to bit-exact arms; defaulting the q8x arm ON is an output-quality
+ACCEPT decision, not a gate to weaken - it stays opt-in. (The committed
+corpus is 11 prompts x 128 positions; a 20+ prompt corpus would change
+the graded fixture, so it was not improvised.)
+
+Lessons: (1) the probe-era NaN reading of e2m1 7/15 was self-confirming by
+construction - the oracle shared the table it tested; the integrated fuzzer
+must decode through the ABI, not through any copy of itself. (2) The recorded
+pass tolerates *per-replay-identical* extra dispatches (the i8 prologue: 30 ->
+32 records, replay stable); the poison class is only one-time/conditional
+launches inside the recording. (3) Shell scope bites orchestration: bash
+functions share the caller's loop variable - helper polling loops clobbered
+`$i` and mislabeled every A/B round; helper loops must use private variable
+names.
