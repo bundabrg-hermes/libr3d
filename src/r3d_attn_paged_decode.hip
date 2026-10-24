@@ -28,11 +28,20 @@
  * A slice with no tiles writes m=-inf, l=0 and no O bytes; the merge skips the O read on
  * m==-inf, so the inert splits cost two floats, not a row.
  *
- * Shape law (host, one place): splits = min(192 / (q_heads*n_seq), tiles_kv/2,
- * tiles_kv, 64), the 192 a two-wave-per-CU target for 96 CUs; an explicit `splits`
- * (the row's tuner axis, or the engine passing a tuned value) wins outright. The SAME
+ * Shape law (host, one place): splits = min(wave / (q_heads*n_seq), cap, tiles_kv,
+ * 64) with (wave, cap) = (128, tiles_kv) for the GQA-fold arm and (192, tiles_kv/2)
+ * for the plain arm; an explicit `splits` (the row's tuner axis, or the engine
+ * passing a tuned value) wins outright. The SAME
  * closed form sizes the arena at declare (swept over every seq count up to max_seqs,
- * because splits*seqs is not monotone in seqs).
+ * because splits*seqs is not monotone in seqs). The fold-arm constants are the
+ * 2026-10-24 retune: device-asserted paired sweeps (M 1..8, ctx 512..8192, 32Q/8KV
+ * and 32Q/4KV, L2-cold, cat ~/scratch/splitsretune) put the fold optimum at ~128
+ * blocks, not the plain arm's inherited two-wave 192 -- the slice walk is
+ * latency-bound, so the extra slices buy wave-quantization tails instead of stream:
+ * 16 beat the old 24 by 1.32-1.44x at every ctx>=2048 for 8KV heads, 32 beat the
+ * old 48 by 1.40-1.43x at 8192 for 4KV heads, and the tiles_kv/2 cap had pinned
+ * ctx-512 1.16x under its measured best (single-tile slices win there). The plain
+ * arm never runs the shapes the sweep covered (gqa==1), so it keeps its constants.
  *
  * Fallbacks, all inside the row (a resolved row must serve, so nothing here declines
  * the op -- only the arithmetic path changes): foreign chip or R3D_NO_WMMA -> the scalar
@@ -181,17 +190,21 @@ __global__ __launch_bounds__(D) void attn_splitk_merge_kernel(R3dAttnParams P, i
 
 /* The shape law, host side, one closed form shared by the launch and the arena hook.
  * tiles_kv: KV tile upper bound (max_ctx or the block table width, kBN keys each).
- * The 192: two waves per CU on 96 CUs -- slices want to be long enough that partial
- * traffic (written once, read once) stays noise next to the KV bytes (it is ~1% at the
- * sizes this row serves), and short enough that every CU carries a block.
+ * The plain arm's 192: two waves per CU on 96 CUs -- slices want to be long enough
+ * that partial traffic (written once, read once) stays noise next to the KV bytes (it
+ * is ~1% at the sizes this row serves), and short enough that every CU carries a
+ * block. The fold arm's 128 (and tiles_kv cap): the retune constant from the
+ * 2026-10-24 verify-band sweep, see the header law note -- 1.3x+ better wherever the
+ * old two-wave target resolved above it, identical where the cap already pinned lower.
  * The head count passed in is q_heads for the plain arm and kv_heads for the GQA-fold
  * arm -- folded blocks are gqa-times fewer, so the same wave target needs gqa-times
  * more slices (and the fold arm is the more demanding arena consumer). */
-int decode_splits(int64_t q_heads, int64_t n_seq, int64_t tiles_kv, int forced) {
+int decode_splits(int64_t q_heads, int64_t n_seq, int64_t tiles_kv, int forced,
+                  bool fold) {
     if (forced > 0) return forced > 64 ? 64 : forced;
     const int64_t units = q_heads * (n_seq > 0 ? n_seq : 1);
-    int64_t s = 192 / units;
-    const int64_t cap = tiles_kv / 2;
+    int64_t s = (fold ? 128 : 192) / units;
+    const int64_t cap = fold ? tiles_kv : tiles_kv / 2;
     if (s > cap) s = cap;
     if (s > tiles_kv) s = tiles_kv;
     if (s > 64) s = 64;
@@ -242,9 +255,9 @@ extern "C" int64_t r3d_rad_attn_decode_scratch(const RadArgs* a) {
         const bool foldable = decode_fold_ok(gqa);
         int64_t worst = 0;
         for (int64_t S = 1; S <= max_seqs; ++S) {
-            int sp = decode_splits(n_head, S, tkv, sp_param);
+            int sp = decode_splits(n_head, S, tkv, sp_param, false);
             if (foldable) {
-                const int spf = decode_splits(kvh, S, tkv, sp_param);
+                const int spf = decode_splits(kvh, S, tkv, sp_param, true);
                 if (spf > sp) sp = spf;                       /* arm-agnostic worst case */
             }
             const int64_t need = decode_partial_bytes(S * qlen, n_head, sp, D);
@@ -258,9 +271,9 @@ extern "C" int64_t r3d_rad_attn_decode_scratch(const RadArgs* a) {
         int64_t mc = rad_args_geti_or(a, "max_ctx", 0);
         if (mc <= 0) mc = P.jcap;
         const int64_t tkv = (mc + kBN - 1) / kBN;
-        int sp = decode_splits(P.q_heads, P.n_seq, tkv, sp_param);
+        int sp = decode_splits(P.q_heads, P.n_seq, tkv, sp_param, false);
         if (decode_fold_ok(P.gqa)) {
-            const int spf = decode_splits(P.kv_heads, P.n_seq, tkv, sp_param);
+            const int spf = decode_splits(P.kv_heads, P.n_seq, tkv, sp_param, true);
             if (spf > sp) sp = spf;
         }
         return decode_partial_bytes(P.rows, P.q_heads, sp, P.head_dim);
@@ -317,14 +330,14 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
     int64_t mc = rad_args_geti_or(a, "max_ctx", 0);
     if (mc <= 0) mc = P.jcap;
     const int64_t tkv = (mc + kBN - 1) / kBN;
-    const int spl_plain = decode_splits(P.q_heads, P.n_seq, tkv, forced);
+    const int spl_plain = decode_splits(P.q_heads, P.n_seq, tkv, forced, false);
     /* GQA fold (llama.cpp's tile-kernel fold, ported): one block per KV head streams
      * the slice once for the whole q-head group, so decode KV traffic drops by gqa.
      * Folded blocks are gqa-times fewer, so its splits law runs on kv_heads; a shape
      * the fold gate refuses, or one where fold resolves to 1 slice, takes the plain
      * split arm unchanged (only gqa==1 ever resolves that way). */
     const bool fold_ok = fold && !v2 && decode_fold_ok(P.gqa);
-    const int spl_fold = fold_ok ? decode_splits(P.kv_heads, P.n_seq, tkv, forced) : 1;
+    const int spl_fold = fold_ok ? decode_splits(P.kv_heads, P.n_seq, tkv, forced, true) : 1;
     const bool use_fold = fold_ok && spl_fold > 1;
     const int spl = use_fold ? spl_fold : spl_plain;
     if (spl <= 1) return tile_or_v1();
