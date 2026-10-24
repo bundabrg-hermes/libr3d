@@ -1555,3 +1555,37 @@ Q/KV are load-bearing for the uint4 LDS staging. S-pitch kBN+4 + P-pitch kBN+2
 + a conditional DBUF slot fits at 64 944 B; occupancy stays 1 block/CU, which
 is what the shipped D=128 tile already runs at 42 064 B. See the issue comment
 for the variant table and the split-K carve still owed.
+
+Issue #11 milestone 2 (2026-10-24, branch `hd256-tile`, merged at `a667cdf`): the
+fitted head_dim-256 WMMA tile, opt-in via `R3D_HD256` (default OFF). The milestone-1
+prediction held exactly: fitted carve PAD0 (S pitch kBN+4) at 65 360 B, PAD1 (S pitch
+kBN+1) at 64 592 B — PAD1 became the default after the paired pinned-clock bench put it
+1.6-4.1% ahead on all ten geometries at bit-identical hashes. Dynamic LDS via
+`hipFuncSetAttribute` once per instantiation (`r3d_launch256`), one block/CU, same as the
+shipped D=128. v2/v3 and fp8-KV-256 refuse before any grid selection and the entry's v1
+backstop catches every refusal; `R3D_NO_WMMA` still withdraws the whole family including
+this path, verified by hash (kill-switch arm output equals v1 on every 256 case).
+
+Numerics: new `tools/repro_attn256.hip` random-operand gate (signed descale fuzz
+including negative scales, unmapped block-table entries, sliding window, ragged batches,
+rows 1-130, ctx up to 8192): all seven hd256 cases within 2.204e-03 of the libref chain
+— under kbench's 2.5e-3 tile gate, and the uniform ~2e-3 floor is the bf16 fragment
+rounding against the f32 oracle (the hd128 controls show the same floor). The four-arm
+hash matrix proves the tile executed (tile != v1 on every 256 case), the kill switch
+returns v1 exactly, and the two pad arms are bit-identical. Gates on build_v117 are
+baseline-identical: stock 2011/2011 (3.135e-03), full 4737/4737 (2.859e-03), and the
+lever-ON stock replay 2011/2011 — the lever cannot perturb recorded geometry.
+
+Bench (pinned clocks, AB_ROT=12 L2 rotation, one binary, env-lever arms): the tile beats
+v1 on every geometry — decode 4.5-8.8x, prefill 53-106x (r512/ctx8k: 841 ms -> 7.9 ms).
+Serve proof on qwen3.5-9b-mxfp4 spec 3, same-session lever pair: TTFT medians 13 786 ->
+7 866 ms, decode 13.36 -> 27.27 tok/s, non-overlapping distributions, with the on-serve
+launch proof captured: `DBG attn-wmma hd256 tile launch pad=1 dbuf=1 smem=64592`.
+
+Honest limits: decode effective ~39 GB/s — 16 blocks over 96 CUs is the geometric deficit
+split-K exists to fix. Desk sizing (milestone 3 groundwork) says hd256 split-K fits the
+same fitted carve — SPLITK adds no LDS, the merge kernel is LDS-free, arena <= 4.03 MiB.
+Implementing it is milestone 3. PAD1's 944 B margin means any future pad/tile growth must
+re-check the 64 KiB ceiling. Enabling the tile in production is one env on the v117 build;
+defaulting it ON is pending the teacher-forced KLD pair (output-changing at the bf16
+fragment class — same gate discipline the q8x arm received).
