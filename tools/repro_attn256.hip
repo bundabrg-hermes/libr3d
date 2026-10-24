@@ -57,10 +57,12 @@ static int fail_count = 0;
  * caller forces one); ctx[] is the per-seq context; kdes/vdes when non-null carry
  * n_seq*KVH f32 scales (negatives included by the callers that pass them). */
 static void run_case(int HD, int QLEN, const int* CTX_ARR, int NSEQ, int WINDOW,
-                     int DESCALE_MODE,   // 0: absent; 1: positive varied; 2: signed incl. negative
+                     int descale_mode,   // 0: absent; 1: positive varied; 2: signed incl. negative
                      int (*entry)(const RadArgs*, RadStream), const char* tag) {
+    int DESCALE_MODE = descale_mode;
     const char* one = getenv("REPRO_ONE");
     if (one && strcmp(one, tag)) return;
+    if (getenv("REPRO_DES")) DESCALE_MODE = atoi(getenv("REPRO_DES"));
     const int QH = 16, KVH = 4, BS = 16, GQA = QH / KVH;
     const int SLOTW = 2 * HD, ROWW = QH * HD;
     int ctxmax = 0, qlen_done = 0;
