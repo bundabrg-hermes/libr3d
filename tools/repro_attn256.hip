@@ -202,7 +202,15 @@ static void run_case(int HD, int QLEN, const int* CTX_ARR, int NSEQ, int WINDOW,
     t_o.data = dout; t_o.dtype = RAD_BF16; t_o.rank = 3;
     t_o.shape[0] = QLEN; t_o.shape[1] = QH; t_o.shape[2] = HD;
     t_o.stride[0] = ROWW; t_o.stride[1] = HD; t_o.stride[2] = 1;
-    const RadTensor tensors[8] = { t_q, t_kv, t_bt, t_su, t_kd, t_vd, t_cu, t_o };
+    // The v1 kernel dereferences the k_descale/v_descale RadTensor structs ON DEVICE
+    // (ldt_dev reads t->dtype/t->data in-kernel) and the engine lives in managed
+    // memory. A host-stack descriptor array is not device-visible: the kernel faults
+    // on it (bisected 2026-10-24: every descale case died, descale-0 passed). Place
+    // the whole tensor array in host-mapped memory, as the engine's own arrays are.
+    RadTensor* tensors = nullptr;
+    hipHostMalloc(&tensors, 8 * sizeof(RadTensor), hipHostMallocMapped);
+    tensors[0] = t_q; tensors[1] = t_kv; tensors[2] = t_bt; tensors[3] = t_su;
+    tensors[4] = t_kd; tensors[5] = t_vd; tensors[6] = t_cu; tensors[7] = t_o;
     RadParam pv[] = {
         RAD_INT("q_len", QLEN), RAD_INT("head_dim", HD), RAD_INT("gqa", GQA),
         RAD_INT("block_size", BS), RAD_INT("causal", 1), RAD_INT("window", WINDOW),
@@ -235,6 +243,7 @@ static void run_case(int HD, int QLEN, const int* CTX_ARR, int NSEQ, int WINDOW,
     fflush(stdout);
     if (!ok) ++fail_count;
     hipFree(dq); hipFree(dkv); hipFree(dout); hipFree(dbt); hipFree(dsu);
+    hipHostFree(tensors);
     if (dcu) hipFree(dcu);
     if (dkd) hipFree(dkd);
     if (dvd) hipFree(dvd);
