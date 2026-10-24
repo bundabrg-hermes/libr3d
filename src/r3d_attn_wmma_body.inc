@@ -41,8 +41,20 @@ __device__ __forceinline__ void bf16_store(bf16* p, uint16_t bits) {
  * O-store staging (32 x (D+8) f32, halves of the output) aliases Q+S after pass two's
  * last fragment read. D=128 total: 41776 B static (DBUF +304 B) -- under the 48 KiB
  * static ceiling, no hipFuncSetAttribute dance; the +304 B does not change blocks/CU
- * at either head_dim (that is the m64 B-buffer lesson honored: no LDS double buffer). */
-template <int D> struct Carve {
+ * at either head_dim (that is the m64 B-buffer lesson honored: no LDS double buffer).
+ *
+ * D=256 (issue #11 milestone 2) does NOT fit that static law: the shipped pads give
+ * 66640 B against the 65536 ceiling (milestone-1 sizing). The 256 specialization below
+ * fits by shaving the two pads that are bank-spread only -- S to kBN+4, P to kBN+2 --
+ * while keeping the +8 on Q/KV/O, which is load-bearing addressing (uint4 row stores
+ * need 16 B-aligned row starts; D+4=520 B rows break them). Fitted total 65360 B at
+ * PAD=0 -- still one block/CU, the same occupancy D=128 already runs at, but over the
+ * 48 KiB STATIC ceiling, so the kernel switches to extern __shared__ for D=256 and the
+ * launcher sizes it (see r3d_attn256_smem: the mirrored formula the launcher uses,
+ * pinned to C::total by the static_assert in the kernel). PAD is an addressing-only
+ * A/B lever for the bank pads (0: S kBN+4; 1: S kBN+1 for row-bank spread); every PAD
+ * is bit-identical in output, the bench picks the speed. */
+template <int D, int PAD = 0> struct Carve {
     static constexpr int kQP = D + 8, kVP = D + 8, kSP = kBN + 8, kPP = kBN + 4;
     static constexpr int kOP = D + 8;
     static constexpr int offQ  = 0;
@@ -57,6 +69,28 @@ template <int D> struct Carve {
     static constexpr int total = offCB2 + kBN + 16;
 };
 
+template <int PAD> struct Carve<256, PAD> {
+    static constexpr int kQP = 256 + 8, kVP = 256 + 8;   /* +8 row pad: uint4 staging */
+    static constexpr int kSP = PAD ? kBN + 1 : kBN + 4;  /* fitted: 36 (PAD1: 33) f32 */
+    static constexpr int kPP = kBN + 2;                  /* fitted: 34 bf16           */
+    static constexpr int kOP = 256 + 8;
+    static constexpr int offQ  = 0;
+    static constexpr int offS  = (offQ + kBM * kQP * 2 + 15) & ~15;
+    static constexpr int offP  = (offS + kBM * kSP * 4 + 15) & ~15;
+    static constexpr int offKV = (offP + kBM * kPP * 2 + 15) & ~15;
+    static constexpr int offM  = (offKV + kBN * kVP * 2 + 15) & ~15;
+    static constexpr int offRB = offM + 2 * kBM * 4;
+    static constexpr int offCB = offRB + kBN * 8;
+    static constexpr int offRB2 = offCB + kBN;
+    static constexpr int offCB2 = offRB2 + kBN * 8;
+    static constexpr int total = offCB2 + kBN + 16;      /* PAD0: 65360, PAD1: 64592 */
+};
+
+/* log2(D): every strided walk in the body and the helpers splits an element index as
+ * (e >> DSH, e & (D-1)). 6/7 for the shipped head_dims, 8 for 256 -- the same value
+ * for a given D everywhere, or the staging slots disagree with the readers. */
+constexpr int r3d_dlog2(int d) { return d == 64 ? 6 : d == 128 ? 7 : d == 256 ? 8 : 0; }
+
 /* Gather the 32 key rows RB[] (bad rows zero-filled) into LDS at pitch kVP. The
  * vector path walks EIGHT bf16 per iteration -- the same bits, 8x fewer scalar
  * load/store instructions per tile. It is the throughput fix the v2/v3 pair
@@ -69,12 +103,12 @@ template <int D> struct Carve {
  * bit-identical too). fp8 stays scalar: fp8_to_bf16_w is per-byte and the
  * unpack costs more than it saves. koff selects K (0) or V (D) within the slot.
  * Must be called after the addressing barrier (it reads RB[]). */
-template <int D, int KVDT>
+template <int D, int KVDT, int PAD = 0>
 __device__ __forceinline__ void stage_kv_tile(bf16* KVp, const int64_t* RB,
                                               const R3dAttnParams& P, int64_t koff,
                                               bool vec) {
-    constexpr int DSH = (D == 128) ? 7 : 6;
-    typedef Carve<D> C;
+    constexpr int DSH = r3d_dlog2(D);
+    typedef Carve<D, PAD> C;
     if (vec) {
         for (int r = 0; r < kBN; ++r)
             if (RB[r] >= 0 && (RB[r] & 7)) { vec = false; break; }
@@ -113,7 +147,7 @@ template <int D, int KVDT>
 __device__ __forceinline__ void ld_kv_regs(uint4* dst, const int64_t* RB,
                                            const R3dAttnParams& P, int64_t koff,
                                            bool vec) {
-    constexpr int DSH = (D == 128) ? 7 : 6;
+    constexpr int DSH = r3d_dlog2(D);
     constexpr int KNU = kBN * D / 8 / kThreads;
     (void)vec;    /* DBUF launches only with the vec gate true; kept for symmetry */
     #pragma unroll
@@ -136,11 +170,11 @@ __device__ __forceinline__ void ld_kv_regs(uint4* dst, const int64_t* RB,
     }
 }
 
-template <int D>
+template <int D, int PAD = 0>
 __device__ __forceinline__ void st_kv_regs(const uint4* src, bf16* KVp) {
-    constexpr int DSH = (D == 128) ? 7 : 6;
+    constexpr int DSH = r3d_dlog2(D);
     constexpr int KNU = kBN * D / 8 / kThreads;
-    typedef Carve<D> C;
+    typedef Carve<D, PAD> C;
     #pragma unroll
     for (int i = 0; i < KNU; ++i) {
         const int e = threadIdx.x + i * kThreads;
@@ -157,11 +191,25 @@ __device__ __forceinline__ void st_kv_regs(const uint4* src, bf16* KVp) {
  * every helper below to the original expressions at compile time -- the prefill
  * instantiation is unchanged by construction (a prefill fold would stream the same
  * bytes: its tiles already carry 64 tokens of ONE head and skip dead KV heads). */
-template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0>
+template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams P) {
-    constexpr int DSH = (D == 128) ? 7 : 6, DM1 = D - 1;
-    typedef Carve<D> C;
-    __shared__ unsigned char raw[C::total];
+    constexpr int DSH = r3d_dlog2(D), DM1 = D - 1;
+    typedef Carve<D, PAD> C;
+    static_assert(D == 64 || D == 128 || D == 256, "WMMA tile: head_dim outside {64,128,256}");
+    static_assert(D != 256 || (SPLITK == 0 && FOLD == 0),
+                  "256 tile: split-K and fold are desk-sized only (issue #11 m2)");
+    /* The launcher (outside the chip gate) sizes the 256 launch from the mirrored
+     * host-side formula; pin the two together so a Carve edit that moves total
+     * breaks the build, not the serve. */
+    static_assert(D != 256 || C::total == r3d_attn256_smem(PAD), "carve mirror drift");
+    /* 256 breaks the 48 KiB static ceiling (fitted total 65360 > 49152), so its LDS
+     * is dynamic: extern __shared__, sized by the launcher, with the driver attribute
+     * raised once before the first launch (see r3d_attn_paged_wmma.hip). 64/128 keep
+     * the historical static array -- the discarded branch below is not instantiated
+     * for them, and the 256 branch never allocates a static buffer. */
+    unsigned char* raw;
+    if constexpr (D == 256) { extern __shared__ unsigned char dyn[]; raw = dyn; }
+    else                    { __shared__ unsigned char stat[C::total]; raw = stat; }
 
     bf16*   Qsp = reinterpret_cast<bf16*>(raw + C::offQ);
     float*  Ssp = reinterpret_cast<float*>(raw + C::offS);
@@ -363,7 +411,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
         address_tile(et0, RBc, CBc);
         address_tile(et0 + 1, RBn, CBn);
         __syncthreads();
-        stage_kv_tile<D, KVDT>(KVp, RBc, P, 0, kvvec);
+        stage_kv_tile<D, KVDT, PAD>(KVp, RBc, P, 0, kvvec);
         __syncthreads();
         for (int t = et0; t < et1; ++t) {
             const int64_t jb = (int64_t)t * kBN;
@@ -403,7 +451,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                 }
             }
             __syncthreads();                                   /* CBc reads complete */
-            st_kv_regs<D>(kx, KVp);                            /* K(t+1) -> LDS */
+            st_kv_regs<D, PAD>(kx, KVp);                            /* K(t+1) -> LDS */
             address_tile(t + 2, RBc, CBc);                     /* refill the freed slot */
             { int64_t* tmp = RBc; RBc = RBn; RBn = tmp; }
             { unsigned char* tmp = CBc; CBc = CBn; CBn = tmp; }
@@ -414,7 +462,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
         address_tile(et0, RBc, CBc);
         address_tile(et0 + 1, RBn, CBn);
         __syncthreads();
-        stage_kv_tile<D, KVDT>(KVp, RBc, P, 0, kvvec);         /* K(t0) */
+        stage_kv_tile<D, KVDT, PAD>(KVp, RBc, P, 0, kvvec);         /* K(t0) */
         ld_kv_regs<D, KVDT>(vc, RBc, P, D, kvvec);             /* V(t0) in flight */
         __syncthreads();
         for (int t = et0; t < et1; ++t) {
@@ -441,7 +489,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                 }
                 bf16_store(Psp + r * C::kPP + jj, f32_bf16_w(pv));
             }
-            st_kv_regs<D>(vc, KVp);                            /* V(t) -> LDS (K(t) dead per b1) */
+            st_kv_regs<D, PAD>(vc, KVp);                            /* V(t) -> LDS (K(t) dead per b1) */
             ld_kv_regs<D, KVDT>(vc, RBn, P, D, kvvec);         /* V(t+1) in flight */
             __syncthreads();                                   /* b2: Psp + V(t) visible */
             for (int jk = 0; jk < kBN / 16; ++jk) {
@@ -457,7 +505,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                 }
             }
             __syncthreads();                                   /* b3: V(t)'s fragments left */
-            st_kv_regs<D>(kx, KVp);                            /* K(t+1) -> LDS */
+            st_kv_regs<D, PAD>(kx, KVp);                            /* K(t+1) -> LDS */
             address_tile(t + 2, RBc, CBc);
             { int64_t* tmp = RBc; RBc = RBn; RBn = tmp; }
             { unsigned char* tmp = CBc; CBc = CBn; CBn = tmp; }
@@ -502,7 +550,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             bf16_store(KVp + r * C::kVP + d, u);
         }
 #else
-        stage_kv_tile<D, KVDT>(KVp, RB, P, 0, kvvec);
+        stage_kv_tile<D, KVDT, PAD>(KVp, RB, P, 0, kvvec);
 #endif
         __syncthreads();
 #ifdef R3D_DBG
@@ -595,7 +643,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             RB[tid] = rb; CB[tid] = (rb < 0) ? 1 : 0;
         }
         __syncthreads();
-        stage_kv_tile<D, KVDT>(KVp, RB, P, 0, kvvec);       /* K tile, as pass one */
+        stage_kv_tile<D, KVDT, PAD>(KVp, RB, P, 0, kvvec);       /* K tile, as pass one */
         __syncthreads();
 
         roCW::fill_fragment(a0, 0.0f);         /* S again: same fragments, same order, */
@@ -647,7 +695,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             bf16_store(KVp + r * C::kVP + d, u);
         }
 #else
-        stage_kv_tile<D, KVDT>(KVp, RB, P, D, kvvec);       /* V tile, aliasing K */
+        stage_kv_tile<D, KVDT, PAD>(KVp, RB, P, D, kvvec);       /* V tile, aliasing K */
 #endif
         __syncthreads();
 

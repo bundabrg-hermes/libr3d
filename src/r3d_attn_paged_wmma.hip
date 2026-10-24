@@ -32,7 +32,9 @@
 
  * Serve geometry this tile is built for (MiniCPM5-2B): head_dim 128, 16 q heads / 2 kv
  * heads (gqa 8), block_size 16, bf16 cache. head_dim 64 compiles and runs on the same
- * template; q-f32 or kv-f32 caches, head_dim outside {64,128}, and every refused shape
+ * template; head_dim 256 rides a fitted carve behind R3D_HD256 (default OFF; issue #11
+ * milestone 2 -- dynamic LDS, S pitch kBN+4, P pitch kBN+2, one block/CU). q-f32 or
+ * kv-f32 caches, head_dim outside the instantiated set, and every refused shape
  * return RAD_E_UNSUPPORTED and v1 serves them, unchanged, forever. Decode rows are
  * eligible too: a qlen=1 sequence wastes 63/64 of a query tile's FMAs but reads the same
  * bytes v1 reads -- decode is bandwidth-bound, and the tensor cores make the waste free
@@ -127,7 +129,7 @@ namespace {
  * stubs, and a missing default arg mangles the host launch's symbol differently from
  * the device image's kernel -- the loader then fails with "Cannot find Symbol" at the
  * first real launch (see COVERAGE fold postmortem). */
-template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0>
+template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams) {}
 template <int D, int KVDT, int SPLITK>
 __global__ __launch_bounds__(kT) void attn_paged_wmma_kernel2(R3dAttnParams) {}
@@ -140,6 +142,35 @@ __global__ __launch_bounds__(kThreads3) void attn_paged_wmma_kernel3(R3dAttnPara
 #ifdef R3D_DBG
 namespace { __global__ void r3d_dbg_null(int* p) { if (p) *p = 1; } }
 #endif
+
+/* One head_dim-256 launch arm: raise the dynamic-LDS attribute once per template
+ * instantiation (the fitted carve is over the 48 KiB static ceiling; see Carve<256>),
+ * then launch with the launcher-side byte count the kernel's static_assert pins to
+ * its own C::total. A failed attribute or launch is RAD_E_DEVICE: the entry hands the
+ * step to v1, which is exactly what lever-OFF does -- the tile can lose a step to a
+ * driver limit, never cost the engine one. `dbg` is the caller's R3D_DEBUG_DECODE
+ * read: the launch-proof line names the tile and its arms once per (arm, process) --
+ * host printf, never device (the printf+big-LDS 401 trap lives in the kernel body). */
+template <int DB, int PAD>
+static int r3d_launch256(const R3dAttnParams& P, dim3 grid, hipStream_t stream, int dbg) {
+    static int attr = -1;
+    if (attr < 0)
+        attr = hipFuncSetAttribute(
+                   (const void*)&attn_paged_wmma_kernel<256, RAD_BF16, 0, DB, 0, PAD>,
+                   hipFuncAttributeMaxDynamicSharedMemorySize,
+                   r3d_attn256_smem(PAD)) == hipSuccess ? 1 : 0;
+    if (!attr) return RAD_E_DEVICE;
+    static int once = 0;
+    if (dbg && !once) {
+        once = 1;
+        printf("DBG attn-wmma hd256 tile launch pad=%d dbuf=%d smem=%d rows=%lld "
+               "grid(%u,%u,%u)\n", PAD, DB, r3d_attn256_smem(PAD), (long long)P.rows,
+               grid.x, grid.y, grid.z);
+    }
+    hipLaunchKernelGGL((attn_paged_wmma_kernel<256, RAD_BF16, 0, DB, 0, PAD>),
+                       grid, dim3(kThreads), r3d_attn256_smem(PAD), stream, P);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
 
 int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
 #ifdef R3D_DBG
@@ -182,7 +213,19 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
     }
     if (!allowed) return RAD_E_UNSUPPORTED;
     if (P.qdt != RAD_BF16) return RAD_E_UNSUPPORTED;
-    if (P.head_dim != 64 && P.head_dim != 128) return RAD_E_UNSUPPORTED;
+    /* R3D_HD256 lever (issue #11 milestone 2, default OFF). Unset: the shipped law
+     * holds unchanged -- head_dim outside {64,128} refuses here and v1 serves it,
+     * byte-identically to c7b2531. Set: head_dim 256 joins the WMMA families on the
+     * fitted tile (r3d_attn_wmma_body.inc's Carve<256>). The kill switch R3D_NO_WMMA
+     * withdraws this path too (it zeroes `allowed` above, one switch for every WMMA
+     * row), and R3D_ATTN_V2/V3 refuse 256 (v2/v3 instantiate 64/128 only -- the
+     * refusal lands on v1 inside the entry, never on the engine). fp8 KV at 256
+     * stays v1: no 256-fp8 instantiation exists, and refusing a dtype the entry
+     * backstops is the ordinary contract. */
+    static int hd256 = -1;
+    if (hd256 < 0) hd256 = getenv("R3D_HD256") ? 1 : 0;
+    if (P.head_dim != 64 && P.head_dim != 128 && !(hd256 && P.head_dim == 256))
+        return RAD_E_UNSUPPORTED;
 
     /* v1 is the default: the v2 256-thread schedule measured 0.43-0.80x at deep ctx
      * (bit-identical hashes, same-card bench 2026-10-20) -- one 40.7 KB-LDS block per
@@ -197,6 +240,12 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
      * reachable only without v3). */
     static int v3 = -1;
     if (v3 < 0) v3 = getenv("R3D_ATTN_V3") ? 1 : 0;
+    /* head_dim 256 rides the v1 body only: v2/v3 have no 256 instantiation (their
+     * carves and thread maps are 64/128-shaped), and fp8-256 has none either. Refuse
+     * BEFORE any grid/macro selection: a mis-selected D would launch a 64-wide body
+     * over 256-wide operands. The entry's v1 backstop serves what we refuse. */
+    const int d256 = hd256 && P.head_dim == 256;
+    if (d256 && (v2 || v3 || P.kvdt != RAD_BF16)) return RAD_E_UNSUPPORTED;
     /* DBUF: register-prefetched KV staging on v1's geometry (body.inc's DBUF branch).
      * Bit-identical schedule change (same fragments, same order, same LDS slots).
      * Default-on since the paired card bench (build8, 2026-10-20): 1.19-1.27x on all
@@ -245,6 +294,19 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
         else                     R3D_LAUNCH4(K, 64, RAD_F8E4M3, SK, DB);
     if (v3)             { R3D_ARMS3(attn_paged_wmma_kernel3) }
     else if (v2)        { R3D_ARMS(attn_paged_wmma_kernel2)  }
+    else if (d256) {
+        /* R3D_HD256_PAD=1 selects the bank-spread pad arm (S kBN+1); both PAD arms
+         * are bit-identical -- the paired bench picks the speed (issue #11 m2). */
+        static int pad = -1;
+        if (pad < 0) pad = getenv("R3D_HD256_PAD") ? 1 : 0;
+        const int dbg256 = getenv("R3D_DEBUG_DECODE") ? 1 : 0;
+        if (dbuf_ok) {
+            if (pad) return r3d_launch256<1, 1>(P, grid, stream, dbg256);
+            return r3d_launch256<1, 0>(P, grid, stream, dbg256);
+        }
+        if (pad) return r3d_launch256<0, 1>(P, grid, stream, dbg256);
+        return r3d_launch256<0, 0>(P, grid, stream, dbg256);
+    }
     else if (dbuf_ok)   { R3D_ARMS4(attn_paged_wmma_kernel, 0, 1) }
     else                { R3D_ARMS(attn_paged_wmma_kernel)   }
     #undef R3D_ARMS4

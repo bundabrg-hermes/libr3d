@@ -52,6 +52,36 @@ struct R3dAttnParams {
  * RAD_E_DEVICE to hand the launch back to the entry's v1 kernel. */
 int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream);
 
+/* Head_dim-256 tile sizing (issue #11 milestone 2). The 256 instantiation cannot use
+ * static __shared__ (the fitted carve exceeds the 48 KiB static ceiling), so the kernel
+ * reads its LDS through extern __shared__ and the LAUNCHER must pass the exact byte
+ * count -- but Carve lives inside each TU's chip gate while the launcher lives outside
+ * it. This host-side constexpr is the launcher's copy of the Carve<256,PAD>::total
+ * formula; every 256 instantiation carries a static_assert pinning it to the kernel's
+ * own C::total, so the two can never drift (mirrors the kvvec-gate-duplicated-
+ * verbatim pattern of the DBUF dispatch). PAD selects the bank-pad A/B arms:
+ * 0 = S pitch kBN+4, P pitch kBN+2; 1 = S pitch kBN+1 (bank-spread variant). Pads are
+ * addressing-only: every PAD produces bit-identical output; the bench picks the speed.
+ * D must be 256; other head_dims keep the historical static path and never call this. */
+constexpr int r3d_attn256_smem(int pad) {
+    constexpr int bm = 64, bn = 32;                       /* kBM, kBN (body.inc law) */
+    const int kQP = 256 + 8, kVP = 256 + 8, kPP = bn + 2; /* Q/KV row pitch 8-elem pad:
+                                                            * uint4 LDS stores need 16 B row
+                                                            * starts (256+4=520 B breaks it) */
+    const int kSP = pad ? bn + 1 : bn + 4;
+    auto al16 = [](int x) { return (x + 15) & ~15; };
+    const int offQ  = 0;
+    const int offS  = al16(offQ + bm * kQP * 2);
+    const int offP  = al16(offS + bm * kSP * 4);
+    const int offKV = al16(offP + bm * kPP * 2);
+    const int offM  = al16(offKV + bn * kVP * 2);
+    const int offRB = offM + 2 * bm * 4;
+    const int offCB = offRB + bn * 8;
+    const int offRB2 = offCB + bn;         /* DBUF addressing pair (8-aligned) */
+    const int offCB2 = offRB2 + bn * 8;
+    return offCB2 + bn + 16;
+}
+
 /* The scalar reference port (r3d_attn_paged.hip's v1 kernel), exposed so the decode row can
  * serve what the split-K tile refuses (foreign chips, R3D_NO_WMMA, head_dim outside the
  * WMMA templates) without re-deriving a single scalar. */

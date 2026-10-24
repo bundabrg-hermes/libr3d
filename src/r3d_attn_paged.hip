@@ -389,8 +389,13 @@ static int r3d_attn_paged_impl(const RadArgs* a, RadStream s) {
      * the tile below), so this route can only ever change which launch runs,
      * never the math. The dtype/head_dim mirror here is for shapes the band
      * itself refuses (windowed, f32 cache, other head_dims): they keep the
-     * direct path with no extra fill. rows <= 8*n_seq is the per-step bound that
-     * survives cu_seqlens (q_len_uniform is 0 whenever the engine passes it). */
+     * direct path with no extra fill. The mirror deliberately does NOT include
+     * head_dim 256: the split-K row has no 256 instantiation (issue #11 m2
+     * desk-sized it only), so a 256 decode shape takes the WMMA offer below --
+     * the plain tile if R3D_HD256 is on, v1 otherwise -- without a detour
+     * through an entry that could only hand it back. rows <= 8*n_seq is the
+     * per-step bound that survives cu_seqlens (q_len_uniform is 0 whenever the
+     * engine passes it). */
     if (P.window == 0 && P.n_seq > 0 && P.rows <= 8 * P.n_seq &&
         (P.head_dim == 64 || P.head_dim == 128) &&
         P.qdt == RAD_BF16 && (P.kvdt == RAD_BF16 || P.kvdt == RAD_F8E4M3))
@@ -399,7 +404,8 @@ static int r3d_attn_paged_impl(const RadArgs* a, RadStream s) {
     /* Offer the launch to the WMMA tile first (r3d_attn_paged_wmma.hip). It sees the
      * same P the v1 kernel would have, computed in the same lines; it refuses what it
      * does not serve (chips without a gfx11xx object, q-f32 / kv-f32, head_dim outside
-     * {64,128}, R3D_NO_WMMA=1) and a refusal is ordinary traffic, not an error -- v1
+     * {64,128} -- or outside {64,128,256} with R3D_HD256=1, fp8 KV at 256 --,
+     * R3D_NO_WMMA=1) and a refusal is ordinary traffic, not an error -- v1
      * below was never launched in that case and serves the op exactly as before. */
     if (r3d_attn_paged_wmma_launch(P, stream) == RAD_OK) return RAD_OK;
 
