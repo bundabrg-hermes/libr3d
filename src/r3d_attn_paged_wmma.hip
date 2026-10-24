@@ -33,7 +33,8 @@
  * Serve geometry this tile is built for (MiniCPM5-2B): head_dim 128, 16 q heads / 2 kv
  * heads (gqa 8), block_size 16, bf16 cache. head_dim 64 compiles and runs on the same
  * template; head_dim 256 rides a fitted carve behind R3D_HD256 (default OFF; issue #11
- * milestone 2 -- dynamic LDS, S pitch kBN+4, P pitch kBN+2, one block/CU). q-f32 or
+ * milestone 2 -- dynamic LDS, S pitch kBN+1 / P pitch kBN+2 by default (pad A/B under
+ * R3D_HD256_PAD), one block/CU). q-f32 or
  * kv-f32 caches, head_dim outside the instantiated set, and every refused shape
  * return RAD_E_UNSUPPORTED and v1 serves them, unchanged, forever. Decode rows are
  * eligible too: a qlen=1 sequence wastes 63/64 of a query tile's FMAs but reads the same
@@ -295,10 +296,13 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
     if (v3)             { R3D_ARMS3(attn_paged_wmma_kernel3) }
     else if (v2)        { R3D_ARMS(attn_paged_wmma_kernel2)  }
     else if (d256) {
-        /* R3D_HD256_PAD=1 selects the bank-spread pad arm (S kBN+1); both PAD arms
-         * are bit-identical -- the paired bench picks the speed (issue #11 m2). */
+        /* Pad A/B (issue #11 m2): both arms are bit-identical by construction; the
+         * paired pinned-clock bench (2026-10-24, XTX, AB_ROT=12) put the odd S pitch
+         * (kBN+1, the PAD1 carve at 64592 B) 1.6-4.1% ahead on all ten geometries.
+         * PAD1 is therefore the default; R3D_HD256_PAD=0 keeps the kBN+4 arm (65360 B)
+         * reachable for postmortem. */
         static int pad = -1;
-        if (pad < 0) pad = getenv("R3D_HD256_PAD") ? 1 : 0;
+        if (pad < 0) pad = getenv("R3D_HD256_PAD") ? atoi(getenv("R3D_HD256_PAD")) : 1;
         const int dbg256 = getenv("R3D_DEBUG_DECODE") ? 1 : 0;
         if (dbuf_ok) {
             if (pad) return r3d_launch256<1, 1>(P, grid, stream, dbg256);
