@@ -34,19 +34,24 @@ __device__ __forceinline__ uint16_t r3d_f32_to_bf16(float f) {
     return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 
-template <int Mode>   /* 0 copy, 1 widen bf16->f32, 2 narrow f32->bf16 */
+template <int Mode, int Contig>   /* Mode: 0 copy, 1 widen bf16->f32, 2 narrow f32->bf16.
+    * Contig: x_pitch == y_pitch == n, so r*pitch+i == e for both faces and the per-element
+    * 64-bit division is dead at compile time -- the contiguous walk is a pure linear copy.
+    * Both arms address the identical element per e, so outputs are bit-identical. */
 __global__ __launch_bounds__(kThreads) void cast_kernel(
     const void* __restrict__ x, void* __restrict__ y, uint64_t total, uint32_t n,
     int64_t x_pitch, int64_t y_pitch) {
     const uint64_t idx = (uint64_t)blockIdx.x * kThreads + threadIdx.x;
     for (uint64_t e = idx; e < total; e += (uint64_t)gridDim.x * kThreads) {
-        const uint64_t r = e / n, i = e - r * n;
+        const uint64_t r = Contig ? 0 : e / n;
+        const uint64_t ox = Contig ? e : r * (uint64_t)x_pitch + (e - r * n);
+        const uint64_t oy = Contig ? e : r * (uint64_t)y_pitch + (e - r * n);
         if (Mode == 0)
-            ((uint16_t*)y)[r * y_pitch + i] = ((const uint16_t*)x)[r * x_pitch + i];
+            ((uint16_t*)y)[oy] = ((const uint16_t*)x)[ox];
         else if (Mode == 1)
-            ((float*)y)[r * y_pitch + i] = r3d_bf16_to_f32(((const uint16_t*)x)[r * x_pitch + i]);
+            ((float*)y)[oy] = r3d_bf16_to_f32(((const uint16_t*)x)[ox]);
         else
-            ((uint16_t*)y)[r * y_pitch + i] = r3d_f32_to_bf16(((const float*)x)[r * x_pitch + i]);
+            ((uint16_t*)y)[oy] = r3d_f32_to_bf16(((const float*)x)[ox]);
     }
 }
 
@@ -83,19 +88,27 @@ static int r3d_cast_impl(const RadArgs* a, RadStream s) {
 
     const int64_t x_pitch = X->rank >= 2 ? X->stride[X->rank - 2] : n;
     const int64_t y_pitch = Y->rank >= 2 ? Y->stride[Y->rank - 2] : n;
+    const int contig = x_pitch == n && y_pitch == n;
 
     const uint32_t blocks = (uint32_t)((nel + kThreads - 1) / kThreads);
     if (blocks == 0 || blocks > 0x7fffffffu) return RAD_E_SHAPE;
 
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
-    if (mode == 0)
-        hipLaunchKernelGGL((cast_kernel<0>), dim3(blocks), dim3(kThreads), 0, stream,
-                           X->data, Y->data, (uint64_t)nel, (uint32_t)n, x_pitch, y_pitch);
-    else if (mode == 1)
-        hipLaunchKernelGGL((cast_kernel<1>), dim3(blocks), dim3(kThreads), 0, stream,
-                           X->data, Y->data, (uint64_t)nel, (uint32_t)n, x_pitch, y_pitch);
-    else
-        hipLaunchKernelGGL((cast_kernel<2>), dim3(blocks), dim3(kThreads), 0, stream,
-                           X->data, Y->data, (uint64_t)nel, (uint32_t)n, x_pitch, y_pitch);
+    #define R3D_CAST_LAUNCH(M) do {                                            \
+        if (contig)                                                            \
+            hipLaunchKernelGGL((cast_kernel<M, 1>), dim3(blocks),              \
+                               dim3(kThreads), 0, stream,                      \
+                               X->data, Y->data, (uint64_t)nel, (uint32_t)n,   \
+                               x_pitch, y_pitch);                              \
+        else                                                                   \
+            hipLaunchKernelGGL((cast_kernel<M, 0>), dim3(blocks),              \
+                               dim3(kThreads), 0, stream,                      \
+                               X->data, Y->data, (uint64_t)nel, (uint32_t)n,   \
+                               x_pitch, y_pitch);                              \
+    } while (0)
+    if (mode == 0)      R3D_CAST_LAUNCH(0);
+    else if (mode == 1) R3D_CAST_LAUNCH(1);
+    else                R3D_CAST_LAUNCH(2);
+    #undef R3D_CAST_LAUNCH
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
