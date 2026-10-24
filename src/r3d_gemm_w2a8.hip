@@ -208,7 +208,7 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_kernel(
 #pragma unroll
             for (int d = 0; d < W; ++d)
                 bwin[d] = (d < rem)
-                    ? *(const uint32_t*)(crow + (((int64_t)(wbase + d)) << 5) + (lane << 2))
+                    ? *(const uint32_t*)(crow + (((int64_t)(wbase + d)) << 7) + (lane << 2))
                     : 0u;
         }
         for (int d = 0; d < rem; ++d) {
@@ -222,7 +222,7 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_kernel(
             __syncthreads();
 
             const uint32_t b4 = (W > 1) ? bwin[d]
-                : *(const uint32_t*)(crow + (((int64_t)wbase + d) << 5) + (lane << 2));
+                : *(const uint32_t*)(crow + (((int64_t)wbase + d) << 7) + (lane << 2));
             float sub[MT];
 #pragma unroll
             for (int m = 0; m < MT; ++m) {
@@ -320,13 +320,19 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_kernel(
 
 }  /* anonymous namespace */
 
-#else  /* non-RDNA3: host-visible no-op, the launcher never dispatches it */
+#else  /* non-RDNA3: host-visible no-op */
 
+/* MUST mirror the real
+ * kernel's signature exactly: the host pass only ever sees this stub, and the runtime
+ * resolves hipLaunchKernelGGL by the MANGLED NAME -- a drifted stub registers a name the
+ * device image does not carry, and every instantiation launches as "cannot find symbol /
+ * invalid device function" (2026-10-24: the 6th int64 pitch was missing here; the row
+ * could never launch on any card and the engine fell back host-side every draft pass). */
 namespace {
 template <int MT, int W>
 __global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_kernel(
     const int8_t*, const uint8_t*, uint16_t*, const float*, const __half*, const uint8_t*,
-    const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int) {}
+    const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) {}
 }  /* anonymous namespace */
 
 #endif /* gfx11 family */
@@ -367,7 +373,9 @@ int w2_plan(const RadArgs* a, const RadTensor* A, const RadTensor* AS, const Rad
     if (!rad_args_geti(a, "group", &gp) || gp != 128) return RAD_E_SHAPE;  /* DF_W2_GROUP */
     if (K % 128) return RAD_E_UNSUPPORTED;             /* the scale grid must close */
     const int64_t M = P->M;                            /* set by the entry: numel(y)/N */
-    if (M <= 0 || M > 8) return RAD_E_UNSUPPORTED;     /* the band's own bound, re-checked */
+    if (M <= 0 || M > 16) return RAD_E_UNSUPPORTED;     /* the band's own bound, re-checked:
+                                                           the drafter declares M to 14, the
+                                                           MT=16 tile covers it at 16 */
     if (N % 16) return RAD_E_UNSUPPORTED;              /* libr4d cGemmNtW2A8's N rule */
     if (M > 0x7ffffffLL || N > 0x7ffffffLL || K > 0x7ffffffLL) return RAD_E_SHAPE;
 
@@ -444,7 +452,11 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
     static const bool no_pf = getenv("R3D_NO_GEMV_PF") != nullptr;
     static const int  pf_w  = getenv("R3D_GEMV_PF_W") ? atoi(getenv("R3D_GEMV_PF_W")) : 8;
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
-    const int mt = P.M >= 8 ? 8 : P.M >= 4 ? 4 : P.M >= 2 ? 2 : 1;
+    /* MT rounds UP to cover M: the tile computes min(M, MT) rows and there is no
+     * m-loop, so MT < M silently drops rows (serve 2026-10-24: the drafter's block
+     * pass collapses the draft rows to 7 -- the old down-round picked MT=4 and
+     * lost 3). The band's M<=16 bound makes the 16 tile the ceiling. */
+    const int mt = P.M >= 9 ? 16 : P.M >= 5 ? 8 : P.M >= 3 ? 4 : P.M >= 2 ? 2 : 1;
     const dim3 grid((unsigned)((P.N + 7) / 8));
 
 #define R3D_W2_GEMV(MT_, W_)                                                        \
@@ -458,7 +470,8 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
         case 1: R3D_W2_GEMV(1, W_); break;            \
         case 2: R3D_W2_GEMV(2, W_); break;            \
         case 4: R3D_W2_GEMV(4, W_); break;            \
-        default: R3D_W2_GEMV(8, W_); break;           \
+        case 8: R3D_W2_GEMV(8, W_); break;            \
+        default: R3D_W2_GEMV(16, W_); break;          \
     }
     if (no_pf)      { R3D_W2_GEMV_SW(1) }
     else if (pf_w == 16) { R3D_W2_GEMV_SW(16) }
@@ -529,9 +542,9 @@ static int r3d_gemm_nt_q_w2a8_dec_impl(const RadArgs* a, RadStream s) {
  *   ref_layout_gemm_q and r4d w2_enc_layout; the DECLINED set is documented in the header.
  */
 
-extern "C" int r3d_layout_gemm_w2a8(const RadParam* p, int n_p, int operand,
-                                    const RadEncoding* enc, const int* sel,
-                                    const RadTensor* planes, int n, RadLayout* out) {
+static int w2_layout_impl(const RadParam* p, int n_p, int operand,
+                          const RadEncoding* enc, const int* sel,
+                          const RadTensor* planes, int n, RadLayout* out) {
     if (operand != 3 || n < 2 || !out) return RAD_E_UNSUPPORTED;   /* codes and the rest:
                                                                       stored as they are */
     if (!enc || !sel) return RAD_E_DTYPE;
@@ -568,6 +581,16 @@ extern "C" int r3d_layout_gemm_w2a8(const RadParam* p, int n_p, int operand,
             planes[i].shape[0] != N || planes[i].shape[1] != nsz)
             return RAD_E_SHAPE;                 /* r4d sz_layout's dims(pl[i], N, nsz) */
     return rad_planes_layout(enc, sel, planes, n, out);
+}
+
+extern "C" int r3d_layout_gemm_w2a8(const RadParam* p, int n_p, int operand,
+                                    const RadEncoding* enc, const int* sel,
+                                    const RadTensor* planes, int n, RadLayout* out) {
+    const int st = w2_layout_impl(p, n_p, operand, enc, sel, planes, n, out);
+    if (getenv("R3D_DEBUG_W2A8"))
+        fprintf(stderr, "W2DBG layout operand=%d n=%d -> %d %s\n", operand, n, st,
+                st == RAD_OK && out && out->tag ? out->tag : "");
+    return st;
 }
 
 extern "C" int r3d_relayout_gemm_w2a8(const RadParam* p, int n_p, int operand,

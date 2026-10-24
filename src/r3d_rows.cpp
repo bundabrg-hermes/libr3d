@@ -983,15 +983,19 @@ static const RadConstraint cMxfp4DecodeRow[] = {
     { "K",     RAD_C_DIV, 128, nullptr },
 };
 
-/* gemm_nt_q w2a8 decode band: the DFlash2 draft head (the container declares the
- * grid only when the draft weight carries its 2-bit recipe). libr4d's cGemmNtW2A8
- * (K DIV 128, N DIV 16, dtype w2a8) plus the decode band M <= 8 and the checkpoint's
- * group; the entry re-checks every dtype, the band's bound, and the dword walk. */
+/* gemm_nt_q w2a8 decode band: the DFlash2 draft head (the container declares the grid
+ * only when the draft weight carries its 2-bit recipe). libr4d's cGemmNtW2A8 (K DIV 128,
+ * N DIV 16, dtype w2a8) plus the drafter's own M ceiling and the checkpoint's group; the
+ * M bound is 16, NOT the fp8/mxfp4 row's 8: the drafter's band collapses at 14 (verify
+ * rows join the draft rows in the block pass), and a bucket with no device row sends the
+ * WHOLE op host-side -- the head's joined scale plane then has no as-is spelling the
+ * mapped tier may read, and startup dies on it. The MT=16 tile serves M <= 16.
+ * The entry re-checks every dtype, the band's bound, and the dword walk. */
 static const RadConstraint cW2A8DecodeRow[] = {
     { "dtype", RAD_C_IN,  0,    "w2a8" },
     { "K",     RAD_C_DIV, 128,  nullptr },
     { "N",     RAD_C_DIV, 16,   nullptr },
-    { "M",     RAD_C_LE,  8,    nullptr },
+    { "M",     RAD_C_LE,  16,   nullptr },
     { "group", RAD_C_EQ,  128,  nullptr },
 };
 
@@ -1436,10 +1440,12 @@ static const RadKernelInfo kRows[] = {
   "an octet butterfly and flushes as (sub * a_scale) * b_scale in the oracle's "
   "order, sub = is - zero * a_sum first -- every value before the scales is an exact "
   "f32 integer, so the fold is bit-exact to ref_gemm's gemm_zp, not merely close",
-  "M <= 8 (the drafter's whole gemm_nt_q band; everything else resolves past the "
-  "row); K a multiple of 128; N a multiple of 16 (libr4d's rule); group exactly "
-  "128; M derives from numel(y)/N; a B whose base or row pitch breaks the dword "
-  "walk resolves past the row, as everything past the band does -- to the host",
+  "M <= 16 (the drafter's whole gemm_nt_q band -- its block pass collapses M at 14, "
+  "verify rows included; a bucket above this would strand the op host-side, which its "
+  "joined scale plane cannot survive; K a multiple of 128; N a multiple of 16 (libr4d's "
+  "rule); group exactly 128; M derives from numel(y)/N; a B whose base or row pitch "
+  "breaks the dword walk resolves past the row, as everything past the band does -- "
+  "to the host",
   "int8 a with an f32 per-row scale (quant_act_i8's step order), u2 b (the codes "
   "plane stored as it is) with an f16 scale and a u8/u4 zero per 128 K in the "
   "canonical rad.planes join (libref's own layout), f32 a_sum = quant_act_i8's "

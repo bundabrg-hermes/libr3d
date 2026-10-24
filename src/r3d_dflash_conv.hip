@@ -109,6 +109,30 @@ static inline int row2(const RadTensor* t, int64_t cols, int64_t* pitch) {
     return 0;
 }
 
+/* R3D_DEBUG_DFLASH=1: name the operand that tripped a refuse. The engine aborts the step
+ * on a refusal at issue (declare-time selection is final), so the entry never re-resolves
+ * and the abort line alone does not say WHICH operand's view deviated (serve 2026-10-24,
+ * the drafter's first issue at T=8): rank/shape/stride of all four, every reject. */
+void dbg_op(const char* tag, const RadTensor* x, const RadTensor* dl,
+            const RadTensor* bs, const RadTensor* o) {
+    if (!getenv("R3D_DEBUG_DFLASH")) return;
+    const RadTensor* ts[4] = { x, dl, bs, o };
+    static const char* nm[4] = { "x", "delta", "base", "out" };
+    fprintf(stderr, "libr3d: dflash_conv refuse(%s):", tag);
+    for (int i = 0; i < 4; ++i) {
+        const RadTensor* t = ts[i];
+        if (!t) { fprintf(stderr, " %s=(null)", nm[i]); continue; }
+        fprintf(stderr, " %s[rank=%lld shape=", nm[i], (long long)t->rank);
+        for (int d = 0; d < t->rank && d < 4; ++d)
+            fprintf(stderr, "%s%lld", d ? "x" : "", (long long)t->shape[d]);
+        fprintf(stderr, " stride=");
+        for (int d = 0; d < t->rank && d < 4; ++d)
+            fprintf(stderr, "%s%lld", d ? "/" : "", (long long)t->stride[d]);
+        fprintf(stderr, "]");
+    }
+    fprintf(stderr, "\n");
+}
+
 } /* anonymous namespace */
 
 /* ------------------------------------------------------------------ entry */
@@ -137,28 +161,43 @@ static int r3d_dflash_conv_impl(const RadArgs* a, RadStream s) {
     const int64_t NG     = param_i(a, "NG", 0);
     const int64_t bsz    = param_i(a, "block_size", 0);
     if (taps <= 0 || group <= 0 || NG <= 0 || bsz <= 0) return RAD_E_INVAL;
-    if (x->rank != 2 || o->rank != 2) return RAD_E_SHAPE;
+    if (x->rank != 2 || o->rank != 2) { dbg_op("rank-xo", x, dl, bs, o); return RAD_E_SHAPE; }
     const int64_t T = x->shape[0], H = x->shape[1];
-    if (T <= 0 || o->shape[0] != T || o->shape[1] != H || H != NG * group) return RAD_E_SHAPE;
-    if (rad_tensor_numel(bs) < taps * H) return RAD_E_SHAPE;
+    if (T <= 0 || o->shape[0] != T || o->shape[1] != H || H != NG * group) {
+        dbg_op("shape-xo", x, dl, bs, o); return RAD_E_SHAPE;
+    }
+    if (rad_tensor_numel(bs) < taps * H) { dbg_op("numel-bs", x, dl, bs, o); return RAD_E_SHAPE; }
 
     /* delta: rank 3 [T, >=taps, >=NG] at its own strides, or rank 2 [T, >=taps*NG] at its
      * own row pitch (group stride unit), exactly ref's two spellings. */
     int64_t d_rs = 0, d_ts = 0;
     if (dl->rank == 3) {
-        if (dl->shape[0] < T || dl->shape[1] < taps || dl->shape[2] < NG) return RAD_E_SHAPE;
-        if (dl->stride[2] != 1) return RAD_E_STRIDE;       /* ref walks d_gs; unit is the band */
+        if (dl->shape[0] < T || dl->shape[1] < taps || dl->shape[2] < NG) {
+            dbg_op("ext-dl3", x, dl, bs, o); return RAD_E_SHAPE;
+        }
+        if (dl->stride[2] != 1) { dbg_op("unit-dl3", x, dl, bs, o); return RAD_E_STRIDE; }
         d_rs = dl->stride[0]; d_ts = dl->stride[1];
     } else if (dl->rank == 2) {
-        if (dl->shape[0] < T || dl->shape[1] < taps * NG) return RAD_E_SHAPE;
-        if (dl->stride[1] != 1) return RAD_E_STRIDE;
+        if (dl->shape[0] < T || dl->shape[1] < taps * NG) {
+            dbg_op("ext-dl2", x, dl, bs, o); return RAD_E_SHAPE;
+        }
+        if (dl->stride[1] != 1) { dbg_op("unit-dl2", x, dl, bs, o); return RAD_E_STRIDE; }
         d_rs = dl->stride[0]; d_ts = NG;                   /* ref: d_ts = NG * d_gs, d_gs = 1 */
-    } else return RAD_E_SHAPE;
+    } else { dbg_op("rank-dl", x, dl, bs, o); return RAD_E_SHAPE; }
 
     int64_t x_rs = 0, o_rs = 0, bs_rs = 0;
-    if (row2(x,  H, &x_rs))  return RAD_E_STRIDE;
-    if (row2(o,  H, &o_rs))  return RAD_E_STRIDE;
-    if (row2(bs, H, &bs_rs)) return RAD_E_STRIDE;
+    if (row2(x,  H, &x_rs))  { dbg_op("row2-x",  x, dl, bs, o); return RAD_E_STRIDE; }
+    if (row2(o,  H, &o_rs))  { dbg_op("row2-o",  x, dl, bs, o); return RAD_E_STRIDE; }
+    /* base's runtime spelling is the weight unit's batched [1, taps, H] view (serve
+     * 2026-10-24: rank 3 stride {taps*H, H, 1}); kbench's recipe spells it rank 2. Fold
+     * a degenerate batch prefix to its rank-2 body and read the row pitch from its own
+     * strides -- addressing identical, ref's base reads are row t at t * pitch. */
+    RadTensor bs2 = *bs;
+    if (bs->rank == 3 && bs->shape[0] == 1) {
+        bs2.rank = 2; bs2.shape[0] = bs->shape[1]; bs2.shape[1] = bs->shape[2];
+        bs2.stride[0] = bs->stride[1]; bs2.stride[1] = bs->stride[2];
+    }
+    if (row2(&bs2, H, &bs_rs)) { dbg_op("row2-bs", x, dl, bs, o); return RAD_E_STRIDE; }
 
     const int64_t total = T * H;
     if (total <= 0 || total > (int64_t)0xffff * kThreads) return RAD_E_SHAPE;

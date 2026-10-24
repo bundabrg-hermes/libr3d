@@ -1923,7 +1923,11 @@ static int gdn_recurrent_update_impl(const RadArgs* a, RadStream s) {
     const int64_t st_s1 = st->rank >= 4 ? st->stride[st->rank - 3] : Vd * Kd;
     const int64_t st_s2 = st->rank >= 4 ? st->stride[st->rank - 2] : Kd;
     if (st->rank >= 4 && st->stride[st->rank - 1] != 1) return RAD_E_STRIDE;
-    if (rad_tensor_numel(st) < T * Hv * Vd * Kd) return RAD_E_SHAPE;
+    /* per_candidate: T state rows. anchor: the engine's slot plane -- [slots, Hv, V, K]
+     * indexed through state_idx, NOT per token (serve 2026-10-24: the drafter's st is 4
+     * slots for T=8 and libref replays that view with rc=0; the old T-row floor refused
+     * at issue and aborted the step). Floor is one slot; reads stay idx-driven as ref's. */
+    if (rad_tensor_numel(st) < (anchor ? 1 : T) * Hv * Vd * Kd) return RAD_E_SHAPE;
 
     /* Anchor form: ref's shape rules. Six state_idx columns; the factor block must be dense
      * [V,K] inside the slot (AnchorLayout indexes it flat); and a step longer than the block's
@@ -2289,7 +2293,11 @@ static int gdn_conv_recurrent_update_impl(const RadArgs* a, RadStream s) {
     const int64_t st_s1 = st->rank >= 4 ? st->stride[st->rank - 3] : Vd * Kd;
     const int64_t st_s2 = st->rank >= 4 ? st->stride[st->rank - 2] : Kd;
     if (st->rank >= 4 && st->stride[st->rank - 1] != 1) return RAD_E_STRIDE;
-    if (rad_tensor_numel(st) < T * Hv * Vd * Kd) return RAD_E_SHAPE;
+    /* per_candidate: T state rows. anchor: the engine's slot plane -- [slots, Hv, V, K]
+     * indexed through state_idx, NOT per token (serve 2026-10-24: the drafter's st is 4
+     * slots for T=8 and libref replays that view with rc=0; the old T-row floor refused
+     * at issue and aborted the step). Floor is one slot; reads stay idx-driven as ref's. */
+    if (rad_tensor_numel(st) < (anchor ? 1 : T) * Hv * Vd * Kd) return RAD_E_SHAPE;
 
     /* Anchor form: ref's shape rules. Six state_idx columns; the factor block must be dense
      * [V,K] inside the slot (AnchorLayout indexes it flat); and a step longer than the block's
