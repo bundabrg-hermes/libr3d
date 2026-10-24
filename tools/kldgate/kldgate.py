@@ -40,13 +40,33 @@ subcommands:
                                                 join boundaries (positions that
                                                 desync are dropped, counted).
   compare --base B --free F --forced R [--report FILE]
-                                                KL/top-1/divergence report and
-                                                the PASS/FAIL verdict. KL and
+                                                KL/top-1/divergence report and the
+                                                PASS/FAIL verdict. KL and
                                                 top-1 agreement are computed
                                                 base vs forced (same context);
                                                 the free run is reported only
                                                 for its first-divergence column
                                                 (free-running greedy arms).
+  diffcompare --a FORCED_A --b FORCED_B [--report FILE]
+                                                DIFFERENTIAL mode (2026-10-25): join two
+                                                already-scored FORCED artifacts from the
+                                                SAME base trajectory and the SAME binary,
+                                                arms differing only in a lever, and
+                                                compute KL/top-1 on identical positions.
+                                                The committed compare flow scores a
+                                                free-RUNNING decode-step base against a
+                                                re-prefilled forced arm; that conditioning
+                                                gap is an instrument property (the same-arm
+                                                floor of 2026-10-25: mean 8.5e-3 / p99
+                                                0.147 / top-1 0.975 on byte-identical
+                                                kernels) and it CANCELS when both sides
+                                                are forced replays of the same trajectory.
+                                                What diffcompare measures is therefore the
+                                                arm-attributable drift directly. The
+                                                committed thresholds stay untouched: a
+                                                diff verdict is adjudicated against them
+                                                with the same-flow floor reported next to
+                                                it, never by moving them.
 
 thresholds (defaults, overridable): mean KLD <= 2e-3, p99 KLD <= 5e-3, top-1
 agreement >= 0.98. Rounding-order-class shifts sit near 1e-4 (their #113
@@ -268,6 +288,88 @@ def cmd_compare(args):
     sys.exit(0 if ok else 1)
 
 
+def load_forced(path):
+    """Index a forced-score jsonl: id -> {pos_index: record}."""
+    out = {}
+    for l in open(path):
+        if l.strip():
+            r = json.loads(l)
+            out.setdefault(r["id"], {})[r["pos_index"]] = r
+    return out
+
+
+def cmd_diffcompare(args):
+    """KL/top-1 between two FORCED artifacts of the same base trajectory.
+
+    Both sides re-prefill identical forced text, so the committed flow's
+    structural prefill-vs-free-decode gap cancels: this is the arm-attributable
+    differential directly. Direction: KL(A || B) with A = the arm under test,
+    B = the control (OFF/same-binary). The reverse direction is reported for
+    information; a union-KL renormalize amplifies razor ties in either arm.
+    """
+    a_by_id = load_forced(args.a)
+    b_by_id = load_forced(args.b)
+    rows, all_kl, all_kl_rev, all_top1 = [], [], [], []
+    for pid in sorted(set(a_by_id) & set(b_by_id)):
+        apos, bpos = a_by_id[pid], b_by_id[pid]
+        kls, kls_rev, agree, first_div = [], [], [], None
+        for i in sorted(apos):
+            ap, bp = apos[i], bpos.get(i)
+            if bp is None:
+                break  # one side truncated (retokenize desync): stop at the gap
+            a = {tid: lp for tid, lp in ap["top"]}
+            a.setdefault(ap["tok"], ap["logprob"])
+            b = {tid: lp for tid, lp in bp["top"]}
+            b.setdefault(bp["tok"], bp["logprob"])
+            kl, _ = kl_union(a, b)
+            kl_r, _ = kl_union(b, a)
+            kls.append(kl)
+            kls_rev.append(kl_r)
+            all_kl.append(kl)
+            top1_ok = max(a, key=a.get) == max(b, key=b.get)
+            agree.append(1 if top1_ok else 0)
+            all_top1.append(1 if top1_ok else 0)
+            if first_div is None and not top1_ok:
+                first_div = i
+        if kls:
+            rows.append((pid, len(kls), f"{sum(kls)/len(kls):.5f}",
+                         f"{max(kls):.5f}", f"{sum(kls_rev)/len(kls_rev):.5f}",
+                         f"{sum(agree)/len(agree):.3f}",
+                         "-" if first_div is None else str(first_div)))
+    mean = sum(all_kl) / len(all_kl) if all_kl else float("nan")
+    mean_r = sum(all_kl_rev) / len(all_kl_rev) if all_kl_rev else float("nan")
+    mx = max(all_kl) if all_kl else float("nan")
+    srt = sorted(all_kl)
+    p99 = srt[int(0.99 * (len(srt) - 1))] if srt else float("nan")
+    t1 = sum(all_top1) / len(all_top1) if all_top1 else float("nan")
+    ok = mean <= args.mean_kld and p99 <= args.p99_kld and t1 >= args.top1
+    lines = ["# kldgate DIFFERENTIAL report", "",
+             "KL / top-1 are computed arm vs control, both teacher-forced over the",
+             "SAME base trajectory: identical text at every position on both sides,",
+             "so the committed flow's free-decode-vs-re-prefill floor cancels. This",
+             "is the arm-attributable drift itself -- NOT a floor-subtraction.",
+             "Adjudication law: the committed thresholds below are the SAME absolute",
+             "numbers as the committed compare flow (they are NOT moved for any arm);",
+             "the differential is read against them directly, and the compare-flow",
+             "floor (same-arm, this session) is quoted beside it for context.", "",
+             f"a(arm)={args.a}  b(control)={args.b}  positions={len(all_kl)}", "",
+             "| corpus | scored pos | mean KL(a\\|\\|b) | max KL | mean KL(b\\|\\|a) | top-1 agree | first top-1 div |",
+             "|---|---|---|---|---|---|---|"]
+    for r in rows:
+        lines.append("| " + " | ".join(str(x) for x in r) + " |")
+    lines += ["",
+              f"**aggregate: mean KLD {mean:.5f} (reference {args.mean_kld}), "
+              f"p99 {p99:.5f} (reference {args.p99_kld}), max {mx:.5f} (info), "
+              f"reverse mean {mean_r:.5f}, top-1 {t1:.3f} (reference {args.top1})**",
+              "", "DIFF VERDICT (arm-attributable component vs committed "
+              "thresholds): " + ("PASS" if ok else "FAIL")]
+    report = "\n".join(lines) + "\n"
+    if args.report:
+        open(args.report, "w").write(report)
+    print(report)
+    sys.exit(0 if ok else 1)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -297,6 +399,14 @@ def main():
     m.add_argument("--p99-kld", type=float, default=GATE_P99_KLD)
     m.add_argument("--top1", type=float, default=GATE_TOP1)
     m.set_defaults(fn=cmd_compare)
+    d = sp.add_parser("diffcompare")
+    d.add_argument("--a", required=True, help="forced artifact of the arm under test")
+    d.add_argument("--b", required=True, help="forced artifact of the control arm")
+    d.add_argument("--report")
+    d.add_argument("--mean-kld", type=float, default=GATE_MEAN_KLD)
+    d.add_argument("--p99-kld", type=float, default=GATE_P99_KLD)
+    d.add_argument("--top1", type=float, default=GATE_TOP1)
+    d.set_defaults(fn=cmd_diffcompare)
     args = ap.parse_args()
     args.fn(args)
 
