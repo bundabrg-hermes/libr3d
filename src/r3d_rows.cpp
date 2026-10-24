@@ -1489,7 +1489,12 @@ static const RadKernelInfo kRows[] = {
   "bf16 or f32 out, f32 softmax with the max subtracted",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cAttnPaged, 3, nullptr, 0, nullptr,
-  nullptr, nullptr, r3d_rad_attn_paged },
+  /* The decode scratch hook rides on THIS row because it is the row the engine
+   * actually selects at boot (see the live-band comment in r3d_attn_paged.hip):
+   * the split-K entry is reached from here at issue time, so the arena it needs
+   * must be sized by the row that was resolved. The hook is the split-K law's
+   * own closed form and answers 0 for shapes it cannot serve. */
+  nullptr, nullptr, r3d_rad_attn_paged, r3d_rad_attn_decode_scratch },
 
 { "attn_paged_decode_bf16kv_h128", "attn_paged", "attn",
   "split-KV decode attention: the WMMA tile's two passes over each of `splits` KV slices "

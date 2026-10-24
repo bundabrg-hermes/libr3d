@@ -40,6 +40,10 @@
 #include "rad_plugin.h"
 #include "r3d_attn.h"
 
+/* The split-KV decode entry (r3d_attn_paged_decode.hip), reached from this row's
+ * live decode band -- see the band comment in r3d_attn_paged_impl. */
+extern "C" int r3d_rad_attn_paged_decode(const RadArgs*, RadStream);
+
 namespace {
 
 using AttnParams = R3dAttnParams;   /* shared with the WMMA tile TU via r3d_attn.h */
@@ -370,6 +374,27 @@ static int r3d_attn_paged_impl(const RadArgs* a, RadStream s) {
     if (rc != RAD_OK) return rc;
 
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
+
+    /* The decode band, live (2026-10-24). The engine resolves attn_paged once at
+     * boot against the op schema's q_len semantics, so the registered
+     * attn_paged_decode_bf16kv_* bands (q_len <= 8, priority 1100) can never
+     * match: boot logs select attn_paged_bf16, the split-K rows are never called
+     * on serve (zero DBG lines over 10k decode steps), and only direct-dlopen
+     * benches ever proved the fold/merge. Same shape as the w2a8 trap fixed for
+     * issue #9 -- "band geometry vs schema capacity" -- and the same fix: the
+     * band's own arithmetic moves HERE, onto the per-launch values this entry
+     * really sees. Decode/verify shapes hand the whole op to the split-K entry
+     * with the same args; that entry IS the band everywhere else (chip gate,
+     * R3D_NO_WMMA / R3D_NO_SPLITK, arena-short, spl==1 all land back on exactly
+     * the tile below), so this route can only ever change which launch runs,
+     * never the math. The dtype/head_dim mirror here is for shapes the band
+     * itself refuses (windowed, f32 cache, other head_dims): they keep the
+     * direct path with no extra fill. rows <= 8*n_seq is the per-step bound that
+     * survives cu_seqlens (q_len_uniform is 0 whenever the engine passes it). */
+    if (P.window == 0 && P.n_seq > 0 && P.rows <= 8 * P.n_seq &&
+        (P.head_dim == 64 || P.head_dim == 128) &&
+        P.qdt == RAD_BF16 && (P.kvdt == RAD_BF16 || P.kvdt == RAD_F8E4M3))
+        return r3d_rad_attn_paged_decode(a, s);
 
     /* Offer the launch to the WMMA tile first (r3d_attn_paged_wmma.hip). It sees the
      * same P the v1 kernel would have, computed in the same lines; it refuses what it
