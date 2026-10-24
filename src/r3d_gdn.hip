@@ -1487,7 +1487,15 @@ static int r3d_gdn_conv_update_impl(const RadArgs* a, RadStream s) {
     if (Hg <= 0 || H <= 0 || H % Hg != 0) return RAD_E_SHAPE;
     const int64_t conv_dim = 2 * Hg * Kd + H * Vd;
     const int64_t xrow_e = xrow ? xrow : conv_dim;
-    if (rad_tensor_numel(x) < T * xrow_e) return RAD_E_SHAPE;
+    /* numel is the shape product, so it can never cover a padded arena row: the
+     * 2026-10-24 serve handed this row x [9, conv_dim] at row pitch 12288 -- a
+     * view this row's own contract calls legal ("wider pitch fine") -- and the
+     * pitch-scaled floor refused it with E_SHAPE at issue, killing the drafter's
+     * 9-row verify step (issue #10). Floor on the logical width and trust the
+     * engine's row stride exactly as the reference host row does: it walks the
+     * same strides with no footprint check. The floor still catches short views. */
+    const int64_t xw = x->rank >= 2 ? x->shape[x->rank - 1] : conv_dim;
+    if (rad_tensor_numel(x) < T * xw) return RAD_E_SHAPE;
     if (rad_tensor_numel(w) < conv_dim * width) return RAD_E_SHAPE;
     if (sidx && rad_tensor_numel(sidx) < N) return RAD_E_SHAPE;
     if (nacc && rad_tensor_numel(nacc) < N) return RAD_E_SHAPE;
