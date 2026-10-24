@@ -1524,3 +1524,34 @@ direct-dlopen row proof says nothing about engine resolution; serve-path proof
 means attribution lines in the engine's own log. (2) The "Rows nothing ran"
 report section is a selection claim; read it at every gate. (3) Serve shape
 vocabulary comes from R3D_DUMP captures, never from bench assumptions.
+
+## 2026-10-24 late window: two bit-identical micro-fixes; hd256 sizing (issue #11 milestone 1)
+
+The external kernel review's remaining card-free items shipped: `rope` now
+computes `sincosf` once per pair through the token block's LDS (the angle is a
+function of the pair index alone - even under imrope's component rule - yet it
+ran once per (head, pair) item), and `cast` gained a Contig template arm that
+folds away its per-element 64-bit division when both pitches equal n. Both are
+bit-identical by construction: same float ops on the same inputs; gates confirm
+at the numbers - stock 2011/2011 (3.135e-03), full 4737/4737 (2.859e-03),
+27b_dflash2 702/702, 27b_df3 768/768, all unchanged. The stock report's per-case
+table proves reachability: 37 rope_bf16 cases (including nontrivial imrope
+sections 11-11-10) and the cast_bf16 family all ran on libr3d device rows at
+0.00e+00.
+
+The paired serve A/B (one session, container swap, 5 salted TTFT rounds + 3
+decode rounds each) measured **nothing**: TTFT medians 22 720 vs 22 717 ms on a
+~3k-token prompt, decode 52.09 vs 51.73 tok/s. That is the honest result and it
+is informative: at head_dim 256 the prefill is dominated by the scalar
+reference attention's quadratic term - rope is not yet a term worth cutting. It
+will be when #11 lands; the fix is shipped now so the term is already cheap
+when the ceiling moves. (22.7 s TTFT for 3k tokens is itself the loudest number
+of the window - the #11 price tag in wall-clock.)
+
+Issue #11 milestone 1 (sizing, from the `Carve<D>` formulas): a literal hd256
+instantiation is 66 640 B - over the 64 KiB dynamic-LDS ceiling by 1104 B,
+because `total` reserves the DBUF pair unconditionally and the +8 pitch pads on
+Q/KV are load-bearing for the uint4 LDS staging. S-pitch kBN+4 + P-pitch kBN+2
++ a conditional DBUF slot fits at 64 944 B; occupancy stays 1 block/CU, which
+is what the shipped D=128 tile already runs at 42 064 B. See the issue comment
+for the variant table and the split-K carve still owed.
