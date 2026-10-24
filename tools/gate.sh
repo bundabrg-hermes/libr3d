@@ -47,6 +47,7 @@ stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
     [ -n "${R3D_FP4_CHAIN:-}" ] && envs+=(-e R3D_FP4_CHAIN="$R3D_FP4_CHAIN")
     [ -n "${R3D_FP4_RP:-}" ] && envs+=(-e R3D_FP4_RP="$R3D_FP4_RP")
     [ -n "${R3D_NO_DFLASH:-}" ] && envs+=(-e R3D_NO_DFLASH="$R3D_NO_DFLASH")
+    [ -n "${R3D_NO_W2A8_Q8X:-}" ] && envs+=(-e R3D_NO_W2A8_Q8X="$R3D_NO_W2A8_Q8X")
     [ -n "${R3D_DEBUG_DFLASH:-}" ] && envs+=(-e R3D_DEBUG_DFLASH="$R3D_DEBUG_DFLASH")
     local out rc; out=$(mktemp); rc=0
     docker run --rm "${DEVS[@]}" "${envs[@]}" --shm-size=4g -v "$SCRATCH":/scratch -v "$REPO/$BUILD":/build:ro \

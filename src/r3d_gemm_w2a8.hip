@@ -318,6 +318,186 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_kernel(
     }
 }
 
+/* ---- the q8 fast arm (hipfire graft, 2026-10-24): v_dot4_i32_iu8 over repacked codes ----
+ *
+ * The u2 walk above spends its band on VALU: sixteen fmaf per lane-group and four float4
+ * LDS reads per row. The microbench that prompted this arm (HIPFIRE-EVAL-2026-10-24, the
+ * same warp-per-row geometry with hipfire's q8x inner loop on the XTX) ran 3-5x the
+ * libr3d decode GEMVs at every model shape and 5-6x in the M=4 verify band. The inner
+ * loop here is that graft: the weight codes repacked to one code a byte (a plane the
+ * plugin owns, built once -- see w2_launch's cache), staged i8 activations in LDS, and
+ * four __builtin_amdgcn_sudot4 per sixteen codes per lane. The builtin lowers to
+ * v_dot4_i32_iu8 with neg_lo:[1,0,0] -- signed i8 activation bytes x unsigned code bytes,
+ * i32 accumulate (compile-probed and fuzzed on the card 2026-10-24, together with the
+ * nibble-wide v_dot8_i32_iu4, which is the wrong width for this zero-point structure).
+ *
+ * Bit-exactness survives unchanged: every value up to the scales is an exact integer
+ * (the group partial is still |is| <= 128*127*3 < 2^24 -- the dot unit sums four products
+ * internally in any order, integers are associative), the octet butterfly folds ints
+ * before the float conversion, and the flush from `sub` onward is the oracle's fp chain
+ * op for op, byte-identical to the u2 walk's. tools/repro_w2a8.hip adjudicates.
+ *
+ * The LDS halves (MT x 512 BYTES vs 4x that) and the window loads are dwordx4: sixteen
+ * weight bytes and sixteen activation bytes per lane per group, which is also the
+ * bytes-in-flight direction the MLP-starvation finding (issue #8 follow-up) names.
+ */
+__global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_repack_kernel(
+    const uint8_t* __restrict__ B, uint8_t* __restrict__ B8,
+    int64_t b_pitch, int64_t kb)
+{
+    const int64_t row = blockIdx.x;
+    const int u = blockIdx.y * kThreads + threadIdx.x;      /* sixteen-code units */
+    if (u >= (kb >> 2)) return;
+    const uint32_t w = *(const uint32_t*)(B + row * b_pitch + ((int64_t)u << 2));
+    const uint32_t b0 = w & 0xffu, b1 = (w >> 8) & 0xffu, b2 = (w >> 16) & 0xffu,
+                   b3 = w >> 24;
+    uint4 o;
+    o.x = (b0 & 3u) | ((b0 >> 2 & 3u) << 8) | ((b0 >> 4 & 3u) << 16) | ((b0 >> 6) << 24);
+    o.y = (b1 & 3u) | ((b1 >> 2 & 3u) << 8) | ((b1 >> 4 & 3u) << 16) | ((b1 >> 6) << 24);
+    o.z = (b2 & 3u) | ((b2 >> 2 & 3u) << 8) | ((b2 >> 4 & 3u) << 16) | ((b2 >> 6) << 24);
+    o.w = (b3 & 3u) | ((b3 >> 2 & 3u) << 8) | ((b3 >> 4 & 3u) << 16) | ((b3 >> 6) << 24);
+    *(uint4*)(B8 + (row << 2) * b_pitch + ((int64_t)u << 4)) = o;
+}
+
+/* crow walks B8 at FOUR times the u2 pitch (the repack preserves row padding); the lane
+ * geometry is the u2 walk's own -- lanes 8j..8j+7 cover group g0+j, sixteen ascending
+ * codes a lane -- so the octet fold, the ascending flush and the tail's whole-wave fold
+ * transfer structurally. xs holds i8 codes at the RAW window position: with byte staging
+ * the lane's sixteen codes are sixteen CONSECUTIVE slots, and quant_act_i8's step order
+ * still rides the staging index exactly as before. */
+template <int MT, int W>
+__global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_q8_kernel(
+    const int8_t* __restrict__ A,
+    const uint8_t* __restrict__ B8,     /* repacked codes, pitch = 4 * b_pitch bytes */
+    uint16_t* __restrict__ Y,
+    const float* __restrict__ AS,
+    const __half* __restrict__ SC,
+    const uint8_t* __restrict__ ZP,
+    const float* __restrict__ SUM,
+    int M, int N, int K, int mpad, int u4zp,
+    int64_t a_pitch, int64_t b8_pitch, int64_t y_pitch, int64_t as_pitch,
+    int64_t sc_pitch, int64_t zp_pitch)
+{
+    __shared__ __align__(16) int8_t xs[MT * 512];
+
+    const int w    = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int r    = blockIdx.x * (kThreads / kWave) + w;
+    const int rr   = r < N ? r : N - 1;
+    const int live = M < MT ? M : MT;
+
+    const uint8_t* crow = B8 + (int64_t)rr * b8_pitch;
+    const int jj = lane >> 3, oo = lane & 7;
+
+    for (int i = threadIdx.x; i < MT * 512; i += kThreads) xs[i] = 0;
+    float acc[MT];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) acc[m] = 0.0f;
+    __syncthreads();
+
+    const int ngrp  = K >> 7;
+    const int nd    = ngrp >> 2;
+    const int ntail = ngrp & 3;
+
+    for (int wbase = 0; wbase < nd; wbase += W) {
+        const int rem = (nd - wbase < W) ? (nd - wbase) : W;
+        uint4 bwin[W];
+        if constexpr (W > 1) {
+#pragma unroll
+            for (int d = 0; d < W; ++d)
+                bwin[d] = (d < rem)
+                    ? *(const uint4*)(crow + (((int64_t)(wbase + d)) << 9) + (lane << 4))
+                    : make_uint4(0u, 0u, 0u, 0u);
+        }
+        for (int d = 0; d < rem; ++d) {
+            const int g0    = (wbase + d) << 2;
+            const int kbase = g0 << 7;
+            for (int i = threadIdx.x; i < live * 512; i += kThreads) {
+                const int m  = i >> 9, kk = i & 511;
+                xs[(m << 9) + kk] = A[(int64_t)m * a_pitch + kbase + w2_step_pos(kk)];
+            }
+            __syncthreads();
+
+            const uint4 b4 = (W > 1) ? bwin[d]
+                : *(const uint4*)(crow + (((int64_t)wbase + d) << 9) + (lane << 4));
+            int32_t isub[MT];
+#pragma unroll
+            for (int m = 0; m < MT; ++m) {
+                const uint4 av = *(const uint4*)&xs[(m << 9) + (jj << 7) + (oo << 4)];
+                int32_t is = __builtin_amdgcn_sudot4((int)av.x, (int)b4.x, 0);
+                is = __builtin_amdgcn_sudot4((int)av.y, (int)b4.y, is);
+                is = __builtin_amdgcn_sudot4((int)av.z, (int)b4.z, is);
+                is = __builtin_amdgcn_sudot4((int)av.w, (int)b4.w, is);
+                isub[m] = is;                             /* integer, exact */
+            }
+#pragma unroll
+            for (int m = 0; m < MT; ++m) {                /* octet fold: exact */
+                isub[m] += __shfl_xor(isub[m], 1);
+                isub[m] += __shfl_xor(isub[m], 2);
+                isub[m] += __shfl_xor(isub[m], 4);
+            }
+#pragma unroll
+            for (int g2 = 0; g2 < 4; ++g2) {              /* flush ascending */
+                const int grp = g0 + g2;
+                const float sb = __half2float(SC[(int64_t)rr * sc_pitch + grp]);
+                const float z = u4zp
+                    ? (float)((ZP[(int64_t)rr * zp_pitch + (grp >> 1)] >> (4 * (grp & 1))) & 0xFu)
+                    : (float)ZP[(int64_t)rr * zp_pitch + grp];
+#pragma unroll
+                for (int m = 0; m < MT; ++m) {
+                    if (m >= live) break;
+                    const float is = (float)__shfl(isub[m], g2 << 3);
+                    const float term = z * SUM[(int64_t)grp * mpad + m];
+                    acc[m] += ((is - term) * AS[(int64_t)m * as_pitch]) * sb;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int t = 0; t < ntail; ++t) {
+        const int grp   = (nd << 2) + t;
+        const int kbase = grp << 7;
+        for (int i = threadIdx.x; i < live * 128; i += kThreads) {
+            const int m = i >> 7, kk = i & 127;
+            xs[(m << 9) + kk] = A[(int64_t)m * a_pitch + kbase + w2_step_pos(kk)];
+        }
+        __syncthreads();
+        const uint32_t bb = *(const uint32_t*)(crow + kbase + (lane << 2));
+        int32_t isub[MT];
+#pragma unroll
+        for (int m = 0; m < MT; ++m)
+            isub[m] = __builtin_amdgcn_sudot4(
+                (int)*(const uint32_t*)&xs[(m << 9) + (lane << 2)], (int)bb, 0);
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {                    /* full-wave fold */
+            isub[m] += __shfl_xor(isub[m], 16);
+            isub[m] += __shfl_xor(isub[m], 8);
+            isub[m] += __shfl_xor(isub[m], 4);
+            isub[m] += __shfl_xor(isub[m], 2);
+            isub[m] += __shfl_xor(isub[m], 1);
+        }
+        const float sb = __half2float(SC[(int64_t)rr * sc_pitch + grp]);
+        const float z = u4zp
+            ? (float)((ZP[(int64_t)rr * zp_pitch + (grp >> 1)] >> (4 * (grp & 1))) & 0xFu)
+            : (float)ZP[(int64_t)rr * zp_pitch + grp];
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+            if (m >= live) break;
+            const float is = (float)isub[m];
+            const float term = z * SUM[(int64_t)grp * mpad + m];
+            acc[m] += ((is - term) * AS[(int64_t)m * as_pitch]) * sb;
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0 && r < N) {
+#pragma unroll
+        for (int m = 0; m < MT; ++m)
+            if (m < live) Y[(int64_t)m * y_pitch + r] = w2_f32_to_bf16(acc[m]);
+    }
+}
+
 }  /* anonymous namespace */
 
 #else  /* non-RDNA3: host-visible no-op */
@@ -331,6 +511,12 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_kernel(
 namespace {
 template <int MT, int W>
 __global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_kernel(
+    const int8_t*, const uint8_t*, uint16_t*, const float*, const __half*, const uint8_t*,
+    const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) {}
+/* the q8 arm mirrors too (same rule): the repack kernel and the q8 GEMV. */
+__global__ void gemm_nt_w2a8_repack_kernel(const uint8_t*, uint8_t*, int64_t, int64_t) {}
+template <int MT, int W>
+__global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_q8_kernel(
     const int8_t*, const uint8_t*, uint16_t*, const float*, const __half*, const uint8_t*,
     const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) {}
 }  /* anonymous namespace */
@@ -451,6 +637,7 @@ int w2_plan(const RadArgs* a, const RadTensor* A, const RadTensor* AS, const Rad
 void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
     static const bool no_pf = getenv("R3D_NO_GEMV_PF") != nullptr;
     static const int  pf_w  = getenv("R3D_GEMV_PF_W") ? atoi(getenv("R3D_GEMV_PF_W")) : 8;
+    static const bool no_q8 = getenv("R3D_NO_W2A8_Q8X") != nullptr;
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
     /* MT rounds UP to cover M: the tile computes min(M, MT) rows and there is no
      * m-loop, so MT < M silently drops rows (serve 2026-10-24: the drafter's block
@@ -458,6 +645,47 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
      * lost 3). The band's M<=16 bound makes the 16 tile the ceiling. */
     const int mt = P.M >= 9 ? 16 : P.M >= 5 ? 8 : P.M >= 3 ? 4 : P.M >= 2 ? 2 : 1;
     const dim3 grid((unsigned)((P.N + 7) / 8));
+
+    /* ---- the q8 repack cache (the a16 rule from r3d_gemm_mxfp4.hip: the plugin's OWN
+     * buffer, one lazy allocation per draft head, never freed; ANY failure -- alloc,
+     * launch, shape ceiling -- falls back to the u2 walk, never a mid-band refusal).
+     * Keyed by (codes base, N, K, pitch); four entries cover any pack staging more than
+     * one head in a process. The lifetime premise is the band's own: like the joined
+     * scale,zero blob and every layout transform before it, checkpoint weight bytes are
+     * arena-pinned for the process -- repro regenerates its operands only across runs,
+     * never under a live pointer, and the 702-case op gate draws every head fresh per
+     * process. A base whose bytes changed under a reused pointer would be caught LOUDLY
+     * (bit-exactness dies), not silently. ---- */
+    struct Q8Ent { const void* src; uint8_t* dst; int64_t N, K, bp4; };
+    static Q8Ent cache[4];
+    static int   ncache = 0;
+    static bool  q8_dead = no_q8;
+    uint8_t* B8 = nullptr;
+    if (!q8_dead) {
+        for (int i = 0; i < ncache; ++i)
+            if (cache[i].src == P.B && cache[i].N == P.N && cache[i].K == P.K &&
+                cache[i].bp4 == 4 * P.b_pitch) { B8 = cache[i].dst; break; }
+        const int64_t bytes = P.N * 4 * P.b_pitch;          /* u8 codes, pitch kept */
+        if (!B8 && ncache < 4 && bytes <= (int64_t)15 << 28) {   /* 1.5 GiB ceiling */
+            uint8_t* nb = nullptr;
+            if (hipMalloc(&nb, (size_t)bytes) == hipSuccess) {
+                const int64_t nu = P.b_pitch >> 2;          /* sixteen-code units a row */
+                dim3 rg((unsigned)P.N, (unsigned)((nu + kThreads - 1) / kThreads));
+                hipLaunchKernelGGL(gemm_nt_w2a8_repack_kernel, rg, dim3(kThreads), 0,
+                                   stream, P.B, nb, P.b_pitch, P.b_pitch);
+                const hipError_t re = hipGetLastError();
+                if (re == hipSuccess) hipStreamSynchronize(stream);   /* once, at fill */
+                if (hipGetLastError() != hipSuccess || hipPeekAtLastError() != hipSuccess) {
+                    hipFree(nb);
+                    q8_dead = true;
+                    fprintf(stderr, "libr3d: w2a8 repack FAILED, u2 walk takes the band\n");
+                } else {
+                    cache[ncache++] = Q8Ent{P.B, nb, P.N, P.K, 4 * P.b_pitch};
+                    B8 = nb;
+                }
+            } else q8_dead = true;
+        }
+    }
 
 #define R3D_W2_GEMV(MT_, W_)                                                        \
     hipLaunchKernelGGL((gemm_nt_w2a8_gemv_kernel<MT_, W_>), grid, dim3(kThreads),   \
@@ -473,9 +701,30 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
         case 8: R3D_W2_GEMV(8, W_); break;            \
         default: R3D_W2_GEMV(16, W_); break;          \
     }
-    if (no_pf)      { R3D_W2_GEMV_SW(1) }
+#define R3D_W2_Q8(MT_, W_)                                                       \
+    hipLaunchKernelGGL((gemm_nt_w2a8_gemv_q8_kernel<MT_, W_>), grid,             \
+                       dim3(kThreads), 0, stream, P.A, B8, (uint16_t*)ydata,     \
+                       P.AS, P.SC, P.ZP, P.SUM, (int)P.M, (int)P.N, (int)P.K,    \
+                       P.mpad, P.u4zp, P.a_pitch, 4 * P.b_pitch, y_pitch,        \
+                       P.as_pitch, P.sc_pitch, P.zp_pitch)
+#define R3D_W2_Q8_SW(W_)                            \
+    switch (mt) {                                   \
+        case 1: R3D_W2_Q8(1, W_); break;            \
+        case 2: R3D_W2_Q8(2, W_); break;            \
+        case 4: R3D_W2_Q8(4, W_); break;            \
+        case 8: R3D_W2_Q8(8, W_); break;            \
+        default: R3D_W2_Q8(16, W_); break;          \
+    }
+    if (B8) {
+        if (no_pf)          { R3D_W2_Q8_SW(1) }
+        else if (pf_w == 16){ R3D_W2_Q8_SW(16) }
+        else                { R3D_W2_Q8_SW(8) }
+    }
+    else if (no_pf)      { R3D_W2_GEMV_SW(1) }
     else if (pf_w == 16) { R3D_W2_GEMV_SW(16) }
-    else            { R3D_W2_GEMV_SW(8) }
+    else                 { R3D_W2_GEMV_SW(8) }
+#undef R3D_W2_Q8_SW
+#undef R3D_W2_Q8
 #undef R3D_W2_GEMV_SW
 #undef R3D_W2_GEMV
 
@@ -484,8 +733,8 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
                                   hipGetErrorName(le));
     else if (getenv("R3D_DEBUG_GEMM")) {
         static bool once = false;
-        if (!once) { once = true; fprintf(stderr, "libr3d: w2a8 decode gemv launched (mt=%d)\n",
-                                          mt); }
+        if (!once) { once = true; fprintf(stderr, "libr3d: w2a8 decode gemv launched (mt=%d, %s)\n",
+                                          mt, B8 ? "q8" : "u2"); }
     }
 }
 

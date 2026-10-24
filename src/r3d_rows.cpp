@@ -1433,13 +1433,16 @@ static const RadKernelInfo kRows[] = {
   nullptr, nullptr, r3d_rad_gemm_nt_q_mxfp4_decode },
 
 { "gemm_nt_q_w2a8_decode", "gemm_nt_q", "gemm",
-  "w2a8 decode-band GEMV (the DFlash2 draft head): warp per weight row, one aligned "
-  "dword per lane per four scale groups -- sixteen unsigned 2-bit codes per lane -- "
-  "the int8 activation staged per 512-of-K window through LDS with quant_act_i8's "
-  "step order de-permuted in the staging index; each group's partial folds through "
-  "an octet butterfly and flushes as (sub * a_scale) * b_scale in the oracle's "
-  "order, sub = is - zero * a_sum first -- every value before the scales is an exact "
-  "f32 integer, so the fold is bit-exact to ref_gemm's gemm_zp, not merely close",
+  "w2a8 decode-band GEMV (the DFlash2 draft head): warp per weight row. The q8 arm "
+  "walks the codes repacked to one byte a code (the plugin's own cached plane, built "
+  "once per head) and folds sixteen codes per lane with four v_dot4_i32_iu8 dots; "
+  "R3D_NO_W2A8_Q8X=1 falls back to the u2 walk -- one aligned dword per lane per "
+  "four scale groups, sixteen 2-bit codes per lane, fmaf chains. Either arm stages "
+  "the int8 activation per 512-of-K window through LDS with quant_act_i8's step "
+  "order de-permuted in the staging index; each group's partial folds through an "
+  "octet butterfly and flushes as (sub * a_scale) * b_scale in the oracle's order, "
+  "sub = is - zero * a_sum first -- every value before the scales is an exact "
+  "integer, so both arms are bit-exact to ref_gemm's gemm_zp, not merely close",
   "M <= 16 (the drafter's whole gemm_nt_q band -- its block pass collapses M at 14, "
   "verify rows included; a bucket above this would strand the op host-side, which its "
   "joined scale plane cannot survive; K a multiple of 128; N a multiple of 16 (libr4d's "
