@@ -56,7 +56,9 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
     int64_t row_pitch, int64_t pos_stride, int64_t ds,
     uint32_t head_dim, uint32_t half, uint32_t rot, uint32_t heads, int mode,
     float theta, float div) {
-    extern __shared__ float inv[];
+    extern __shared__ float lds[];                  /* 3*half floats: ladder, then sincos */
+    float* const inv = lds;                         /* inv[i] for i < half            */
+    float* const sc  = lds + half;                  /* s at sc[2i], c at sc[2i+1]     */
     const int64_t m = blockIdx.x;
 
     /* The ladder, ref_rope_freqs' expression at the oracle's widths. The row refuses any
@@ -69,6 +71,13 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
      * tensor's element stride -- a view into a packed buffer is expressible and recorded. */
     const float p = (float)(double)pos[m * pos_stride] / div;
 
+    /* One sincosf per pair, not per (head, pair): the angle is a function of the pair
+     * alone, so heads-1 recomputations of the identical deterministic value were waste.
+     * Same float ops, same inputs -> bit-identical outputs. */
+    for (uint32_t i = threadIdx.x; i < half; i += kThreads)
+        sincosf(p * inv[i], &sc[2 * i], &sc[2 * i + 1]);
+    __syncthreads();
+
     const uint16_t* const row = qkv + m * row_pitch;
     const uint32_t work = heads * half;
     for (uint32_t w = threadIdx.x; w < work; w += kThreads) {
@@ -79,9 +88,7 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
          * makes every head write the first head's elements -- overlapping read-modify-writes
          * that compound rotations. */
         uint16_t* __restrict__ xr = (uint16_t*)row + (int64_t)h * head_dim;
-        const float ang = p * inv[i];
-        float c, s;
-        sincosf(ang, &s, &c);                    /* magnitude is 1 outside yarn, which is refused */
+        const float s = sc[2 * i], c = sc[2 * i + 1];  /* magnitude is 1 outside yarn, refused */
         const float x0 = r3d_bf16_to_f32(xr[i0 * ds]);
         const float x1 = r3d_bf16_to_f32(xr[i1 * ds]);
         xr[i0 * ds] = r3d_f32_to_bf16(x0 * c - x1 * s);
@@ -101,24 +108,31 @@ __global__ __launch_bounds__(kThreads) void rope_imrope_kernel(
     int64_t row_pitch, int64_t pcs, int64_t pms, int64_t ds,
     uint32_t head_dim, uint32_t half, uint32_t rot, uint32_t heads,
     uint32_t s1, uint32_t s2, float theta, float div) {
-    extern __shared__ float inv[];
+    extern __shared__ float lds[];
+    float* const inv = lds;
+    float* const sc  = lds + half;
     const int64_t m = blockIdx.x;
 
     for (uint32_t i = threadIdx.x; i < half; i += kThreads)
         inv[i] = 1.0f / (float)pow((double)theta, (double)((float)(2u * i) / (float)rot));
     __syncthreads();
 
+    /* Per-pair sincos, same reuse as rope_kernel: the component rule -- and hence the
+     * position it reads -- is a function of the pair index i alone. */
+    for (uint32_t i = threadIdx.x; i < half; i += kThreads) {
+        const uint32_t c = (i % 3u == 1u && i < 3u * s1) ? 1u
+                       : (i % 3u == 2u && i < 3u * s2) ? 2u : 0u;
+        const float p = (float)(double)pos[(int64_t)c * pcs + m * pms] / div;
+        sincosf(p * inv[i], &sc[2 * i], &sc[2 * i + 1]);
+    }
+    __syncthreads();
+
     const uint16_t* const row = qkv + m * row_pitch;
     const uint32_t work = heads * half;
     for (uint32_t w = threadIdx.x; w < work; w += kThreads) {
         const uint32_t h = w / half, i = w - h * half;
-        const uint32_t c = (i % 3u == 1u && i < 3u * s1) ? 1u
-                       : (i % 3u == 2u && i < 3u * s2) ? 2u : 0u;
-        const float p = (float)(double)pos[(int64_t)c * pcs + m * pms] / div;
+        const float sn = sc[2 * i], cn = sc[2 * i + 1];
         uint16_t* __restrict__ xr = (uint16_t*)row + (int64_t)h * head_dim;
-        const float ang = p * inv[i];
-        float cn, sn;
-        sincosf(ang, &sn, &cn);
         const float x0 = r3d_bf16_to_f32(xr[i * ds]);
         const float x1 = r3d_bf16_to_f32(xr[(i + half) * ds]);
         xr[i * ds] = r3d_f32_to_bf16(x0 * cn - x1 * sn);
@@ -231,7 +245,7 @@ static int r3d_rope_impl(const RadArgs* a, RadStream s) {
 
     const uint32_t half = (uint32_t)(rot / 2);
     const uint32_t heads = (uint32_t)(n_head + n_head_kv);
-    const size_t shmem = (size_t)half * sizeof(float);
+    const size_t shmem = (size_t)half * 3u * sizeof(float);   /* ladder + per-pair sincos */
 
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
     if (multi) {   /* imrope: the guards above proved mode 3, rank 2, n_sec >= 3 */
