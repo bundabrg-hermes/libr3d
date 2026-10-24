@@ -1937,13 +1937,19 @@ static int gdn_recurrent_update_impl(const RadArgs* a, RadStream s) {
      * at issue and aborted the step). Floor is one slot; reads stay idx-driven as ref's. */
     if (rad_tensor_numel(st) < (anchor ? 1 : T) * Hv * Vd * Kd) return RAD_E_SHAPE;
 
-    /* Anchor form: ref's shape rules. Six state_idx columns; the factor block must be dense
-     * [V,K] inside the slot (AnchorLayout indexes it flat); and a step longer than the block's
-     * tmax is refused at resolve -- q_len is the engine's per-sequence bound, and the accepted
-     * prefix can never exceed the candidates issued, so the launcher can see what ref checks
-     * from cu. */
+    /* Anchor form: ref's shape rules. Six state_idx columns; the factor block must be
+     * dense [V,K] inside the slot (AnchorLayout indexes it flat); and a step replaying
+     * more candidates than the block's tmax is refused. The engine's q_len PARAMETER
+     * is not that candidate count: the 2026-10-24 serve proved radiance ships it with
+     * two different schemas per op -- rows-per-step on gdn_conv_recurrent_update (8),
+     * per-sequence capacity on gdn_recurrent_update (2048) -- and comparing the latter
+     * to tmax refused every fallback launch (issue #10). Bound what the launcher can
+     * see instead: candidates ride this step's rows, so no sequence can hold more
+     * than T/N rows on average, and the anchor form's only producers (decode/verify
+     * passes, uniform 1+drafts rows a sequence) saturate that bound. Degenerate long
+     * steps -- one sequence, more rows than the block -- are still refused. */
     int64_t al_groups = 0, al_fstr = 0, al_vb = 0, al_gb = 0, al_mark = 0, al_tmax = 0;
-    long long ql_ll = 0;
+    long long ql_ll = 0; rad_args_geti(a, "q_len", &ql_ll);   /* trace witness only */
     if (anchor) {
         if (sw < 6) return RAD_E_SHAPE;
         if (st->rank >= 4 && st->stride[st->rank - 2] != Kd) return RAD_E_STRIDE;
@@ -1954,7 +1960,7 @@ static int gdn_recurrent_update_impl(const RadArgs* a, RadStream s) {
         al_tmax   = (Vd * Kd - 1) / al_fstr; if (al_tmax > 16) al_tmax = 16;
         if (al_tmax < 1) return RAD_E_SHAPE;
         al_mark   = al_tmax * al_fstr;
-        if (rad_args_geti(a, "q_len", &ql_ll) && ql_ll > al_tmax) return RAD_E_UNSUPPORTED;
+        if (T > al_tmax * N) return RAD_E_UNSUPPORTED;
     }
 
     /* 1-D weight vectors: ref's laststride reads; unit last stride (dense vectors). */
@@ -2307,13 +2313,14 @@ static int gdn_conv_recurrent_update_impl(const RadArgs* a, RadStream s) {
      * at issue and aborted the step). Floor is one slot; reads stay idx-driven as ref's. */
     if (rad_tensor_numel(st) < (anchor ? 1 : T) * Hv * Vd * Kd) return RAD_E_SHAPE;
 
-    /* Anchor form: ref's shape rules. Six state_idx columns; the factor block must be dense
-     * [V,K] inside the slot (AnchorLayout indexes it flat); and a step longer than the block's
-     * tmax is refused at resolve -- q_len is the engine's per-sequence bound, and the accepted
-     * prefix can never exceed the candidates issued, so the launcher can see what ref checks
-     * from cu. */
+    /* Anchor form: ref's shape rules. Six state_idx columns; the factor block must be
+     * dense [V,K] inside the slot (AnchorLayout indexes it flat); and a step replaying
+     * more candidates than the block's tmax is refused -- bound by the launcher's own
+     * geometry (candidates ride this step's rows; no sequence holds more than the
+     * average), never by the q_len parameter, whose schema is per-op in radiance and
+     * per-sequence capacity on some ops (issue #10). */
     int64_t al_groups = 0, al_fstr = 0, al_vb = 0, al_gb = 0, al_mark = 0, al_tmax = 0;
-    long long ql_ll = 0;
+    long long ql_ll = 0; rad_args_geti(a, "q_len", &ql_ll);   /* trace witness only */
     if (anchor) {
         if (sw < 6) return RAD_E_SHAPE;
         if (st->rank >= 4 && st->stride[st->rank - 2] != Kd) return RAD_E_STRIDE;
@@ -2324,7 +2331,7 @@ static int gdn_conv_recurrent_update_impl(const RadArgs* a, RadStream s) {
         al_tmax   = (Vd * Kd - 1) / al_fstr; if (al_tmax > 16) al_tmax = 16;
         if (al_tmax < 1) return RAD_E_SHAPE;
         al_mark   = al_tmax * al_fstr;
-        if (rad_args_geti(a, "q_len", &ql_ll) && ql_ll > al_tmax) return RAD_E_UNSUPPORTED;
+        if (T > al_tmax * N) return RAD_E_UNSUPPORTED;
     }
 
     auto v3_ok = [&](const RadTensor* t, int64_t heads, int64_t dim,

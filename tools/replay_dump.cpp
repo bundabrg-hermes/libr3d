@@ -127,9 +127,11 @@ int main(int argc, char** argv) {
                         d.ts.size(), d.n_p, d.ps.size());
             size_t o = 0;
             for (size_t t = 0; t < d.ts.size(); ++t) {
+                /* a null operand is dumped rank-0: sh[] is empty, sh[0] was the segfault */
                 std::printf("   ts[%zu] dt=%u rank=%u sh0=%lld bytes=%zu (off=%zu)\n", t, d.ts[t].dt,
-                            d.ts[t].rank, (long long)d.ts[t].sh[0], d.ts[t].bytes, o);
+                            d.ts[t].rank, d.ts[t].sh.empty() ? 0LL : (long long)d.ts[t].sh[0], d.ts[t].bytes, o);
                 o += d.ts[t].bytes;
+                std::fflush(stdout);
             }
         }
         /* op := row name minus the dtype suffix the libr3d table carries */
@@ -148,13 +150,15 @@ int main(int argc, char** argv) {
         for (auto& x : d.ts) if (x.trunc) truncated = true;
         std::printf("\n=== %s (row %s, rc=%d)%s\n", argv[i], d.row.c_str(), d.rc,
                     rk ? "" : "  [libref has no host row]");
+        std::fflush(stdout);   /* a later crash must not swallow this line */
         fails = 0; int unver = 0;   /* per-directory verdict scope: a global fails
                                      counter silently suppressed every ALL EQUAL
                                      after the first mismatch (observed 2026-10-21) */
-        if (!rk || truncated || d.post.empty()) {
+        if (!rk || truncated) {
             /* sanity: argmax of every large f32/bf16 output captured */
+            if (d.post.empty()) std::printf("  (no post state captured)\n");
             size_t off = 0;
-            for (size_t t = 0; t < d.ts.size(); ++t) {
+            for (size_t t = 0; d.post.size() && t < d.ts.size(); ++t) {
                 const Dump::T& x = d.ts[t];
                 const size_t this_off = off;
                 off += x.bytes;
@@ -257,6 +261,16 @@ int main(int argc, char** argv) {
             off += x.bytes;
             if (x.nullp || !x.bytes) continue;
             if (dense[t].size() < x.bytes) { std::printf("  operand %zu: dense shorter than dump\n", t); ++fails; continue; }
+            if (d.post.empty()) {
+                /* refused capture (rc<0, no post state): the replay's own file pair is
+                 * the witness -- run both arms and cmp ref.bin dev.bin. Report the
+                 * replay's effect on each operand relative to pre so a no-write shows. */
+                if (std::memcmp(dense[t].data(), d.pre.data() + this_off, x.bytes) != 0)
+                    std::printf("  operand %zu: replay wrote (%zu B differ from pre)\n", t, x.bytes);
+                else
+                    std::printf("  operand %zu: replay left untouched\n", t);
+                continue;
+            }
             if (std::memcmp(dense[t].data(), d.post.data() + this_off, x.bytes) == 0) continue;
             /* Vacuous-diff guard: a libref host row that silently declines the live
              * geometry leaves its outputs byte-equal to pre. Diffing the card's real
