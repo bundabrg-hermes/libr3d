@@ -44,7 +44,9 @@
  * default) pipelines the next slice's global loads into registers while WMMA runs, A
  * double-buffered, B single (block 06's measured rule); R3D_GEMM_NO_DBUF=1 takes the
  * serialized arm; R3D_NO_MXFP4=1 refuses the row entirely so the engine answers from the
- * host reference -- the serve A/B kill switch, no remount needed.
+ * host reference -- the serve A/B kill switch, no remount needed. R3D_NO_FP4_DEC=1 withdraws
+ * only the decode row (the band falls to the m64 tile); R3D_MXFP4_Q8X=1 opts the decode row
+ * into the dot4 q8x arm (the repacked byte-plane walk, see the arm's block comment).
  */
 
 #include <hip/hip_runtime.h>
@@ -54,9 +56,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>   /* the q8x plane cache (host-side only) */
 
 #include "rad_abi.h"
 #include "rad_plugin.h"   /* rad_arg_in / rad_tensor_numel (host-side entry helpers) */
+#include "r3d_mxfp4_q8x.h"
 
 namespace {
 
@@ -820,6 +824,146 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv1_f16_kernel(
     if (lane == 0 && r < N) Y[r] = f32_to_bf16_m4(a0);
 }
 
+/* ---- the dot4 q8x arm (hipfire Phase B, 2026-10-24) ---------------------------------
+ *
+ * The probe (tools/bench_dot4_seed.hip, REPORT in the probe scratch) settled the
+ * plateau question the #6/#7/#8 legs could not: the binding term at model shapes is
+ * the number of DISTINCT DRAM streams per warp, not instruction count or latency.
+ * One byte-aligned stream that carries the weights AND their e8m0 scales (136B
+ * groups per 128 codes: 4 scale bytes, 4 pad, 128 i8 codes = e2m1 x 2), a pure
+ * signed v_dot4_i32_iu8 chain, and an i8 activation plane produced by a per-dispatch
+ * requant prologue: 2.4-2.6x at M=1 and 3.5-5.7x in the spec-3 verify band, paired
+ * same-session against the shipped walk at 12288x4096 / 24576x4096 / 4096x12288 /
+ * 4096x4096. The PREF ring was falsified in the same probe (self-pipelined loop,
+ * issue #8 verbatim), so this ships PREF=1.
+ *
+ * Unlike the #5/#6 arms this one is NOT close to bit-exact: the activation requant
+ * (e4m3 -> per-32-group max-scaled i8, rintf RN) re-quantizes A, so the arm grades
+ * at rel_l2 ~1e-3 against libref, far inside the 3e-2 per-op tolerance but outside
+ * anything bit-exactness doctrine would notice. Everything the oracle order DOES
+ * own still rides verbatim: quad-owns-the-32-group, the int fold inside the quad
+ * (offsets 1,2 -- exact, integers), the per-group f32 flush, the warp fold 4/8/16,
+ * the e8m0 0xFF-NaN / 0x00-subnormal rules via r3d_e8m0_sc (the probe's bare bit
+ * trick is corrected here: fixtures may carry either byte), and the bf16 RNE store.
+ * The flush chain is (p * sg) * AS * sc * 0.5 -- requant scale first, oracle's
+ * two-multiply pair after; the requant epsilon dwarfs any order rounding.
+ *
+ * Geometry mirrors the probe verbatim: ONE wave32 per weight row (block 32, grid N),
+ * lane owns 8 codes (2 dot4), quad owns the 32-group. The row's K % 256 == 0 plan
+ * gate is the probe's own (two 136B groups per 256-span, no tail arms); K % 256 ==
+ * 128 geometries ride the shipped legs. No eref, no LDS: registers only.
+ */
+
+/* Repack: nibble plane (b_pitch = K/2) + e8m0 BS plane -> one interleaved plane of
+ * row pitch 136 * (K/128). Launched ONCE per weight tensor on the PLUGIN's own
+ * stream (the w2a8 q8 rule: never inside the engine's recorded drafter pass).
+ * Codes 7/15 are numbers (+-6 -> +-12 in the doubling); nothing asserts absence. */
+__global__ __launch_bounds__(256) void m4_repack_q8x_kernel(
+    const uint8_t* __restrict__ B, const uint8_t* __restrict__ BS, uint8_t* __restrict__ S,
+    int64_t b_pitch, int64_t bs_pitch, int N, int K)
+{
+    constexpr int8_t lut[16] = R3D_E2M1_X2;
+    const int K128 = K >> 7;                       /* entry gate: K % 256 == 0 */
+    const int64_t rpitch = (int64_t)K128 * 136;
+    const int64_t ncodes = (int64_t)N * (K >> 1);  /* one thread per nibble BYTE */
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < ncodes + (int64_t)N * K128; i += (int64_t)gridDim.x * blockDim.x) {
+        if (i < ncodes) {
+            const int64_t n = i / (K >> 1);
+            const int b = (int)(i - n * (K >> 1));
+            const uint8_t byte = B[n * b_pitch + b];
+            const uint16_t pair = (uint16_t)(uint8_t)lut[byte & 15u]
+                                | ((uint16_t)(uint8_t)lut[byte >> 4] << 8);
+            *(uint16_t*)(S + n * rpitch + (b >> 6) * 136 + 8 + (b & 63) * 2) = pair;
+        } else {                                   /* group header: 4 scales, 4 pad */
+            const int64_t j = i - ncodes;
+            const int64_t n = j / K128;
+            const int g = (int)(j - n * K128);
+            uint8_t* h = S + n * rpitch + g * 136;
+            const uint8_t* sb = BS + n * bs_pitch + g * 4;
+            h[0] = sb[0]; h[1] = sb[1]; h[2] = sb[2]; h[3] = sb[3];
+            h[4] = 0; h[5] = 0; h[6] = 0; h[7] = 0;
+        }
+    }
+}
+
+/* Per-dispatch activation requant: e4m3 codes -> i8 + per-32-group f32 scale, the
+ * probe's prologue verbatim (warp-per-group so K spreads over many CUs; a
+ * thread-per-group draft sat on an 11-42 us latency floor). AS is NOT folded here:
+ * it rides the flush like the oracle. a_pitch is honoured (the dot2 prologue's
+ * own-buffer simplification does not apply -- A is the engine's plane). Launched on
+ * the ENGINE stream every dispatch, like the #6 A16 prologue: the issue pattern is
+ * identical on every replay, which is exactly what the drafter recorder asserts. */
+__global__ __launch_bounds__(256) void m4_act_i8_kernel(
+    const uint8_t* __restrict__ A, int8_t* __restrict__ X8, float* __restrict__ SG,
+    int M, int K, int64_t a_pitch)
+{
+    const int cols = K >> 5;
+    const int gwarp = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (gwarp >= M * cols) return;
+    const int m = gwarp / cols, g = gwarp - m * cols;
+    const int lane = threadIdx.x & 31;
+    const float e = fp8e4m3_gemv(A[(int64_t)m * a_pitch + (g << 5) + lane]);
+    float mx = fabsf(e);
+#pragma unroll
+    for (int off = 16; off; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off));  /* max is order-free */
+    const float s = mx ? mx / 127.0f : 1.0f;
+    if (lane == 0) SG[(int64_t)m * cols + g] = s;
+    X8[(int64_t)m * K + (g << 5) + lane] = (int8_t)rintf(e / s);
+}
+
+/* The GEMV: single 136B-group stream walk, pure signed dot4. X8 is the plugin's own
+ * i8 plane (pitch K, rows >= M hold bounded stale bytes -- the m predicate keeps
+ * them out of every stored row), SG its f32 scales (pitch K/32), AS/BS the engine's
+ * planes at their derived pitches. */
+template <int MT>
+__global__ __launch_bounds__(32) void gemm_nt_mxfp4_gemv_q8x_kernel(
+    const uint8_t* __restrict__ S, const int8_t* __restrict__ X, const float* __restrict__ SG,
+    const float* __restrict__ AS, uint16_t* __restrict__ Y,
+    int M, int N, int K, int64_t y_pitch, int64_t as_pitch)
+{
+    const int r = blockIdx.x;
+    const int t = threadIdx.x;
+    const int q = t >> 2;
+    const int nstep = K >> 8;
+    const int live = M < MT ? M : MT;
+    const uint8_t* crow = S + (int64_t)r * ((int64_t)(K >> 7) * 136);
+
+    float acc[MT];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) acc[m] = 0.0f;
+
+    const int hi8 = (t >> 4) * 136;                /* second 136B group of the span */
+    const int lo8 = (t & 15) << 3;
+
+    for (int it = 0; it < nstep; ++it) {
+        const uint8_t* sp = crow + ((int64_t)it << 1) * 136;
+        const uint2 wc = *(const uint2*)(sp + hi8 + 8 + lo8);
+        const int g = (it << 3) + q;               /* the quad owns the 32-group */
+        const float sc = r3d_e8m0_sc(sp[((q >> 2) * 136) + (q & 3)]);
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+            if (m >= live) break;                  /* block-uniform: every lane skips */
+            const uint2 xv = *(const uint2*)(X + (int64_t)m * K + (it << 8) + (t << 3));
+            int32_t p = __builtin_amdgcn_sudot4(1, (int)xv.x, 1, (int)wc.x, 0, 0);
+            p = __builtin_amdgcn_sudot4(1, (int)xv.y, 1, (int)wc.y, p, 0);
+            p += __shfl_xor(p, 1);
+            p += __shfl_xor(p, 2);
+            float c = (float)p * SG[(int64_t)m * (K >> 5) + g]
+                            * AS[(int64_t)m * as_pitch + (g >> 2)] * sc * 0.5f;
+            c += __shfl_xor(c, 4);
+            c += __shfl_xor(c, 8);
+            c += __shfl_xor(c, 16);
+            acc[m] += c;
+        }
+    }
+    if (t == 0) {
+#pragma unroll
+        for (int m = 0; m < MT; ++m)
+            if (m < live) Y[(int64_t)m * y_pitch + r] = f32_to_bf16_m4(acc[m]);
+    }
+}
+
 } /* anonymous namespace */
 
 #else  /* non-RDNA3: host-visible no-op, the launcher never dispatches it */
@@ -837,6 +981,15 @@ __global__ void m4_act_f16_kernel(const uint8_t*, uint32_t*, int) {}
 __global__ void gemm_nt_mxfp4_gemv1_f16_kernel(
     const uint32_t*, const uint8_t*, uint16_t*, const float*, const uint8_t*,
     int, int, int64_t, int64_t, int64_t) {}
+/* the q8x arm mirrors too (the w2a8 stub-signature law: the runtime resolves
+ * hipLaunchKernelGGL by the mangled name the HOST pass sees). */
+__global__ void m4_repack_q8x_kernel(const uint8_t*, const uint8_t*, uint8_t*,
+                                     int64_t, int64_t, int, int) {}
+__global__ void m4_act_i8_kernel(const uint8_t*, int8_t*, float*, int, int, int64_t) {}
+template <int MT>
+__global__ __launch_bounds__(32) void gemm_nt_mxfp4_gemv_q8x_kernel(
+    const uint8_t*, const int8_t*, const float*, const float*, uint16_t*,
+    int, int, int, int64_t, int64_t) {}
 } /* anonymous namespace */
 
 #endif
@@ -1057,6 +1210,123 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s) {
                 if (!once) { once = true; fprintf(stderr, "libr3d: mxfp4 dot2 leg launched\n"); }
             }
             return le == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+        }
+    }
+
+    /* ---- the dot4 q8x arm (hipfire Phase B, 2026-10-24): opt-in R3D_MXFP4_Q8X=1.
+     *
+     * Plane cache: the w2a8 q8 rule verbatim -- the plugin's OWN repack plane per
+     * weight tensor, built lazily ONCE on the plugin's own non-blocking stream and
+     * host-joined before the engine stream gets its gemv. A once-per-process launch
+     * inside the engine's recorded drafter pass shortens every later replay by that
+     * issue and stops the step loop ('issued differently'), which killed the last
+     * two promotions' first serves; the side stream keeps the recorded stream's
+     * pattern identical across plays. The activation prologue by contrast rides the
+     * ENGINE stream every dispatch (the #6 A16 prologue's chaining): it issues
+     * identically on every replay, which is exactly what the recorder asserts.
+     * ANY failure -- VRAM guard, alloc, stream, launch -- records the tensor as
+     * failed and falls back IN-PLACE to the shipped walk; never a refusal (the
+     * engine selected this row at declare; a refusal is an abort). Failed keys are
+     * remembered so a VRAM-tight serve does not re-hipMemGetInfo per launch.
+     * Gate: K % 256 == 0 (the probe's own span closure) and a scratch ceiling;
+     * every other geometry the band accepts rides the shipped legs untouched. */
+    static const bool q8x_on = getenv("R3D_MXFP4_Q8X") != nullptr;
+    if (q8x_on && (P.K & 255) == 0 && P.K <= (1 << 20)) {
+        struct Q8xEnt { const void* b; const void* bs; int64_t n, k; uint8_t* plane; };
+        static std::vector<Q8xEnt> q8x_cache, q8x_failed;
+        static hipStream_t q8x_side = nullptr;
+        static int8_t* q8x_x8 = nullptr;
+        static float*  q8x_sg  = nullptr;
+        static int64_t q8x_cap_k = 0;
+        static bool    q8x_scratch_dead = false;
+
+        uint8_t* plane = nullptr;
+        bool known_dead = false;
+        for (const Q8xEnt& e : q8x_failed)
+            if (e.b == P.B && e.bs == P.BS && e.n == P.N && e.k == P.K) { known_dead = true; break; }
+        if (!known_dead) {
+            for (const Q8xEnt& e : q8x_cache)
+                if (e.b == P.B && e.bs == P.BS && e.n == P.N && e.k == P.K) { plane = e.plane; break; }
+            if (!plane) {
+                const int64_t bytes = P.N * ((P.K >> 7) * 136);   /* ~2.06x the nibble plane */
+                size_t vfree = 0, vtot = 0;
+                bool build = hipMemGetInfo(&vfree, &vtot) == hipSuccess &&
+                             bytes + (int64_t(512) << 20) <= (int64_t)vfree;  /* headroom: a
+                             27B-class plane over free VRAM lands on the fallback, not OOM */
+                if (build) {
+                    uint8_t* nb = nullptr;
+                    if (hipMalloc(&nb, (size_t)bytes) != hipSuccess) nb = nullptr;
+                    if (nb) {
+                        if (!q8x_side &&
+                            hipStreamCreateWithFlags(&q8x_side, hipStreamNonBlocking) != hipSuccess)
+                            q8x_side = nullptr;
+                        bool ok = false;
+                        if (q8x_side) {
+                            const int64_t work = P.N * ((P.K >> 1) + (P.K >> 7));
+                            const int64_t g = (work + 255) / 256;
+                            hipLaunchKernelGGL(m4_repack_q8x_kernel,
+                                               dim3((unsigned)(g < 8192 ? g : 8192)), dim3(256),
+                                               0, q8x_side, P.B, P.BS, nb, P.b_pitch, P.bs_pitch,
+                                               (int)P.N, (int)P.K);
+                            ok = hipGetLastError() == hipSuccess;
+                            if (ok) ok = hipStreamSynchronize(q8x_side) == hipSuccess;
+                        }
+                        if (ok) { q8x_cache.push_back(Q8xEnt{P.B, P.BS, P.N, P.K, nb}); plane = nb; }
+                        else { (void)hipFree(nb); plane = nullptr; }
+                    }
+                }
+                if (!plane) {
+                    q8x_failed.push_back(Q8xEnt{P.B, P.BS, P.N, P.K, nullptr});
+                    fprintf(stderr, "libr3d: mxfp4 q8x plane unavailable (N=%lld K=%lld), "
+                                    "shipped walk keeps this band\n", (long long)P.N, (long long)P.K);
+                }
+            }
+        }
+
+        if (plane && !q8x_scratch_dead && P.K > q8x_cap_k) {
+            int8_t* nx = nullptr; float* ns = nullptr;
+            if (hipMalloc(&nx, (size_t)(8 * P.K)) == hipSuccess &&
+                hipMalloc(&ns, (size_t)(8 * (P.K >> 5) * 4)) == hipSuccess) {
+                /* the old scratch is LEAKED on grow, never freed: the engine stream
+                 * may hold in-flight reads of it and a hipFree is a device sync --
+                 * ~9 MB leaks per K-growth step, invisible beside the planes */
+                q8x_x8 = nx; q8x_sg = ns; q8x_cap_k = P.K;
+            } else {
+                if (nx) (void)hipFree(nx);
+                q8x_scratch_dead = true;
+            }
+        }
+
+        if (plane && !q8x_scratch_dead && q8x_cap_k >= P.K) {
+            const unsigned pgrid = (unsigned)((P.M * (P.K >> 5) + 7) / 8);
+            hipLaunchKernelGGL(m4_act_i8_kernel, dim3(pgrid), dim3(256), 0, stream,
+                               P.A, q8x_x8, q8x_sg, (int)P.M, (int)P.K, P.a_pitch);
+            #define R3D_M4_Q8X(MT_)                                                    \
+                hipLaunchKernelGGL((gemm_nt_mxfp4_gemv_q8x_kernel<MT_>),               \
+                                   dim3((unsigned)P.N), dim3(32), 0, stream, plane,    \
+                                   q8x_x8, q8x_sg, P.AS, (uint16_t*)Y->data,           \
+                                   (int)P.M, (int)P.N, (int)P.K, P.y_pitch, P.as_pitch)
+            switch (mt) {
+                case 1: R3D_M4_Q8X(1); break;
+                case 2: R3D_M4_Q8X(2); break;
+                case 4: R3D_M4_Q8X(4); break;
+                default: R3D_M4_Q8X(8); break;
+            }
+            #undef R3D_M4_Q8X
+            const hipError_t le = hipGetLastError();
+            if (le == hipSuccess) {
+                if (getenv("R3D_DEBUG_GEMM")) {
+                    static bool once = false;
+                    if (!once) { once = true;
+                        fprintf(stderr, "libr3d: mxfp4 q8x dot4 arm launched (mt=%d)\n", mt); }
+                }
+                return RAD_OK;
+            }
+            fprintf(stderr, "libr3d: mxfp4 q8x arm launch FAILED (%s), shipped walk "
+                            "takes this launch\n", hipGetErrorName(le));
+            /* fall through: the shipped legs below re-launch on the same operands --
+             * the arm's plane and scratch are plugin-owned buffers no engine tensor
+             * aliases, so nothing it wrote needs undoing. */
         }
     }
 
