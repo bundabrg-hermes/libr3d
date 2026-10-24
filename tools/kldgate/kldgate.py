@@ -326,6 +326,7 @@ def cmd_diffcompare(args):
             kls.append(kl)
             kls_rev.append(kl_r)
             all_kl.append(kl)
+            all_kl_rev.append(kl_r)
             top1_ok = max(a, key=a.get) == max(b, key=b.get)
             agree.append(1 if top1_ok else 0)
             all_top1.append(1 if top1_ok else 0)
