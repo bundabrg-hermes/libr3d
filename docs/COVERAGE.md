@@ -1934,3 +1934,59 @@ tree. Deltas folded: Q1 (rotation gate + MT>=2 gate + rejected-variant skips), Q
 widening constraint), Q12 (L2-convoy risk note), new Q18-Q21, card bench protocol adopted
 (verify widths, L2-rotating harnesses, A-B-A-B, rocprofv3 limits, census-after-change).
 No kernel code touched; spec9g untouched (build_v124, health 200); no serve ran this window.
+
+## Q18: the w2a8 register window — census trap fixed, MT-gated, shipped in build_v127 (2026-10-25)
+
+The census finding became the fix: the q8 GEMV's prefetch window was a `uint4 bwin[W]`
+consumed through the runtime `d` of a `d < rem`-bounded loop — an array with a dynamic
+index cannot live in registers, so LLVM demoted the whole window to per-thread scratch
+(144/272 B priv on all ten W>1 arms; 16x `scratch_store_b128` per iteration at W=16,
+8 at W=8). Fix shape (`a805b84`): BOTH the preload and the consumption loop carry
+`#pragma unroll` to the compile-time trip W with a BLOCK-UNIFORM `d < rem` guard
+(rem is a function of wbase/nd only — barrier arrival counts stay equal across the
+block, the predicated-barrier legality). Every `bwin` index is then static and register
+residence is the compiler's only option. Verified at the instruction level: the gfx1100
+`<16,8>` disassembly (11,239 lines, 528 sudot4 — non-empty slice, right code object,
+co1 = flags 0x41) contains ZERO scratch instructions; the `sgpr_spill_count` 178/439 on
+the MT=16 arms are reserved-and-unused slots (metadata only, disasm rules).
+
+The rollout then produced the window's most instructive result: measured WHOLE-TILE,
+the register window was a split win (v124 vs v126, same card, same session, alternating
+rounds, all five shape classes non-overlapping, log ~/scratch/r3d/q18_ab.txt):
+M=1 K=8192 +24.7%, M=1 K=16384 +29.5%, M=4 +15.0%, but M=7 (MT=8) -8.1% and M=14
+(MT=16) -11.4% — the W-fold body copies price the wide tiles past what removing the
+scratch traffic buys. That is the schedule-transfer law (per-family, once written in the
+ledger for sibling kernels) biting inside ONE kernel across its own MT ladder. The ship
+(`e78f0f4`) gates the new walk at `MT <= 4`; MT>=8 keeps the pre-Q18 walk verbatim, and
+the dword iteration (stage/sync/dot/fold/flush/sync) moves into one `__device__
+__forceinline__ q8_dword_iter<MT>` shared by both arms — the bit-identity is now a
+SOURCE property (one body, both fetch paths), not a bench finding.
+
+Census before/after (gfx1100, v124 -> v127, per arm MT,W): MT<=4 arms priv 144/272 -> 0
+at 85-122 VGPR (all under the 128 cap for W=8; the W=16 opt-in arms at 117-122 are the
+only ones near the cap); MT>=8 arms byte-identical to v124 (priv 144/272, 87-90 VGPR).
+Gates on build_v127 (e78f0f4): repro_w2a8 BIT-EXACT at every M (rc=0, rel 0.000e+00,
+13/13 Ms); battery 6/6 with baseline fingerprints identical to the v125 line (stock 2011
+6.952e-3, full 4737 6.994e-3, attr 480 6.994e-3, df2 702 7.306e-3, df3 768 6.994e-3,
+fp8 536 3.686e-4); per_op_cmp v125-vs-v127 ZERO diffs on 34/36/1/1/1/2 ops — the
+zero-diff class claim measured, per the row's own instruction.
+Confirmation A/B v124 vs v127 (3 alternating rounds, ~/scratch/r3d/q18_ab2.txt):
++25.9/+31.7% (M=1, non-overlapping), +15.6% (M=4, non-overlapping), +1.3/+0.2% with
+overlapping spreads at M=7/M=14 = parity, exactly the gate's promise.
+
+Row-level tooling born with it: `tools/bench_w2a8.cpp` — repro_w2a8's operand
+construction (the joined scale,zero blob no kbench recorder can describe), argv shapes,
+plane rotation for the L2 law (q8 plane N*K bytes per launch; >=96 MB at one plane),
+median-launch timing as GB/s, and a nonzero-output liveness assertion (the all-zero
+fixture lesson armed in the harness itself). Build line in the file header.
+
+Serving context: spec9g (qwen3.5-9b-mxfp4) never issues `gemm_nt_q_w2a8_decode` (zero
+w2a8 lines; its drafter is the container's own, chained-launches-off) — the band serves
+only DFlash2-style w2a8 draft heads, so no serve swap rode this change: the row ships
+for the next drafter deployment on build_v127+, and the live serve stays build_v124.
+Residual: Q18b (Wc=4 middle-ground window for the MT>=8 verify band — the scratch
+demotion is still paid there, now MEASURED as the cheaper cost, so Q18b needs a
+schedule that beats BOTH, e.g. partial unroll or a 4-deep sub-window; gate behind a
+fresh bench win). Q12 (compressed-input dot4 on the same row) should re-read this
+section before touching the walk.
+
