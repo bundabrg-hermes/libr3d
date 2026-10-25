@@ -64,12 +64,13 @@ int main(int argc, char** argv) {
     // Which arm DO WE EXPECT for this shape? Mirrors the launcher's gates so a
     // bench line can never quietly measure a different arm than it claims.
     const int MT = (M + 63) / 64;
-    const bool vec   = getenv("R3D_M64_VEC") && strcmp(getenv("R3D_M64_VEC"), "0") != 0;
+    const char* vev = getenv("R3D_M64_VEC");
+    const int   vecv = (!vev || strcmp(vev, "0") == 0) ? 0 : (strcmp(vev, "2") == 0 ? 2 : 1);
     const bool ronen = getenv("R3D_M64_ROT") && strcmp(getenv("R3D_M64_ROT"), "0") != 0;
-    const bool vec_ok = vec && MT >= 2 && (K % 8 == 0);   // pitch=K here; bases 256B
+    const bool vec_ok = vecv != 0 && MT >= 2 && (K % 8 == 0);   // pitch=K here; bases 256B
     const bool expect_rot = vec_ok && ronen && (K % 4096 == 0);
-    printf("ARM expected=%s MT=%d K%%4096=%d\n",
-           expect_rot ? "vec+rot" : vec_ok ? "vec" : "scalar", MT, K % 4096 == 0);
+    printf("ARM expected=%s%s MT=%d K%%4096=%d\n", vec_ok ? (vecv == 2 ? "b64" : "vec16") : "scalar",
+           expect_rot ? "+rot" : "", MT, K % 4096 == 0);
 
     uint32_t st = 0x9e3779b9u;
     auto rnd = [&]() { st ^= st << 13; st ^= st >> 17; st ^= st << 5; return st; };

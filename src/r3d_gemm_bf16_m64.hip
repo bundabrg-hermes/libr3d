@@ -271,17 +271,28 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_kernel(
  * ------------------------------------------------------------------------- */
 constexpr int kVecPad = 16;
 
-template <bool ROT>
+/* PAD16=true:  uint4 global loads AND uint4 LDS stores, rows padded to 32
+ * elements (16B alignment) -- LDS/WG exactly 32KB, which costs the second
+ * workgroup per CU (2x32768 = the full 64KB bank). Measured 2026-10-25:
+ * -0.6..-9.1% across MT>=2 shapes -- the occupancy cost dominates.
+ * PAD16=false (R3D_M64_VEC=2, the Astra b64 fallback): SAME uint4 global loads,
+ * but the LDS store splits into two 8B uint2 halves and the rows keep the
+ * shipped pad 4. A 40B row keeps every 8B slot aligned (40r + 2d, d%4==0 ->
+ * %8==0), so b64 stores need no repadding, and LDS/WG is BYTE-IDENTICAL to the
+ * shipped scalar arm (25088) -- occupancy preserved, vec loads kept. This is
+ * the arm that separates "vec staging helps" from "pad 16's occupancy hurts". */
+template <bool ROT, bool PAD16>
 __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_vec_kernel(
     const uint16_t* __restrict__ A, const uint16_t* __restrict__ B,
     uint16_t* __restrict__ Y, float* __restrict__ Yf,
     int M, int N, int K, int64_t a_pitch, int64_t b_pitch, int64_t y_pitch) {
 
-    constexpr int kLD = kKB + kVecPad;               /* 32 elements: 16B-aligned rows */
-    static_assert(kLD * 2 % 16 == 0, "vec LDS stores need 16B-aligned rows");
+    constexpr int kLD = kKB + (PAD16 ? kVecPad : kLdsPad);
+    static_assert(PAD16 ? (kLD * 2 % 16 == 0) : (kLD * 2 % 8 == 0),
+                  "vec LDS stores need 8B/16B-aligned rows");
     __shared__ uint16_t As[2][kMB][kLD];             /* DBUF only: always doubled */
     __shared__ uint16_t Bs[kNB][kLD];                /* B single-buffered (block-06 law) */
-    __shared__ float    Ys[kMB][kNB + kVecPad];
+    __shared__ float    Ys[kMB][kNB + (PAD16 ? kVecPad : kLdsPad)];
 
     const int m0 = blockIdx.y * kMB;
     const int n0 = blockIdx.x * kNB;
@@ -326,10 +337,24 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_vec_kernel(
         else      ld_vec(A, a_pitch, m0, M, k0, rot, &areg);
     };
     auto stage_a = [&](int ab, int rot) {
-        if (!is_b) *reinterpret_cast<uint4*>(&As[ab][rot][d8]) = areg;
+        if (!is_b) {
+            if (PAD16) { *reinterpret_cast<uint4*>(&As[ab][rot][d8]) = areg; }
+            else {
+                uint16_t* p = &As[ab][rot][d8];
+                *reinterpret_cast<uint2*>(p)      = make_uint2(areg.x, areg.y);
+                *reinterpret_cast<uint2*>(p + 4)  = make_uint2(areg.z, areg.w);
+            }
+        }
     };
     auto stage_b = [&](int rot) {
-        if (is_b) *reinterpret_cast<uint4*>(&Bs[rot][d8]) = breg;
+        if (is_b) {
+            if (PAD16) { *reinterpret_cast<uint4*>(&Bs[rot][d8]) = breg; }
+            else {
+                uint16_t* p = &Bs[rot][d8];
+                *reinterpret_cast<uint2*>(p)      = make_uint2(breg.x, breg.y);
+                *reinterpret_cast<uint2*>(p + 4)  = make_uint2(breg.z, breg.w);
+            }
+        }
     };
 
     const int nks = (K + kKB - 1) / kKB;
@@ -355,9 +380,9 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_vec_kernel(
     }
 
     __syncthreads();
-    rocwmma::store_matrix_sync(&Ys[tw * 16][tc * 16], fc0, kNB + kVecPad,
+    rocwmma::store_matrix_sync(&Ys[tw * 16][tc * 16], fc0, kNB + (PAD16 ? kVecPad : kLdsPad),
                                rocwmma::mem_row_major);
-    rocwmma::store_matrix_sync(&Ys[tw * 16][(tc + 1) * 16], fc1, kNB + kVecPad,
+    rocwmma::store_matrix_sync(&Ys[tw * 16][(tc + 1) * 16], fc1, kNB + (PAD16 ? kVecPad : kLdsPad),
                                rocwmma::mem_row_major);
     __syncthreads();
 
@@ -382,7 +407,7 @@ template <bool DBUF>
 __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_kernel(
     const uint16_t*, const uint16_t*, uint16_t*, float*,
     int, int, int, int64_t, int64_t, int64_t) {}
-template <bool ROT>
+template <bool ROT, bool PAD16>
 __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_vec_kernel(
     const uint16_t*, const uint16_t*, uint16_t*, float*,
     int, int, int, int64_t, int64_t, int64_t) {}
@@ -423,26 +448,28 @@ int r3d_gemm_nt_m64_launch(const void* A, const void* B, void* Y, float* Yf,
         return RAD_E_DEVICE;
     }
     static const bool dbuf = getenv("R3D_GEMM_NO_DBUF") == nullptr;
-    /* Q1 arms, both dark until released: vec staging (MT>=2 rows, aligned
-     * operands, DBUF schedule) and the K%4096==0-gated issue rotation on top.
-     * Withdraw law (issue #6/Q6): the literal "0" is OFF, any other set value
-     * is ON. */
-    static const bool vec  = getenv("R3D_M64_VEC")  && strcmp(getenv("R3D_M64_VEC"),  "0") != 0;
-    static const bool rot  = getenv("R3D_M64_ROT")  && strcmp(getenv("R3D_M64_ROT"),  "0") != 0;
+    /* Q1 arms, dark until released. R3D_M64_VEC selects the staging variant:
+     *   unset/"0" -> scalar walk (shipped); "2" -> b64 LDS stores, pad 4
+     *   (occupancy-preserving Astra fallback); anything else -> uint4 stores,
+     *   pad 16. R3D_M64_ROT adds the K%4096==0-gated issue rotation.
+     * Withdraw law (issue #6/Q6): the literal "0" is OFF. */
+    static const char* vev = getenv("R3D_M64_VEC");
+    static const int   vecv = (!vev || strcmp(vev, "0") == 0) ? 0
+                              : (strcmp(vev, "2") == 0 ? 2 : 1);
+    static const bool  rot  = getenv("R3D_M64_ROT") && strcmp(getenv("R3D_M64_ROT"), "0") != 0;
     dim3 grid((unsigned)((N + kNB - 1) / kNB), (unsigned)((M + kMB - 1) / kMB));
     const int MT = (M + kMB - 1) / kMB;
-    const bool vec_ok = vec && dbuf && MT >= 2 &&
+    const bool vec_ok = vecv != 0 && dbuf && MT >= 2 &&
                         (a_pitch % 8 == 0) && (b_pitch % 8 == 0) &&
                         ((((uintptr_t)A) & 15) == 0) && ((((uintptr_t)B) & 15) == 0);
     const bool rot_on = vec_ok && rot && (K % 4096 == 0);
-    if (vec_ok && rot_on)
-        hipLaunchKernelGGL((gemm_nt_bf16_m64_vec_kernel<true>), grid, dim3(kThreads), 0, stream,
-                           (const uint16_t*)A, (const uint16_t*)B, (uint16_t*)Y, Yf,
-                           M, N, K, a_pitch, b_pitch, y_pitch);
-    else if (vec_ok)
-        hipLaunchKernelGGL((gemm_nt_bf16_m64_vec_kernel<false>), grid, dim3(kThreads), 0, stream,
-                           (const uint16_t*)A, (const uint16_t*)B, (uint16_t*)Y, Yf,
-                           M, N, K, a_pitch, b_pitch, y_pitch);
+#define R3D_M64_V(ROT_, PAD16_) \
+    hipLaunchKernelGGL((gemm_nt_bf16_m64_vec_kernel<ROT_, PAD16_>), grid, dim3(kThreads), 0, stream, \
+                       (const uint16_t*)A, (const uint16_t*)B, (uint16_t*)Y, Yf, \
+                       M, N, K, a_pitch, b_pitch, y_pitch)
+    if (vec_ok && rot_on) { if (vecv == 2) R3D_M64_V(true, false); else R3D_M64_V(true, true); }
+    else if (vec_ok)      { if (vecv == 2) R3D_M64_V(false, false); else R3D_M64_V(false, true); }
+#undef R3D_M64_V
     else if (dbuf)
         hipLaunchKernelGGL((gemm_nt_bf16_m64_kernel<true>), grid, dim3(kThreads), 0, stream,
                            (const uint16_t*)A, (const uint16_t*)B, (uint16_t*)Y, Yf,
@@ -457,8 +484,8 @@ int r3d_gemm_nt_m64_launch(const void* A, const void* B, void* Y, float* Yf,
     else if (getenv("R3D_DEBUG_GEMM")) {
         static bool once = false;
         if (!once) { once = true; fprintf(stderr, "libr3d: m64 WMMA tile launched (%s)\n",
-                                          rot_on ? "vec staging rot=on"
-                                       : vec_ok ? "vec staging rot=off"
+                                          rot_on ? (vecv == 2 ? "b64 staging rot=on" : "vec16 staging rot=on")
+                                       : vec_ok ? (vecv == 2 ? "b64 staging rot=off" : "vec16 staging rot=off")
                                        : dbuf   ? "dbuf pipeline" : "single-buffer"); }
     }
     return le == hipSuccess ? RAD_OK : RAD_E_DEVICE;
