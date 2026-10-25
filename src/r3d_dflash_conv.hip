@@ -78,14 +78,19 @@ __global__ void dflash_conv_kernel(const uint16_t* __restrict__ x,
                                    int64_t bs_rs,
                                    int taps, int group, int bsz) {
     const int64_t total = T * H;
-    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total) return;
-    const int64_t t = i / H, h = i - t * H;
-    const int64_t g = h / group;
+    const int64_t i64 = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i64 >= total) return;
+    /* Q4 (REVIEW_QUEUE): the launcher caps total <= 0xffff*kThreads, so every index
+     * below provably fits u32 -- the three i64 software divisions become u32, and the
+     * per-tap t%bsz is hoisted to once per element (same value every tap). Addresses
+     * stay int64; values are bit-identical integer identities. */
+    const uint32_t i = (uint32_t)i64, H32 = (uint32_t)H;
+    const uint32_t t = i / H32, h = i - t * H32;
+    const uint32_t g = h / (uint32_t)group, mask = t % (uint32_t)bsz;
 
     float acc = 0.0f;
     for (int j = 0; j < taps; ++j) {
-        if (j > 0 && t % bsz < j) continue;                    /* the block-start mask */
+        if (j > 0 && mask < (uint32_t)j) continue;             /* the block-start mask */
         const float c = r3d_bf16_to_f32(bs[j * bs_rs + h]) +
                         r3d_bf16_to_f32(dl[t * d_rs + (int64_t)j * d_ts + g]);
         const float term = c * r3d_bf16_to_f32(x[(t - j) * x_rs + h]);

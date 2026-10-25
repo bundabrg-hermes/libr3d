@@ -120,8 +120,11 @@ __global__ __launch_bounds__(kThreads) void quant_act_fp8_kernel(
     float* __restrict__ scale, int64_t s_pitch,
     int64_t n, int64_t g, int64_t ngrp) {
     __shared__ float s_part[kWarps]; __shared__ float s_sc;
-    const int64_t row  = blockIdx.x / ngrp;
-    const int64_t gi   = blockIdx.x % ngrp;
+    /* Q4 (REVIEW_QUEUE): block-uniform u32 split (grid x == rows*ngrp < 2^31 by the
+     * launch gate, so ngrp fits u32 -- the guard below pins it); addresses widen back. */
+    const uint32_t row32 = blockIdx.x / (uint32_t)ngrp;
+    const int64_t row  = row32;
+    const int64_t gi   = blockIdx.x - row32 * (uint32_t)ngrp;
     const int64_t k0   = gi * g, k1 = (k0 + g < n) ? k0 + g : n;
     const uint8_t* __restrict__ xr = x + row * x_pitch;
     uint8_t* __restrict__ qr = q + row * q_pitch;
@@ -329,6 +332,7 @@ static int r3d_quant_act_fp8_impl(const RadArgs* a, RadStream s) {
     int64_t g = param_i(a, "group", n);
     if (g <= 0 || g > n) g = n;
     const int64_t ngrp = (n + g - 1) / g;
+    if (ngrp > 0x7fffffffLL) return RAD_E_SHAPE;   /* u32 kernel split + grid x both fit */
     if (rad_tensor_numel(q) < rows * n || rad_tensor_numel(sc) < rows * ngrp) return RAD_E_SHAPE;
     int64_t xp, qp, sp;
     if (row2_pitch(x, n, &xp)) return RAD_E_STRIDE;

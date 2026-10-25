@@ -919,10 +919,10 @@ __global__ __launch_bounds__(256) void m4_act_i8_kernel(
  * them out of every stored row), SG its f32 scales (pitch K/32), AS/BS the engine's
  * planes at their derived pitches. */
 template <int MT>
-__global__ __launch_bounds__(32) void gemm_nt_mxfp4_gemv_q8x_kernel(
+__global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_kernel(
     const uint8_t* __restrict__ S, const int8_t* __restrict__ X, const float* __restrict__ SG,
     const float* __restrict__ AS, uint16_t* __restrict__ Y,
-    int M, int N, int K, int64_t y_pitch, int64_t as_pitch)
+    int M, int N, int K, int64_t y_pitch, int64_t as_pitch, int nt)
 {
     const int r = blockIdx.x;
     const int t = threadIdx.x;
@@ -940,7 +940,11 @@ __global__ __launch_bounds__(32) void gemm_nt_mxfp4_gemv_q8x_kernel(
 
     for (int it = 0; it < nstep; ++it) {
         const uint8_t* sp = crow + ((int64_t)it << 1) * 136;
-        const uint2 wc = *(const uint2*)(sp + hi8 + 8 + lo8);
+        /* Q5 (REVIEW_QUEUE): nt=1 streams the weight plane non-temporally (the plane is
+         * L2-cold by design; activations stay inline -- cold-plane-only law). Donor
+         * measured +10-12% stream / -3% in-engine, so this ships opt-in (R3D_Q8X_NT). */
+        const uint2 wc = nt ? __builtin_nontemporal_load((const uint2*)(sp + hi8 + 8 + lo8))
+                            : *(const uint2*)(sp + hi8 + 8 + lo8);
         const int g = (it << 3) + q;               /* the quad owns the 32-group */
         const float sc = r3d_e8m0_sc(sp[((q >> 2) * 136) + (q & 3)]);
 #pragma unroll
@@ -989,9 +993,9 @@ __global__ void m4_repack_q8x_kernel(const uint8_t*, const uint8_t*, uint8_t*,
                                      int64_t, int64_t, int, int) {}
 __global__ void m4_act_i8_kernel(const uint8_t*, int8_t*, float*, int, int, int64_t) {}
 template <int MT>
-__global__ __launch_bounds__(32) void gemm_nt_mxfp4_gemv_q8x_kernel(
+__global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_kernel(
     const uint8_t*, const int8_t*, const float*, const float*, uint16_t*,
-    int, int, int, int64_t, int64_t) {}
+    int, int, int, int64_t, int64_t, int) {}
 } /* anonymous namespace */
 
 #endif
@@ -1348,6 +1352,7 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
         }
 
         if (plane && q8x_x8) {
+            static const int q8x_nt = getenv("R3D_Q8X_NT") ? 1 : 0;
             const unsigned pgrid = (unsigned)((P.M * (P.K >> 5) + 7) / 8);
             hipLaunchKernelGGL(m4_act_i8_kernel, dim3(pgrid), dim3(256), 0, stream,
                                P.A, q8x_x8, q8x_sg, (int)P.M, (int)P.K, P.a_pitch);
@@ -1355,7 +1360,8 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
                 hipLaunchKernelGGL((gemm_nt_mxfp4_gemv_q8x_kernel<MT_>),               \
                                    dim3((unsigned)P.N), dim3(32), 0, stream, plane,    \
                                    q8x_x8, q8x_sg, P.AS, (uint16_t*)Y->data,           \
-                                   (int)P.M, (int)P.N, (int)P.K, P.y_pitch, P.as_pitch)
+                                   (int)P.M, (int)P.N, (int)P.K, P.y_pitch, P.as_pitch,\
+                                   q8x_nt)
             switch (mt) {
                 case 1: R3D_M4_Q8X(1); break;
                 case 2: R3D_M4_Q8X(2); break;

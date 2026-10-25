@@ -29,7 +29,11 @@ namespace {
 constexpr uint32_t kThreads = 256;
 
 /* One block per token. All strides in elements, resolved on the host side of the launch
- * exactly as ref's kv_view does; the bf16 value is copied without rounding (identity). */
+ * exactly as ref's kv_view does; the bf16 value is copied without rounding (identity).
+ * VEC (Q8, REVIEW_QUEUE): when every face is 16B-aligned and contiguous in 8-element runs
+ * (serve's canonical paged layout), the walk copies uint4 -- byte-identical copies, 1/8 the
+ * per-element divisions and stores. Odd strides keep the historical scalar walk (VEC=0). */
+template <int VEC>
 __global__ __launch_bounds__(kThreads) void kv_store_kernel(
     const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
     const int32_t* __restrict__ sm, uint16_t* __restrict__ kv,
@@ -47,6 +51,17 @@ __global__ __launch_bounds__(kThreads) void kv_store_kernel(
     uint16_t* __restrict__ row = kv + blk * sb + off * so;
 
     const uint32_t per_head = head_dim;         /* elements each of k and v per head */
+    if (VEC) {
+        const uint32_t per_head8 = per_head >> 3;
+        for (uint32_t L = threadIdx.x; L < n_head_kv * per_head8; L += kThreads) {
+            const uint32_t h = L / per_head8, c8 = (L - h * per_head8) << 3;
+            uint16_t* __restrict__ dst = row + (int64_t)h * sh + c8;
+            *reinterpret_cast<uint4*>(dst) =
+                *reinterpret_cast<const uint4*>(kt + (int64_t)h * k_hs + c8);
+            *reinterpret_cast<uint4*>(dst + (int64_t)head_dim * sd) =
+                *reinterpret_cast<const uint4*>(vt + (int64_t)h * v_hs + c8);
+        }
+    } else
     for (uint32_t e = threadIdx.x; e < n_head_kv * per_head; e += kThreads) {
         const uint32_t h = e / per_head, d = e % per_head;
         uint16_t* __restrict__ dst = row + (int64_t)h * sh + (int64_t)d * sd;
@@ -104,11 +119,21 @@ static int r3d_kv_store_impl(const RadArgs* a, RadStream s) {
     const int64_t sb = kv->stride[0], sh = kv->stride[1], so = kv->stride[2], sd = kv->stride[3];
     if (M > 0x7ffffffLL) return RAD_E_SHAPE;
 
+    /* VEC gate (Q8): 16B = 8 bf16 elements; every plane must start and run in units of
+     * 8, and every face must be contiguous within a head (sd==1, ds==1 already pinned). */
+    const bool vec = head_dim % 8 == 0 && sd == 1 &&
+                     sb % 8 == 0 && so % 8 == 0 && sh % 8 == 0 &&
+                     k_rs % 8 == 0 && v_rs % 8 == 0 && k_hs % 8 == 0 && v_hs % 8 == 0 &&
+                     (((uintptr_t)k->data | (uintptr_t)v->data | (uintptr_t)kv->data) & 15) == 0;
+
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
-    hipLaunchKernelGGL(kv_store_kernel, dim3((uint32_t)M), dim3(kThreads), 0, stream,
-                       (const uint16_t*)k->data, (const uint16_t*)v->data,
-                       (const int32_t*)sm->data, (uint16_t*)kv->data,
-                       (uint32_t)head_dim, (uint32_t)n_head_kv, (int32_t)block_size,
-                       kv->shape[0], k_rs, k_hs, v_rs, v_hs, sb, sh, so, sd);
+    #define R3D_KVS_LA(V)                                                             \
+        hipLaunchKernelGGL((kv_store_kernel<V>), dim3((uint32_t)M), dim3(kThreads), 0, \
+                           stream, (const uint16_t*)k->data, (const uint16_t*)v->data,\
+                           (const int32_t*)sm->data, (uint16_t*)kv->data,             \
+                           (uint32_t)head_dim, (uint32_t)n_head_kv, (int32_t)block_size,\
+                           kv->shape[0], k_rs, k_hs, v_rs, v_hs, sb, sh, so, sd)
+    if (vec) R3D_KVS_LA(1); else R3D_KVS_LA(0);
+    #undef R3D_KVS_LA
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }

@@ -167,7 +167,7 @@ __device__ __forceinline__ int w2_xs_idx(int j, int kk) {   /* j = kk >> 7 (0..3
 /* MT activation rows per block; W = prefetch window in dwords (a dword covers FOUR scale
  * groups -- the fp8 row's PF law, issue #7, with the window counted in load units). */
 template <int MT, int W>
-__global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_kernel(
+__global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_kernel(
     const int8_t* __restrict__ A,       /* [M, a_pitch] i8 codes, step order */
     const uint8_t* __restrict__ B,      /* [N, b_pitch] u2 codes, dense (stored as is) */
     uint16_t* __restrict__ Y,           /* [M, y_pitch] bf16 */
@@ -366,7 +366,7 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_repack_kernel(
  * the lane's sixteen codes are sixteen CONSECUTIVE slots, and quant_act_i8's step order
  * still rides the staging index exactly as before. */
 template <int MT, int W>
-__global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_q8_kernel(
+__global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     const int8_t* __restrict__ A,
     const uint8_t* __restrict__ B8,     /* repacked codes, pitch = 4 * b_pitch bytes */
     uint16_t* __restrict__ Y,
@@ -512,13 +512,13 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_q8_kernel(
  * could never launch on any card and the engine fell back host-side every draft pass). */
 namespace {
 template <int MT, int W>
-__global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_kernel(
+__global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_kernel(
     const int8_t*, const uint8_t*, uint16_t*, const float*, const __half*, const uint8_t*,
     const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) {}
 /* the q8 arm mirrors too (same rule): the repack kernel and the q8 GEMV. */
 __global__ void gemm_nt_w2a8_repack_kernel(const uint8_t*, uint8_t*, int64_t, int64_t) {}
 template <int MT, int W>
-__global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_q8_kernel(
+__global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     const int8_t*, const uint8_t*, uint16_t*, const float*, const __half*, const uint8_t*,
     const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) {}
 }  /* anonymous namespace */

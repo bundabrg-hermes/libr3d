@@ -67,13 +67,21 @@ __device__ __forceinline__ float r3d_act(int act, float x) {
     }
 }
 
+/* Q4 (REVIEW_QUEUE): Contig = all pitches equal n, so address == e and the per-element
+ * 64-bit division is dead at compile time (the cast Contig precedent); W32 = total < 2^32
+ * (gated at launch), so the row/col split runs as u32 division -- bit-identical values,
+ * the u64 walk kept for the gated-out giant case. */
+template <int Contig, int W32>
 __global__ __launch_bounds__(kThreads) void act_mul_kernel(
     const uint16_t* __restrict__ a, const uint16_t* __restrict__ b, uint16_t* __restrict__ y,
     uint64_t total, uint32_t n, int act,
     int64_t a_pitch, int64_t b_pitch, int64_t y_pitch) {
     const uint64_t idx = (uint64_t)blockIdx.x * kThreads + threadIdx.x;
     for (uint64_t e = idx; e < total; e += (uint64_t)gridDim.x * kThreads) {
-        const uint64_t r = e / n, i = e - r * n;
+        uint64_t r, i;
+        if (Contig) { r = 0; i = e; }
+        else if (W32) { const uint32_t e32 = (uint32_t)e, r32 = e32 / n; r = r32; i = e32 - r32 * n; }
+        else { r = e / n; i = e - r * n; }
         const float g = r3d_bf16_to_f32(a[r * a_pitch + i]);
         const float v = r3d_act(act, g);
         const uint16_t vb = r3d_f32_to_bf16(v);          /* the schema's first rounding */
@@ -128,8 +136,16 @@ static int r3d_act_mul_impl(const RadArgs* a, RadStream s) {
     if (blocks == 0 || blocks > 0x7fffffffu) return RAD_E_SHAPE;
 
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
-    hipLaunchKernelGGL(act_mul_kernel, dim3(blocks), dim3(kThreads), 0, stream,
-                       (const uint16_t*)A->data, (const uint16_t*)B->data, (uint16_t*)Y->data,
-                       total, (uint32_t)n, (int)ai, a_pitch, b_pitch, y_pitch);
+    const int contig = a_pitch == n && b_pitch == n && y_pitch == n;
+    const int w32 = total < (1ull << 32);
+    #define R3D_ACT_LA(CT, W32_)                                                      \
+        hipLaunchKernelGGL((act_mul_kernel<CT, W32_>), dim3(blocks), dim3(kThreads),  \
+                           0, stream, (const uint16_t*)A->data, (const uint16_t*)B->data, \
+                           (uint16_t*)Y->data, total, (uint32_t)n, (int)ai,           \
+                           a_pitch, b_pitch, y_pitch)
+    if (contig)       R3D_ACT_LA(1, 1);
+    else if (w32)     R3D_ACT_LA(0, 1);
+    else              R3D_ACT_LA(0, 0);
+    #undef R3D_ACT_LA
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
