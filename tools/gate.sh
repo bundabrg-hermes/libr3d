@@ -41,6 +41,7 @@ stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
     local libs=(); while [ "$1" != "--" ]; do libs+=("$1"); shift; done; shift
     local envs=(-e ROCR_VISIBLE_DEVICES="$ROCR")
     [ -n "${R3D_FP4_DOT2:-}" ] && envs+=(-e R3D_FP4_DOT2="$R3D_FP4_DOT2")
+    [ -n "${R3D_FP8A8_D2:-}" ] && envs+=(-e R3D_FP8A8_D2="$R3D_FP8A8_D2")
     [ -n "${R3D_NO_GEMV_PF:-}" ] && envs+=(-e R3D_NO_GEMV_PF="$R3D_NO_GEMV_PF")
     [ -n "${R3D_GEMV_PF_W:-}" ] && envs+=(-e R3D_GEMV_PF_W="$R3D_GEMV_PF_W")
     [ -n "${R3D_FP4_GEMV_PF:-}" ] && envs+=(-e R3D_FP4_GEMV_PF="$R3D_FP4_GEMV_PF")

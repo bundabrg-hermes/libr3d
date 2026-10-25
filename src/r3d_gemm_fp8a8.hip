@@ -38,6 +38,7 @@
  */
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include "r3d_dump.h"
 
 #include <cmath>
@@ -143,6 +144,46 @@ __device__ __forceinline__ float fp8e4m3_gemv(uint8_t b) {
         u = s | ((e - 7u + 127u) << 23) | (m << 20);
     }
     return __uint_as_float(u);
+}
+
+/* ---- the dot2 leg (Q9, 2026-10-25) ---------------------------------------------------
+ *
+ * The donor (QFN-P2) proposed v_dot2c_f32_bf16. PROBE FALSIFIED THE SPELLING on gfx1100
+ * (cat ~/scratch/q9probe, 3-arm assembler probe + ISA cross-check): ROCm 10.1 rejects
+ * every bf16 dot2 mnemonic on this target, and the ISA says why -- RDNA3 has NO VOP2
+ * bf16 dot form, VOP3P V_DOT2_F32_BF16 carries src3 in the literal pool ONLY (no
+ * register accumulator), and bf16 accumulate exists only as the VOPD dual instruction
+ * V_DUAL_DOT2ACC_F32_BF16 (ISA p.370/372), unreachable from inline asm.
+ *
+ * The fold survives, on f16 pairs: e4m3 embeds EXACTLY in f16 (<=4 significant bits,
+ * |v| in {0} U [2^-9, 448], all f16 normals), products are exact in f32, and the
+ * accumulate form the assembler DOES take -- 3-operand v_dot2c_f32_f16, lowering to
+ * VOP2 v_dot2acc_f32_f16 (16-bit encoding, no clamp bit; carve-objdump proven) -- is
+ * exactly what the shipped mxfp4 dot2 leg (issue #6) runs on. Accumulation order stays
+ * opaque (probe: pair summed first with the adder's guard bits -- matches neither
+ * ascending-fma nor pair-rounded at chain 128, maxrel 1.1e-3): this family is graded on
+ * rel_l2 3e-02 (fp8_9b adjudicates), same law as issue #6.
+ *
+ * Arm shape: the weight dword walks a 256-entry LDS f16 LUT (init once per block --
+ * 4 gathers + 2 packs REPLACE the 4x ~10-VALU per-byte decode chain, hoisted out of the
+ * m loop), activations stage as packed f16 pairs (xs16, half the LDS of the f32 xs).
+ * Per-lane per-group inner drops from ~10 + decode/m to 1 LDS.64 + 2 dot2/m.
+ * R3D_FP8A8_D2=1 selects the arm (lever OFF default until gates + bench carry the
+ * proof; issue #8's geometry caution on file: this row's dword walk was never the
+ * nibble-geometry disaster the mxfp4 plateau was -- instruction count may not bind).
+ */
+__device__ __forceinline__ uint32_t f16_pair_f8(float lo, float hi) {
+    __half2 h = __floats2half2_rn(lo, hi);        /* .x = lo -> low half */
+    uint32_t u;
+    memcpy(&u, &h, 4);
+    return u;
+}
+
+__device__ __forceinline__ float dot2c_f16_f8(uint32_t a, uint32_t b, float acc) {
+    /* 3-operand spelling == dst is also src3; resolves to v_dot2acc_f32_f16 (VOP2,
+     * 16-bit, no clamp bit) -- see the Q9 chronicle above and the mxfp4 twin. */
+    asm ("v_dot2c_f32_f16 %0, %1, %2" : "+v"(acc) : "v"(a), "v"(b));
+    return acc;
 }
 
 /* One 64x64 output tile per workgroup, K in 16-wide slices, flushed per 128-of-K scale
@@ -319,7 +360,7 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_m64_kernel(
  * all W fly across the staging barriers. Measured on the shape sweep: fp8 M==1 bands
  * gain +8..17% at W=8 (this family really was starved); W=1 is the #4 arm verbatim.
  * R3D_NO_GEMV_PF=1 selects W=1; R3D_GEMV_PF_W=16 probes a wider window (bench only). */
-template <int MT, int W>
+template <int MT, int W, bool D2>
 __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, uint16_t* __restrict__ Y,
     const float* __restrict__ AS, const uint16_t* __restrict__ BS,
@@ -329,6 +370,8 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
     int rblk)
 {
     __shared__ __align__(16) float xs[MT][128];
+    __shared__ __align__(16) uint32_t xs16[MT][64];     /* D2: packed f16 pairs (Q9) */
+    __shared__ uint32_t WLUT[256];                      /* D2: e4m3 byte -> f16 bits (low half) */
 
     const int w    = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -341,6 +384,8 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
 
     for (int i = threadIdx.x; i < MT * 128; i += kThreads)
         xs[i >> 7][i & 127] = 0.0f;
+    if constexpr (D2) WLUT[threadIdx.x] =
+        (uint32_t)__half_as_ushort(__float2half_rn(fp8e4m3_gemv((uint8_t)threadIdx.x)));
     float acc[MT];
 #pragma unroll
     for (int m = 0; m < MT; ++m) acc[m] = 0.0f;
@@ -361,24 +406,46 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
         for (int d = 0; d < rem; ++d) {
         const int grp = gbase + d;
         const int kbase = grp << 7;
-        for (int i = threadIdx.x; i < live * 128; i += kThreads) {
-            const int m = i >> 7, k = i & 127;
-            xs[m][k] = fp8e4m3_gemv(A[(int64_t)m * a_pitch + kbase + k]);
+        if constexpr (D2) {
+            for (int i = threadIdx.x; i < live * 64; i += kThreads) {
+                const int m = i >> 6, k = (i & 63) * 2;
+                xs16[m][i & 63] = f16_pair_f8(
+                    fp8e4m3_gemv(A[(int64_t)m * a_pitch + kbase + k]),
+                    fp8e4m3_gemv(A[(int64_t)m * a_pitch + kbase + k + 1]));
+            }
+        } else {
+            for (int i = threadIdx.x; i < live * 128; i += kThreads) {
+                const int m = i >> 7, k = i & 127;
+                xs[m][k] = fp8e4m3_gemv(A[(int64_t)m * a_pitch + kbase + k]);
+            }
         }
         __syncthreads();
 
         /* One aligned dword per lane: k = lane*4 + 0..3, ascending within the lane. */
         const uint32_t b4 = (W > 1) ? bwin[d] : *(const uint32_t*)(crow + kbase + (lane << 2));
         float sub[MT];
+        if constexpr (D2) {
+            /* weight pair gather: hoisted out of the m loop (re-used across rows);
+             * low byte = even k == f16 low half, matching the activation pair order. */
+            const uint32_t w01 = WLUT[b4 & 0xffu]        | (WLUT[(b4 >> 8) & 0xffu] << 16);
+            const uint32_t w23 = WLUT[(b4 >> 16) & 0xffu] | (WLUT[b4 >> 24] << 16);
 #pragma unroll
-        for (int m = 0; m < MT; ++m) {
-            const float4 xv = ((const float4*)xs[m])[lane];
-            const float x4[4] = { xv.x, xv.y, xv.z, xv.w };
-            float s = 0.0f;
+            for (int m = 0; m < MT; ++m) {
+                const uint2 ap = ((const uint2*)xs16[m])[lane];
+                float s = dot2c_f16_f8(w01, ap.x, 0.0f);
+                sub[m] = dot2c_f16_f8(w23, ap.y, s);
+            }
+        } else {
 #pragma unroll
-            for (int t = 0; t < 4; ++t)
-                s = __fmaf_rn(x4[t], fp8e4m3_gemv((uint8_t)(b4 >> (8 * t))), s);
-            sub[m] = s;
+            for (int m = 0; m < MT; ++m) {
+                const float4 xv = ((const float4*)xs[m])[lane];
+                const float x4[4] = { xv.x, xv.y, xv.z, xv.w };
+                float s = 0.0f;
+#pragma unroll
+                for (int t = 0; t < 4; ++t)
+                    s = __fmaf_rn(x4[t], fp8e4m3_gemv((uint8_t)(b4 >> (8 * t))), s);
+                sub[m] = s;
+            }
         }
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
@@ -411,7 +478,7 @@ template <bool DBUF>
 __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_m64_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint16_t*,
     int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int) {}
-template <int MT, int W>
+template <int MT, int W, bool D2>
 __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint16_t*,
     int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int) {}
@@ -651,6 +718,9 @@ void f8_launch_tile(const F8Plan& P, void* ydata, int64_t y_pitch, RadStream s,
     static const bool no_dec  = getenv("R3D_NO_FP8_DEC") != nullptr;
     static const bool no_pf   = getenv("R3D_NO_GEMV_PF") != nullptr;   /* issue #7 A/B */
     static const int  pf_w    = getenv("R3D_GEMV_PF_W") ? atoi(getenv("R3D_GEMV_PF_W")) : 8;
+    /* Q9 dot2 arm: R3D_FP8A8_D2 selects the f16-pair dot2c inner; the literal "0"
+     * withdraws (house lever law). Default OFF -- tol-graded arm, gates+bench first. */
+    static const bool d2      = getenv("R3D_FP8A8_D2") && strcmp(getenv("R3D_FP8A8_D2"), "0") != 0;
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
 
     /* Decode band (issue #4): at M <= 8 the width row reads every weight byte once.
@@ -660,28 +730,34 @@ void f8_launch_tile(const F8Plan& P, void* ydata, int64_t y_pitch, RadStream s,
     if (!no_dec && P.M <= 8 && (P.b_pitch % 4) == 0 && (((uintptr_t)P.B & 3) == 0)) {
         const int mt = P.M >= 8 ? 8 : P.M >= 4 ? 4 : P.M >= 2 ? 2 : 1;
         dim3 grid((unsigned)((P.N + 7) / 8));
-        #define R3D_F8_GEMV(MT_, W_)                                                   \
-            hipLaunchKernelGGL((gemm_nt_fp8a8_gemv_kernel<MT_, W_>), grid,             \
+        #define R3D_F8_GEMV(MT_, W_, D_)                                               \
+            hipLaunchKernelGGL((gemm_nt_fp8a8_gemv_kernel<MT_, W_, D_>), grid,         \
                                dim3(kThreads),                                         \
                                0, stream, P.A, P.B, (uint16_t*)ydata, P.AS, P.BS,      \
                                (int)P.M, (int)P.N, (int)P.K, P.as_cols, P.bs_cols,     \
                                P.a_pitch, P.b_pitch, y_pitch, P.as_pitch, P.bs_pitch,  \
                                P.rblk)
-        #define R3D_F8_GEMV_SW(W_)                            \
+        #define R3D_F8_GEMV_SW(W_, D_)                        \
             switch (mt) {                                     \
-                case 1: R3D_F8_GEMV(1, W_); break;            \
-                case 2: R3D_F8_GEMV(2, W_); break;            \
-                case 4: R3D_F8_GEMV(4, W_); break;            \
-                default: R3D_F8_GEMV(8, W_); break;           \
+                case 1: R3D_F8_GEMV(1, W_, D_); break;        \
+                case 2: R3D_F8_GEMV(2, W_, D_); break;        \
+                case 4: R3D_F8_GEMV(4, W_, D_); break;        \
+                default: R3D_F8_GEMV(8, W_, D_); break;       \
             }
-        if (no_pf)        { R3D_F8_GEMV_SW(1)  }
-        else if (pf_w == 16) { R3D_F8_GEMV_SW(16) }
-        else              { R3D_F8_GEMV_SW(8)  }
+        if (!d2) {
+            if (no_pf)         { R3D_F8_GEMV_SW(1,  false) }
+            else if (pf_w == 16) { R3D_F8_GEMV_SW(16, false) }
+            else               { R3D_F8_GEMV_SW(8,  false) }
+        } else {
+            if (no_pf)         { R3D_F8_GEMV_SW(1,  true) }
+            else if (pf_w == 16) { R3D_F8_GEMV_SW(16, true) }
+            else               { R3D_F8_GEMV_SW(8,  true) }
+        }
         #undef R3D_F8_GEMV_SW
         #undef R3D_F8_GEMV
         if (getenv("R3D_DEBUG_GEMM")) {
             static bool once = false;
-            if (!once) { once = true; fprintf(stderr, "libr3d: fp8a8 decode gemv launched (mt=%d)\n", mt); }
+            if (!once) { once = true; fprintf(stderr, "libr3d: fp8a8 decode gemv launched (mt=%d d2=%d)\n", mt, (int)d2); }
         }
         return;
     }
