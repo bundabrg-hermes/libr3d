@@ -2038,3 +2038,54 @@ liveness %; Y-dump for cross-arm md5). Runners cat ~/scratch/r3d/q1_ab{,2}.sh.
 Shadow-container note: the first one went zombie on teardown without --init (took
 a second before the runtime reaped it); q1serve2 ran --init and died cleanly.
 Always --init for serve shadows.
+
+## Q10 closed SHIPPED: fp8 KV staging was a byte walk, and it was the whole story (2026-10-25)
+
+The queue's literal premise (donor 3-inst `v_perm + v_pk_ashrrev_i16 + v_and_b32`
+e4m3->f16 widening) is FALSIFIED for this kernel family before any card time: the
+WMMA attention fragments are pinned `bf16` (the f16 output cannot be consumed), and
+the widening trick's exactness rests on the f16 subnormal lattice catching the
+shifted e4m3 subnormals arithmetically -- bf16 has no such lattice at that scale.
+But the disassembly of the shipped v129 fp8 staging loop told the real story, and
+it was bigger than the decode: per-BYTE `global_load_d16_u8`, an exec-mask branch
+DANCE around the shipped ternary decode (`v_cmpx_ne` + `s_xor`/
+`s_and_not1_saveexec` + `s_cbranch_execz` + re-merge), and per-byte 16-bit LDS
+stores. Staging, not attention, was the fp8 cost center.
+
+The shipped arm (R3D_F8ST default 3): a 256-entry per-block LDS LUT built from the
+SHIPPED `fp8_to_bf16_w` (identical decode by construction, NaN codes included),
+8-byte global gathers (kv_sd==1 + RB[]%8 gates, Q1 pad law honored -- zero LDS
+repadding; row starts are already 16B at pitch D+8), and 16B LDS stores. Gate miss
+reruns the tile on the scalar LUT walk (still ~+9%). Dark arms: 1 = branchless VALU
+decode (the select IS the branch's truth table -- both sides are pure), 2 = LUT
+scalar, 0 = verbatim withdrawal. R3D_DBG forces verbatim (the dbg wire bypasses
+stage_kv_tile; same law as DBUF).
+
+Identity: battery 10/10 on v130, arms st0..st3 all 160/160 attn cases on the fp8
+pack with worst rel_l2 0.00e+00; full/attr/df2/df3/fp8 byte-identical v129.
+Promotion battery on v131 (default-3): all six legs green, withdrawal arm
+byte-equal to the recorded st0 report, stock/full byte-identical v129.
+
+A/B (v129 vs st0/1/2/3, 3 interleaved rounds, hash-equal on every geometry,
+KVH=4 + 12 rotating planes to put decode KV past L2): st3 **+33..+40% hd64,
++75..+154% hd128** (decode and prefill alike), st2 +8..11%, st1 +3..6%, every
+spread disjoint; st0 (the codegen-jitter control) +-0.3%.
+
+The st0 control existed because of a NEW TRAP found this card-pass: declaring the
+LUT as a dead 1-element `__shared__` array for the F8ST==0 instantiations --
+never referenced, `if constexpr`-guarded away -- RE-SCHEDULES the prologue of
+EVERY instantiation in the TU (bf16 arms included; instruction-level diff moves
+from the 10th line while vgpr/lds descriptors stay byte-equal). Compiler-codegen
+claims about UNCHANGED arms must therefore be adjudicated by output fingerprints
+(the battery) plus a timing control (st0), not by objdump. Filed for Q19.
+
+Serve: spec9g serves bf16 KV and never issues these arms; v131's bf16
+fingerprints are byte-identical v129, so per the Q18 precedent no swap rode the
+change (serve stays build_v129; the next fp8-KV deployment mounts build_v131+).
+
+Harness: attn_bench AB_KVDT=f8 (fp8 planes, NaN codes excluded, byte-width
+allocs, dtype tag in the print); gate.sh passes R3D_F8ST + R3D_ATTN_NO_DBUF into
+the battery env. Runners cat ~/scratch/r3d/q10_gates.sh, q10_ab.sh,
+q10_promote_gates.sh. Two host-execution laws re-earned: bench binaries run
+INSIDE the device container (host hipGetDevice = phantom run), and scratch paths
+mount at /scratch in-container, not /scratch/r3d.
