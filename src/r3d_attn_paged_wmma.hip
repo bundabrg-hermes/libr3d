@@ -262,13 +262,14 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
 #else
     if (dbuf < 0) dbuf = getenv("R3D_ATTN_NO_DBUF") ? 0 : 1;
 #endif
-    /* Q10 fp8 staging arms (see r3d_attn_wmma_body.inc stage_kv_tile). */
+    /* Q10 fp8 staging arms: DEFAULT 3 (see r3d_attn_paged_decode.hip for the
+     * promotion evidence); R3D_F8ST overrides; R3D_DBG forces verbatim. */
     static int f8st = -1;
 #ifdef R3D_DBG
     f8st = 0;
 #else
-    if (f8st < 0) { const char* sv = getenv("R3D_F8ST"); f8st = sv ? atoi(sv) : 0;
-                    if (f8st < 0 || f8st > 3) f8st = 0; }
+    if (f8st < 0) { const char* sv = getenv("R3D_F8ST"); f8st = sv ? atoi(sv) : 3;
+                    if (f8st < 0 || f8st > 3) f8st = 3; }
 #endif
 
     const unsigned bm = v3 ? (unsigned)kBM3 : (unsigned)kBM;

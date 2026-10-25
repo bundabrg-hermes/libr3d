@@ -397,16 +397,18 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
 #else
     if (dbuf < 0) dbuf = getenv("R3D_ATTN_NO_DBUF") ? 0 : 1;
 #endif
-    /* Q10 fp8 staging arms (stage_kv_tile's F8ST slot): 0 verbatim default,
-     * 1 branchless VALU decode, 2 LDS LUT, 3 LUT + wide gather. Read once per
-     * process. R3D_DBG forces verbatim: the dbg wire keeps its own instrumented
-     * scalar loop that bypasses stage_kv_tile (same law as DBUF above). */
+    /* Q10 fp8 staging arms (stage_kv_tile's F8ST slot). DEFAULT 3 (LUT + wide
+     * gather): the 2026-10-25 A/B (3 interleaved rounds, hash-equal, disjoint
+     * spreads) put st3 +33..+154% over v129, st2 +8..11%, st1 +3..6%. R3D_F8ST
+     * overrides: 0 verbatim withdrawal, 1 branchless VALU, 2 LUT scalar. Read
+     * once per process. R3D_DBG forces verbatim: the dbg wire keeps its own
+     * instrumented scalar loop that bypasses stage_kv_tile (same law as DBUF). */
     static int f8st = -1;
 #ifdef R3D_DBG
     f8st = 0;
 #else
-    if (f8st < 0) { const char* sv = getenv("R3D_F8ST"); f8st = sv ? atoi(sv) : 0;
-                    if (f8st < 0 || f8st > 3) f8st = 0; }
+    if (f8st < 0) { const char* sv = getenv("R3D_F8ST"); f8st = sv ? atoi(sv) : 3;
+                    if (f8st < 0 || f8st > 3) f8st = 3; }
 #endif
     const bool dbuf_ok = dbuf && !v2 && kvbf && (P.kv_sd == 1) && ((((uintptr_t)P.kv) & 15) == 0);
     #define R3D_DK_LAUNCH4(K, D, KV, SK, DB, FD)                                                           \
