@@ -1462,7 +1462,7 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
                                    dim3((unsigned)P.N), dim3(32), 0, stream, plane,    \
                                    q8x_x8, q8x_sg, P.AS, (uint16_t*)Y->data,           \
                                    (int)P.M, (int)P.N, (int)P.K, P.y_pitch, P.as_pitch,\
-                                   q8x_nt, q8x_pf)
+                                   q8x_nt, q8x_pf, q8x_dpp)
             switch (mt) {
                 case 1: R3D_M4_Q8X(1); break;
                 case 2: R3D_M4_Q8X(2); break;
@@ -1475,8 +1475,8 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
                 if (getenv("R3D_DEBUG_GEMM")) {
                     static bool once = false;
                     if (!once) { once = true;
-                        fprintf(stderr, "libr3d: mxfp4 q8x dot4 arm launched (mt=%d pf=%d)\n",
-                                mt, q8x_pf); }
+                        fprintf(stderr, "libr3d: mxfp4 q8x dot4 arm launched (mt=%d pf=%d dpp=%d)\n",
+                                mt, q8x_pf, q8x_dpp); }
                 }
                 return RAD_OK;
             }
