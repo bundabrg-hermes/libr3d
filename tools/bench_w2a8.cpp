@@ -24,8 +24,8 @@
 #include <ctime>
 #include <algorithm>
 #include <vector>
-#include "radiance/rad_abi.h"
-#include "radiance/rad_types.h"
+#include "rad_abi.h"
+#include "rad_types.h"
 #include "rad_planes.h"
 
 static void die(const char* m, hipError_t e) { if (e == hipSuccess) return;
