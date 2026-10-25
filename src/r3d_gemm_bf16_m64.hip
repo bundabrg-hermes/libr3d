@@ -422,9 +422,11 @@ int r3d_gemm_nt_m64_launch(const void* A, const void* B, void* Y, float* Yf,
     }
     static const bool dbuf = getenv("R3D_GEMM_NO_DBUF") == nullptr;
     /* Q1 arms, both dark until released: vec staging (MT>=2 rows, aligned
-     * operands, DBUF schedule) and the K%4096==0-gated issue rotation on top. */
-    static const bool vec  = getenv("R3D_M64_VEC") != nullptr;
-    static const bool rot  = getenv("R3D_M64_ROT") != nullptr;
+     * operands, DBUF schedule) and the K%4096==0-gated issue rotation on top.
+     * Withdraw law (issue #6/Q6): the literal "0" is OFF, any other set value
+     * is ON. */
+    static const bool vec  = getenv("R3D_M64_VEC")  && strcmp(getenv("R3D_M64_VEC"),  "0") != 0;
+    static const bool rot  = getenv("R3D_M64_ROT")  && strcmp(getenv("R3D_M64_ROT"),  "0") != 0;
     dim3 grid((unsigned)((N + kNB - 1) / kNB), (unsigned)((M + kMB - 1) / kMB));
     const int MT = (M + kMB - 1) / kMB;
     const bool vec_ok = vec && dbuf && MT >= 2 &&

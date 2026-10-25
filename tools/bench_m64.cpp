@@ -64,8 +64,8 @@ int main(int argc, char** argv) {
     // Which arm DO WE EXPECT for this shape? Mirrors the launcher's gates so a
     // bench line can never quietly measure a different arm than it claims.
     const int MT = (M + 63) / 64;
-    const bool vec   = getenv("R3D_M64_VEC") != nullptr;
-    const bool ronen = getenv("R3D_M64_ROT") != nullptr;
+    const bool vec   = getenv("R3D_M64_VEC") && strcmp(getenv("R3D_M64_VEC"), "0") != 0;
+    const bool ronen = getenv("R3D_M64_ROT") && strcmp(getenv("R3D_M64_ROT"), "0") != 0;
     const bool vec_ok = vec && MT >= 2 && (K % 8 == 0);   // pitch=K here; bases 256B
     const bool expect_rot = vec_ok && ronen && (K % 4096 == 0);
     printf("ARM expected=%s MT=%d K%%4096=%d\n",
