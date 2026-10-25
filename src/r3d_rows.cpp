@@ -1190,7 +1190,10 @@ extern "C" int r3d_rad_gemm_nt_q_fp8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q_fp8_decode(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q_mxfp4_decode(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q_mxfp4_decode_q8x(const RadArgs*, RadStream);
-bool r3d_mxfp4_q8x_off(void);   /* r3d_gemm_mxfp4.hip: default ON, literal "0" withdraws */
+extern "C" bool r3d_mxfp4_q8x_off(void);   /* r3d_gemm_mxfp4.hip: default ON, literal
+   "0" withdraws. extern "C" BOTH sides: this file's body sits inside the header's
+   extern "C" {" block (line 14), so a bare declaration silently asks for C linkage
+   while a C++ definition mangles -- undefined symbol only at dlopen, never at link. */
 extern "C" int r3d_rad_gemm_nt_q_gated_fp8(const RadArgs*, RadStream);
 extern "C" int64_t r3d_rad_gemm_nt_q_gated_fp8_scratch(const RadArgs*);
 extern "C" int r3d_rad_logits_gemm_e4m3(const RadArgs*, RadStream);

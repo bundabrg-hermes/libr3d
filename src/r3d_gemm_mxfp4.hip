@@ -1166,7 +1166,7 @@ extern "C" int r3d_rad_gemm_nt_q_mxfp4_decode_q8x(const RadArgs* a, RadStream s)
  * r3d_rows.cpp consults it at the rad_kernel_count/rad_kernel_at registration gate
  * (withdraw the sibling row -> band resolves to the legacy decode row), and this TU
  * mirrors it as a pure backstop in the arm entry. */
-bool r3d_mxfp4_q8x_off(void) {
+extern "C" bool r3d_mxfp4_q8x_off(void) {
     static const bool off = [] {
         const char* e = getenv("R3D_MXFP4_Q8X");
         return e && !strcmp(e, "0");
