@@ -166,7 +166,6 @@ __device__ __forceinline__ int w2_xs_idx(int j, int kk) {   /* j = kk >> 7 (0..3
 
 /* MT activation rows per block; W = prefetch window in dwords (a dword covers FOUR scale
  * groups -- the fp8 row's PF law, issue #7, with the window counted in load units). */
-template <int MT, int W>
 /* Q22 (REVIEW_QUEUE): RDNA3 DPP row_xmask folds on this row's butterflies --
  * Q6's primitive, second row, from the Q19 census (tree's largest default-path
  * ds_bpermute cluster: 468 static at each <MT=4,W=16> q8 leg, shared by both
@@ -232,6 +231,7 @@ __device__ __forceinline__ void w2_fold_tail_i32(int32_t* s, const bool dpp) {
     }
 }
 
+template <int MT, int W>
 __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_kernel(
     const int8_t* __restrict__ A,       /* [M, a_pitch] i8 codes, step order */
     const uint8_t* __restrict__ B,      /* [N, b_pitch] u2 codes, dense (stored as is) */
