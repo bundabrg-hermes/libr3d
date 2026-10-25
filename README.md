@@ -115,7 +115,8 @@ or to the host. Use them to A/B a band or bisect a suspect kernel:
 | `R3D_NO_FP8A8` | all fp8 GEMM rows withdraw (bands place on host) |
 | `R3D_NO_FP8_DEC` | fp8 decode band returns to the m64 tile |
 | `R3D_NO_MXFP4` | mxfp4 GEMM rows withdraw |
-| `R3D_NO_FP4_DEC` | mxfp4 decode band returns to the m64 tile |
+| `R3D_NO_FP4_DEC` | mxfp4 decode band (both width-row legs) returns to the m64 tile |
+| `R3D_MXFP4_Q8X=0` | the dot4 q8x mxfp4 decode arm (default ON) withdraws at registration; the band re-resolves to the legacy width row. Unlike the `R3D_NO_*` presence levers this one reads a value: unset or `1` = arm on, the literal `0` = arm off |
 | `R3D_NO_GDN` | gated-delta-net rows withdraw |
 | `R3D_NO_ANCHOR` | withdraws the recurrent rows' speculative anchor state-form |
 | `R3D_NO_DFLASH` | drafter family withdraws: dflash conv/select, logit rerank, w2a8 draft GEMV |

@@ -1031,6 +1031,9 @@ enum { R3D_PRIO_ATTN_DECODE = 1100 };   /* split-KV rows win the decode band fro
 enum { R3D_PRIO_FP8_DECODE  = 1100 };   /* same law for gemm_nt_q: the width row wins
                                            M <= 8 from the m64 tile (issue #4) */
 enum { R3D_PRIO_MXFP4_DECODE = 1100 };  /* the mxfp4 band's own width row (issue #5) */
+enum { R3D_PRIO_MXFP4_Q8X    = 1200 };  /* the dot4 q8x arm wins the same band from the
+                                           legacy width row by default (2026-10-25
+                                           promotion); =0 withdraws it at registration */
 enum { R3D_PRIO_W2A8_DECODE = 1100 };   /* same law: the width row owns the band; nothing
                                          * else in this plugin claims w2a8 at all */
 
@@ -1186,6 +1189,8 @@ extern "C" int r3d_rad_gemm_nt_q(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q_fp8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q_fp8_decode(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q_mxfp4_decode(const RadArgs*, RadStream);
+extern "C" int r3d_rad_gemm_nt_q_mxfp4_decode_q8x(const RadArgs*, RadStream);
+bool r3d_mxfp4_q8x_off(void);   /* r3d_gemm_mxfp4.hip: default ON, literal "0" withdraws */
 extern "C" int r3d_rad_gemm_nt_q_gated_fp8(const RadArgs*, RadStream);
 extern "C" int64_t r3d_rad_gemm_nt_q_gated_fp8_scratch(const RadArgs*);
 extern "C" int r3d_rad_logits_gemm_e4m3(const RadArgs*, RadStream);
@@ -1436,6 +1441,26 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_MXFP4_DECODE,
   cMxfp4DecodeRow, 3, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_gemm_nt_q_mxfp4_decode },
+
+{ "gemm_nt_q_mxfp4_decode_q8x", "gemm_nt_q", "gemm",
+  "mxfp4a8 decode-band dot4 q8x arm (DEFAULT ON, 2026-10-25 promotion): one wave32 per "
+  "weight row over the plugin's own interleaved byte plane (one i8 = e2m1 code x2 with "
+  "the e8m0 group scales woven as 136B headers, repacked lazily once per tensor on the "
+  "plugin stream), i8 activations requantized per dispatch, four signed v_dot4_i32_iu8 "
+  "dots per lane per sixteen codes; the per-group flush keeps the shipped quant_dot "
+  "order. Measured +23.5% serve decode median over the legacy walk (2026-10-24 pair)",
+  "same band as the legacy width row (M <= 8, K % 128) plus the arm's own plan gate "
+  "K % 256 == 0 -- K % 256 == 128 and every arm-unavailable geometry (plane build, "
+  "VRAM headroom, launch) serve the legacy walk IN-PLACE from the same entry; the "
+  "plane cache is per (B, BS, N, K), never freed",
+  "fp8_e4m3 a with f32 a_scale per (row, 128 K), e2m1 b with E8M0 b_scale per "
+  "(row, 32 K), bf16 y; b_ref accepted and ignored; a_sum refused. R3D_MXFP4_Q8X=0 "
+  "(literal \"0\") withdraws this row at the registration gate and the band resolves "
+  "to the legacy decode row -- the kill switch is a re-resolve, never an entry-time "
+  "refusal (issue #4 law); R3D_NO_FP4_DEC / R3D_NO_MXFP4 withdraw this row too",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_MXFP4_Q8X,
+  cMxfp4DecodeRow, 3, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_gemm_nt_q_mxfp4_decode_q8x },
 
 { "gemm_nt_q_w2a8_decode", "gemm_nt_q", "gemm",
   "w2a8 decode-band GEMV (the DFlash2 draft head): warp per weight row. The q8 arm "
@@ -1953,9 +1978,16 @@ static bool r3d_row_hidden(const char* op) {
  * R3D_NO_FP8A8=1 withdraws all three fp8a8 rows (the bands then place on the host, as
  * they did before the rows shipped); R3D_NO_FP8_DEC=1 withdraws only the decode row, so
  * the M <= 8 band falls to the m64 tile on the same .so -- the issue #4 A/B arm.
- * R3D_NO_FP4_DEC=1 is that same lever for the mxfp4 band (issue #5). R3D_NO_MXFP4=1
- * withdraws both mxfp4 rows: it was the pre-registration-gdn lever and carried the same
- * latent abort fault #4 caught -- the entry-level refusal now only backstops the gate.
+ * R3D_NO_FP4_DEC=1 is that same lever for the mxfp4 band (issue #5): since the 2026-10-25
+ * q8x promotion it withdraws BOTH width-row legs (legacy walk and q8x sibling) so the
+ * band lands whole on the m64 tile -- a lever that hid one leg and left the sibling
+ * registered would hand the A/B arm an entry whose backstop refuses (issue #4 class).
+ * R3D_MXFP4_Q8X default-ON law: the dot4 q8x arm is its own row
+ * (gemm_nt_q_mxfp4_decode_q8x, priority 1200); the literal R3D_MXFP4_Q8X=0 withdraws
+ * only that sibling at this gate, and the band resolves to the legacy decode row --
+ * byte-identical pre-arm behaviour. R3D_NO_MXFP4=1
+ * withdraws all three mxfp4 rows: it was the pre-registration-gdn lever and carried the
+ * same latent abort fault #4 caught -- the entry-level refusal now only backstops the gate.
  * The op schemas stay declared either way: gemm_nt_q/gated keep their other-encoding
  * rows. */
 static bool r3d_band_row_hidden(const RadKernelInfo& k) {
@@ -1965,12 +1997,16 @@ static bool r3d_band_row_hidden(const RadKernelInfo& k) {
     static const bool no_mxd  = getenv("R3D_NO_FP4_DEC") != nullptr;
     static const bool no_df   = getenv("R3D_NO_DFLASH") != nullptr;
     static const bool no_ngb  = getenv("R3D_NO_NGRAM_BAN") != nullptr;
+    static const bool q8x_off = r3d_mxfp4_q8x_off();
     if (no_ngb && !strcmp(k.op, "sample_ngram_ban")) return true;   /* engine sampler band */
     if (no_df && (!strcmp(k.op, "dflash_conv") || !strcmp(k.op, "dflash_select") ||
                   !strcmp(k.op, "logit_rerank") ||
                   !strcmp(k.name, "gemm_nt_q_w2a8_decode"))) return true;   /* drafter family (issue #9) */
     if (!strcmp(k.name, "gemm_nt_q_fp8a8_decode")) return no_fp8 || no_f8d;
     if (!strcmp(k.name, "gemm_nt_q_mxfp4_decode")) return no_mx || no_mxd;
+    /* the q8x sibling rides every mxfp4-band lever (never leave one leg of a band
+     * registered while its family lever hides the other), plus its own OFF lever */
+    if (!strcmp(k.name, "gemm_nt_q_mxfp4_decode_q8x")) return no_mx || no_mxd || q8x_off;
     if (!strcmp(k.name, "gemm_nt_q_mxfp4"))        return no_mx;
     return no_fp8 && (!strcmp(k.name, "gemm_nt_q_fp8a8") ||
                       !strcmp(k.name, "gemm_nt_q_gated_fp8a8"));

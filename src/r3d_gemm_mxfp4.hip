@@ -45,8 +45,10 @@
  * double-buffered, B single (block 06's measured rule); R3D_GEMM_NO_DBUF=1 takes the
  * serialized arm; R3D_NO_MXFP4=1 refuses the row entirely so the engine answers from the
  * host reference -- the serve A/B kill switch, no remount needed. R3D_NO_FP4_DEC=1 withdraws
- * only the decode row (the band falls to the m64 tile); R3D_MXFP4_Q8X=1 opts the decode row
- * into the dot4 q8x arm (the repacked byte-plane walk, see the arm's block comment).
+ * the decode band (both width-row legs: the legacy walk and the q8x sibling; the band
+ * falls to the m64 tile); R3D_MXFP4_Q8X=0 (the literal "0") withdraws ONLY the q8x
+ * sibling row and the band lands on the legacy byte-plane walk -- see the arm's block
+ * comment for the default-on law.
  */
 
 #include <hip/hip_runtime.h>
@@ -1142,14 +1144,43 @@ static int r3d_gemm_nt_q_impl(const RadArgs* a, RadStream s) {
  * actually re-resolves. The dword-per-lane walk pins B's 4-byte alignment; anything odd
  * rides the tile. b_ref is accepted and ignored like the tile's (the fp8 decode row
  * refuses it -- at the fp8 encoding ref refuses b_ref at all, at mxfp4a8 it is a legal
- * derived plane both host libraries ignore). */
-static int r3d_gemm_nt_q_m4dec_impl(const RadArgs*, RadStream);
+ * derived plane both host libraries ignore).
+ *
+ * Since the 2026-10-25 promotion this entry is the LEGACY leg: the dot4 q8x arm lives
+ * on the sibling row gemm_nt_q_mxfp4_decode_q8x (same op, same constraints, priority
+ * 1200), which the resolver wins by default; R3D_MXFP4_Q8X=0 withdraws the sibling at
+ * the registration gate and the band lands back HERE, byte-identical to the pre-arm
+ * builds. This entry never runs the arm even if the env says otherwise -- the lever
+ * resolved at registration; an entry that disagreed with the resolver is the issue #4
+ * failure class. The env-decides-at-entry shape survives only for levers whose arms
+ * fall back IN-PLACE (dot2, PF, CH, RP). */
+static int r3d_gemm_nt_q_m4dec_impl(const RadArgs*, RadStream, bool q8x_allowed);
+static int r3d_m4dec_legacy(const RadArgs* a, RadStream s) { return r3d_gemm_nt_q_m4dec_impl(a, s, false); }
+static int r3d_m4dec_q8x(const RadArgs* a, RadStream s)    { return r3d_gemm_nt_q_m4dec_impl(a, s, true); }
 extern "C" int r3d_rad_gemm_nt_q_mxfp4_decode(const RadArgs* a, RadStream s)
-    R3D_DUMP_WRAP("gemm_nt_q_mxfp4_decode", r3d_gemm_nt_q_m4dec_impl)
-static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s) {
+    R3D_DUMP_WRAP("gemm_nt_q_mxfp4_decode", r3d_m4dec_legacy)
+extern "C" int r3d_rad_gemm_nt_q_mxfp4_decode_q8x(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("gemm_nt_q_mxfp4_decode_q8x", r3d_m4dec_q8x)
+
+/* The q8x OFF lever: DEFAULT ON; the literal value "0" is the only off spelling.
+ * r3d_rows.cpp consults it at the rad_kernel_count/rad_kernel_at registration gate
+ * (withdraw the sibling row -> band resolves to the legacy decode row), and this TU
+ * mirrors it as a pure backstop in the arm entry. */
+bool r3d_mxfp4_q8x_off(void) {
+    static const bool off = [] {
+        const char* e = getenv("R3D_MXFP4_Q8X");
+        return e && !strcmp(e, "0");
+    }();
+    return off;
+}
+
+static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8x_allowed) {
     static const bool no_mxfp4 = getenv("R3D_NO_MXFP4") != nullptr ||
                                  getenv("R3D_NO_FP4_DEC") != nullptr;
     if (no_mxfp4) return RAD_E_UNSUPPORTED;
+    if (q8x_allowed && r3d_mxfp4_q8x_off()) return RAD_E_UNSUPPORTED;  /* backstop: the
+        registration gate already withdrew this row whenever this predicate holds --
+        the legacy entry is UNCONDITIONAL here, it is the fallback leg itself */
 
     const RadTensor* A    = rad_arg_in(a, 0);
     const RadTensor* AS   = rad_arg_in(a, 1);
@@ -1213,7 +1244,7 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s) {
         }
     }
 
-    /* ---- the dot4 q8x arm (hipfire Phase B, 2026-10-24): opt-in R3D_MXFP4_Q8X=1.
+    /* ---- the dot4 q8x arm (hipfire Phase B, 2026-10-24) ----------------------------------
      *
      * Plane cache: the w2a8 q8 rule verbatim -- the plugin's OWN repack plane per
      * weight tensor, built lazily ONCE on the plugin's own non-blocking stream and
@@ -1229,8 +1260,16 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s) {
      * engine selected this row at declare; a refusal is an abort). Failed keys are
      * remembered so a VRAM-tight serve does not re-hipMemGetInfo per launch.
      * Gate: K % 256 == 0 (the probe's own span closure) and a scratch ceiling;
-     * every other geometry the band accepts rides the shipped legs untouched. */
-    static const bool q8x_on = getenv("R3D_MXFP4_Q8X") != nullptr;
+     * every other geometry the band accepts rides the shipped legs untouched.
+     *
+     * 2026-10-25 PROMOTION: the arm is DEFAULT ON -- the resolver reaches it through
+     * the sibling row gemm_nt_q_mxfp4_decode_q8x (this same impl with q8x_allowed=true);
+     * R3D_MXFP4_Q8X=0 withdraws that row at the registration gate (r3d_rows.cpp) and
+     * the band resolves to the legacy entry, which never takes this branch. The lever
+     * is read ONCE at registration, never here. Every failure the arm can hit still
+     * falls back IN-PLACE to the shipped walk (never a refusal: the engine selected
+     * this row at declare). */
+    const bool q8x_on = q8x_allowed;
     if (q8x_on && (P.K & 255) == 0 && P.K <= (1 << 20)) {
         struct Q8xEnt { const void* b; const void* bs; int64_t n, k; uint8_t* plane; };
         static std::vector<Q8xEnt> q8x_cache, q8x_failed;
