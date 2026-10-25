@@ -933,9 +933,13 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
      * set resident, repacked set streaming) M=1 +15%. MT=16 LOSES -1..-3% non-overlapping
      * -- the expansion VALU prices the wide tile past the 4x traffic cut, the same
      * per-geometry law that gates the Q18 register window, so MT>=16 keeps the repack
-     * walk and its cache verbatim. Opt-out: R3D_W2_C4=0 (withdrawal arm, gated byte-
-     * equal); the packed walk expands with the repack kernel's own helper, so outputs
-     * are bit-identical to the repack walk at every M (repro 13/13 exact both arms). */
+     * walk and its cache verbatim. [Q12c RE-ADJUDICATES that sentence, v139: the MT=16
+     * loss measured here was taken on the SCRATCH-DEMOTEDED walk. With Q18b's register
+     * sub-window the packed plane wins the wide tile by +9.9% cold / +15.4% cache-fit,
+     * and the packed gate now follows the window, not the tile size.] Opt-out: R3D_W2_C4=0
+     * (withdrawal arm, gated byte-equal); the packed walk expands with the repack
+     * kernel's own helper, so outputs are bit-identical to the repack walk at every M
+     * (repro 13/13 exact both arms). */
     static const bool no_c4 = getenv("R3D_W2_C4") && atoi(getenv("R3D_W2_C4")) == 0;
     /* Q22 (REVIEW_QUEUE): DPP row_xmask butterfly folds (Q6's primitive on this
      * row). Bit-identical by construction -- q22_probe lane-exact, 4.19e9 lane
@@ -945,29 +949,42 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
      * verbatim shfl chain (literal "0", the lever law). */
     static const bool w2_dpp = !(getenv("R3D_W2_DPP") &&
                                  !std::strcmp(getenv("R3D_W2_DPP"), "0"));
-    /* Q18b/Q12c (REVIEW_QUEUE): the wide-tile (MT>=8) window schedule. 0 = the verbatim
-     * shipped walk (default; MT>=8 keeps paying the scratch demotion, measured as the
-     * cheaper of the two known costs at these tiles); 2/4 = sub-window register walk
-     * (Q18's fix at depth WC); -8 = select-window (one body copy, static-index reads).
-     * All three consume dwords in the same order, so every arm is bit-identical; the
-     * A/B adjudicates the speed. Only W=8 (the shipped pf_w) carries WC arms: the
-     * opt-in pf_w=16 ladder keeps its verbatim walk. R3D_W2_C4_WIDE extends the Q12
-     * packed gate to MT=16 when a WC arm is selected (Q12c: does a shallower window
-     * recover the -1..-3% the packed walk lost at the wide tile?). */
-    static const int  w2_wc_raw = getenv("R3D_W2_WC") ? atoi(getenv("R3D_W2_WC")) : 0;
-    static const bool c4_wide   = getenv("R3D_W2_C4_WIDE") != nullptr;
-    const int  w2_wc = (w2_wc_raw == 2 || w2_wc_raw == 4 || w2_wc_raw == -8)
-                           ? w2_wc_raw : 0;
+    /* Q18b/Q12c SHIPPED default-ON at the wide tile (A/B on v138, same binary, lever
+     * the only axis, 3 interleaved rounds, spreads disjoint -- ~/scratch/r3d/q18_gates
+     * .log + q18_ab2.log): at M=14 cold (both plane sets past L2) the sub-window walk
+     * on the PACKED plane (wc2+c4) is +9.9% and on the repack plane +3.5%; in the
+     * cache-fit regime +15.4% / +9.3%; the select-window arm LOSES -60% (the census
+     * called it before the card: keeping all W uint4 operands live costs 160 B of
+     * private scratch vs the 144 B it replaces). Q12's MT=16 gate-out is therefore
+     * RE-ADJUDICATED: the wide-tile loss was never the expansion VALU -- it was the
+     * expansion riding a scratch-demoted walk. Packed (cw0) on the VERBATIM walk is
+     * still -0.8% (that arm is dispatch-identical to base, so it is also this run's
+     * jitter control), and at MT=8 every WC arm is parity (packed staging already
+     * keeps its window in registers), so the policy applies the sub-window at MT=16
+     * ONLY and MT=8 keeps its shipped schedule untouched.
+     * Withdrawal: R3D_W2_WC=0 restores the exact pre-Q18b dispatch (repack plane +
+     * verbatim walk at MT=16); device code for that arm is byte-equal to v137. */
+    static const int  wc_raw = getenv("R3D_W2_WC") ? atoi(getenv("R3D_W2_WC")) : 0x7FFF;
+    static const bool wc_auto = wc_raw == 0x7FFF;
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
     /* MT rounds UP to cover M: the tile computes min(M, MT) rows and there is no
      * m-loop, so MT < M silently drops rows (serve 2026-10-24: the drafter's block
      * pass collapses the draft rows to 7 -- the old down-round picked MT=4 and
      * lost 3). The band's M<=16 bound makes the 16 tile the ceiling. */
     const int mt = P.M >= 9 ? 16 : P.M >= 5 ? 8 : P.M >= 3 ? 4 : P.M >= 2 ? 2 : 1;
+    /* Window policy for the wide tiles (see the Q18b note above): auto = the depth-2
+     * sub-window at MT=16, the verbatim walk everywhere else. An explicit R3D_W2_WC
+     * overrides both tiles the arms are instantiated for (8 and 16); an unrecognised
+     * value falls back to 0 (the shipped walk), never to a silent guess. The WC arms
+     * exist on the shipped W=8 prefetch ladder only -- any other ladder takes 0. */
+    const int wc = (!no_pf && pf_w == 8)
+        ? (wc_auto ? (mt >= 16 ? 2 : 0)
+                   : (wc_raw == 0 || wc_raw == 2 || wc_raw == 4 || wc_raw == -8) ? wc_raw : 0)
+        : 0;
     /* the family kill-switch withdraws BOTH q8 fast arms (sibling-row law): C4 too. */
-    const bool c4 = ((mt <= 8) || (c4_wide && w2_wc != 0 && !no_pf && pf_w == 8))
-                        && !no_c4 && !no_q8;   /* Q12 gate: MT=16 keeps the repack walk
-                                                  unless Q18b's WC arm is selected */
+    const bool c4 = (mt <= 8 || wc != 0) && !no_c4 && !no_q8;   /* Q12 + Q12c: the packed
+        plane serves every tile whose walk is register-resident (wc != 0); with the
+        withdrawal lever set it retracts to MT<=8 exactly as shipped in v133. */
     const dim3 grid((unsigned)((P.N + 7) / 8));
 
     /* ---- the q8 repack cache (the a16 rule from r3d_gemm_mxfp4.hip: the plugin's OWN
@@ -1071,9 +1088,6 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
         case 8: R3D_W2_Q8C_WC(8, W_, WC_); break;          \
         default: R3D_W2_Q8C_WC(16, W_, WC_); break;        \
     }
-    /* The WC arms are instantiated on the shipped W=8 ladder only; every other
-     * prefetch ladder dispatches WC=0 (the verbatim walk), never a silent no-op. */
-    const int wc = (!no_pf && pf_w == 8) ? w2_wc : 0;
     if (c4) {
         if (no_pf)          { R3D_W2_Q8C_SW_W(1, 0) }
         else if (pf_w == 16){ R3D_W2_Q8C_SW_W(16, 0) }
