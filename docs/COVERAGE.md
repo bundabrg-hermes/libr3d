@@ -1589,3 +1589,67 @@ Implementing it is milestone 3. PAD1's 944 B margin means any future pad/tile gr
 re-check the 64 KiB ceiling. Enabling the tile in production is one env on the v117 build;
 defaulting it ON is pending the teacher-forced KLD pair (output-changing at the bf16
 fragment class — same gate discipline the q8x arm received).
+
+
+## The q8x arm graduates: differential-KLD adjudication, default-ON promotion, and the replay law (2026-10-25)
+
+The 2026-10-24 chronicle held the dot4 q8x mxfp4 decode arm opt-in on a teacher-forced
+KLD FAIL (mean 8.27e-3 against 2e-3 gates). Re-audited against a same-flow floor: the
+committed `compare` flow scores free-running decode trajectories against re-prefilled
+forced contexts, and its base-vs-itself floor is mean 8.53e-3 / p99 0.147 / top-1 0.975
+— past every threshold by construction. The old FAIL was instrument class, reproducible
+from the floor; the arm numbers sat under it. Thresholds untouched (law: never move a
+committed gate); the instrument got a differential mode instead
+(`kldgate.py diffcompare`, 7f222ac/510d856): two forced artifacts of the SAME base
+trajectory, identical conditioning per position — the prefill-vs-decode gap cancels.
+
+Differential results (1258 positions, build_v117, lever arms of one binary): same-arm
+floor (two fresh lever-OFF boots) mean 4e-5 / p99 1.5e-4 / top-1 1.000; q8x (ON vs OFF)
+mean 5e-5 / p99 5.2e-4 / top-1 1.000. Arm-attributable delta +1e-5, at the floor — the
+program stop rule (delta > +2e-3 mean or top-1 drop > 0.5%) not remotely triggered.
+Honest caveat kept with the promotion: the score pass is prefill-only (n_predict=1), so
+the decode-band arm moves one drafter-prologue launch there; the differential proves no
+collateral drift, and the arm's quality envelope is the 480/480 attribution sweep
+(worst 6.994e-3, inside the 3e-2 mxfp4a8 tolerance), the random-operand fuzz against the
+independent decoder, the serve completion hash matrix, and the paired A/B.
+hd256 re-scored with the same tool: mean 9.79e-3 / top-1 0.979 — ~240x the floor, real
+drift; tile stays OFF, accept decision still the operator's.
+
+Promotion (b818328, operator-approved 2026-10-25): sibling row
+`gemm_nt_q_mxfp4_decode_q8x` (prio 1200) wins the band by default; `R3D_MXFP4_Q8X=0`
+withdraws it at `rad_kernel_count`/`at` so the band RE-RESOLVES to the legacy walk —
+the issue #4 kill-switch law, not a launch-time refusal. Two build-cycle catches:
+the cross-TU helper `r3d_mxfp4_q8x_off` needs `extern "C"` on BOTH sides because
+r3d_rows.cpp's body lives inside the header's `extern "C" {"` block — a bare
+declaration mangles against the .hip definition and only explodes at dlopen (44b614b);
+and the arm's growing activation scratch broke the engine's recorded-pass replay —
+`m4_act_i8_kernel` must issue the same scratch pointer every time a recorded pass
+replays, but the grow-on-larger-K buffer swapped pointers mid-life, poisoning the drafter
+pass (-1) the first time down_proj (K=intermediate) grew it after the pass was recorded
+("arguments differ at byte 9" -> engine stop). Fix: one immortal buffer per K (316cd01).
+Recorded-pass replay is a NEW gate surface for any plugin kernel holding plugin-owned
+scratch: kbench direct-launches and never sees it.
+
+Gates on build_v119 (the scratch fix is post-v118): all baseline-identical — stock
+2011/2011 (6.952e-3), full 4737/4737 (6.994e-3) and its lever arms `=0` (2.859e-3) /
+`=1` (6.994e-3), attribution 480/480 twice, dflash2 702/702, df3 768/768; dot4 fuzz OK
+(all 16 codes, 2^20 sudot4 draws, device e8m0); repro_w2a8 bit-exact at every M;
+rows_dump 5-arm kill-switch matrix exact (default/`=1`: sibling at prio 1200; `=0`:
+sibling gone, legacy stays; `NO_FP4_DEC`/`NO_MXFP4` cover the sibling too).
+
+Serve A/B on the XTX, sequential pairs, flashnext untouched throughout: v116 medians
+31.07 / 30.14 / 31.13 t/s vs v119 35.51 / 34.92 / 36.39 — +14.3 / +15.9 / +16.9%,
+non-overlapping distributions (the older-era +23.5% was measured on a different base;
+this is the honest current number). Four-arm completion hash matrix: default ==
+explicit `=1` (combined sha256 f4b40ce5...), `=0` == the v116 build (aacd15f7...) —
+the kill switch restores legacy behavior BYTE-IDENTICALLY, and the default is the arm.
+Debug boot: `libr3d: mxfp4 q8x dot4 arm launched (mt=1)`, 0 host ops across 4 recorded
+pass classes, 0 plane fallbacks, acceptance 144/171, coherent chat.
+
+Promoted: spec9g renamed to spec9g_v116_rollback (chain v113/v112 kept), fresh spec9g on
+build_v119, inspect-faithful (12 GiB cap, host net, --init, spec 3/ctx 4096/4 seqs/
+all_vram/mm 0, ENV pin ROCR=1). Card law note: the HOST DRM order moved (XTX is card2
+by DRM number) — DRM numbers do NOT index ROCr; the authoritative proof is the serve's
+own boot line, verified: `1 device(s) [0:gfx1100]`, `card 0000:17:00.0 rank 0`,
+selection libavx 736 / libr3d 736, weights 6.65 GiB VRAM mapped 0 B, 0 real refusals,
+67.4 t/s on a live chat completion, 88/99 drafter accepts.
