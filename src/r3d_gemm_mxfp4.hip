@@ -918,11 +918,43 @@ __global__ __launch_bounds__(256) void m4_act_i8_kernel(
  * i8 plane (pitch K, rows >= M hold bounded stale bytes -- the m predicate keeps
  * them out of every stored row), SG its f32 scales (pitch K/32), AS/BS the engine's
  * planes at their derived pitches. */
+/* Q6 (REVIEW_QUEUE): RDNA3 DPP row_xmask folds. ISA Table 94: DPP_CTRL
+ * 0x160|mask fetches lane (n ^ mask) inside the 16-lane row -- the butterfly
+ * partner, on VALU. The shipped __shfl_xor lowers to ds_bpermute_b32 (DS pipe,
+ * competes with LDS reads). Bit-identical to the shfl chain by construction
+ * (partner value + same add order; probe q6probe2 verified lane-exact on
+ * gfx1100). row_xmask covers xor 1/2/4/8; xor16 crosses the row and stays
+ * shfl. Lever dpp=0 keeps the verbatim shfl arms. */
+__device__ __forceinline__ int32_t q8x_fold_i32(int32_t p, const bool dpp) {
+    if (dpp) {
+        p += __builtin_amdgcn_update_dpp(p, p, 0x161, 0xf, 0xf, 0);
+        p += __builtin_amdgcn_update_dpp(p, p, 0x162, 0xf, 0xf, 0);
+        return p;
+    }
+    p += __shfl_xor(p, 1);
+    p += __shfl_xor(p, 2);
+    return p;
+}
+__device__ __forceinline__ float q8x_fold_f32(float c, const bool dpp) {
+    if (dpp) {
+        c += __uint_as_float(__builtin_amdgcn_update_dpp(
+            __float_as_uint(c), __float_as_uint(c), 0x164, 0xf, 0xf, 0));
+        c += __uint_as_float(__builtin_amdgcn_update_dpp(
+            __float_as_uint(c), __float_as_uint(c), 0x168, 0xf, 0xf, 0));
+        c += __shfl_xor(c, 16);
+        return c;
+    }
+    c += __shfl_xor(c, 4);
+    c += __shfl_xor(c, 8);
+    c += __shfl_xor(c, 16);
+    return c;
+}
+
 template <int MT>
 __global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_kernel(
     const uint8_t* __restrict__ S, const int8_t* __restrict__ X, const float* __restrict__ SG,
     const float* __restrict__ AS, uint16_t* __restrict__ Y,
-    int M, int N, int K, int64_t y_pitch, int64_t as_pitch, int nt, int pf)
+    int M, int N, int K, int64_t y_pitch, int64_t as_pitch, int nt, int pf, int dpp)
 {
     const int r = blockIdx.x;
     const int t = threadIdx.x;
@@ -977,13 +1009,10 @@ __global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_kernel(
                 const uint2 xv = *(const uint2*)(X + (int64_t)m * K + (it << 8) + (t << 3));
                 int32_t p = __builtin_amdgcn_sudot4(1, (int)xv.x, 1, (int)wc.x, 0, 0);
                 p = __builtin_amdgcn_sudot4(1, (int)xv.y, 1, (int)wc.y, p, 0);
-                p += __shfl_xor(p, 1);
-                p += __shfl_xor(p, 2);
+                p = q8x_fold_i32(p, dpp != 0);
                 float c = (float)p * SG[(int64_t)m * (K >> 5) + g]
                                 * AS[(int64_t)m * as_pitch + (g >> 2)] * sc * 0.5f;
-                c += __shfl_xor(c, 4);
-                c += __shfl_xor(c, 8);
-                c += __shfl_xor(c, 16);
+                c = q8x_fold_f32(c, dpp != 0);
                 acc[m] += c;
             }
         }
@@ -1008,13 +1037,10 @@ __global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_kernel(
             const uint2 xv = *(const uint2*)(X + (int64_t)m * K + (it << 8) + (t << 3));
             int32_t p = __builtin_amdgcn_sudot4(1, (int)xv.x, 1, (int)wc.x, 0, 0);
             p = __builtin_amdgcn_sudot4(1, (int)xv.y, 1, (int)wc.y, p, 0);
-            p += __shfl_xor(p, 1);
-            p += __shfl_xor(p, 2);
+            p = q8x_fold_i32(p, dpp != 0);
             float c = (float)p * SG[(int64_t)m * (K >> 5) + g]
                             * AS[(int64_t)m * as_pitch + (g >> 2)] * sc * 0.5f;
-            c += __shfl_xor(c, 4);
-            c += __shfl_xor(c, 8);
-            c += __shfl_xor(c, 16);
+            c = q8x_fold_f32(c, dpp != 0);
             acc[m] += c;
         }
     }
@@ -1051,7 +1077,7 @@ __global__ void m4_act_i8_kernel(const uint8_t*, int8_t*, float*, int, int, int6
 template <int MT>
 __global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_kernel(
     const uint8_t*, const int8_t*, const float*, const float*, uint16_t*,
-    int, int, int, int64_t, int64_t, int, int) {}
+    int, int, int, int64_t, int64_t, int, int, int) {}
 } /* anonymous namespace */
 
 #endif
@@ -1422,6 +1448,12 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
             static const int q8x_pf = []{
                 const char* e = getenv("R3D_Q8X_PF");
                 return (e && e[0] == '2') ? 2 : 1; }();
+            /* Q6 (REVIEW_QUEUE): R3D_Q8X_DPP=1 swaps the butterfly folds to DPP
+             * row_xmask (VALU instead of ds_bpermute's DS pipe). Bit-identical by
+             * the q6probe2 lane-exact probe; default-off until the A/B speaks. */
+            static const int q8x_dpp = []{
+                const char* e = getenv("R3D_Q8X_DPP");
+                return (e && e[0] == '1') ? 1 : 0; }();
             const unsigned pgrid = (unsigned)((P.M * (P.K >> 5) + 7) / 8);
             hipLaunchKernelGGL(m4_act_i8_kernel, dim3(pgrid), dim3(256), 0, stream,
                                P.A, q8x_x8, q8x_sg, (int)P.M, (int)P.K, P.a_pitch);
