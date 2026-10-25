@@ -942,9 +942,14 @@ __global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_kernel(
         const uint8_t* sp = crow + ((int64_t)it << 1) * 136;
         /* Q5 (REVIEW_QUEUE): nt=1 streams the weight plane non-temporally (the plane is
          * L2-cold by design; activations stay inline -- cold-plane-only law). Donor
-         * measured +10-12% stream / -3% in-engine, so this ships opt-in (R3D_Q8X_NT). */
-        const uint2 wc = nt ? __builtin_nontemporal_load((const uint2*)(sp + hi8 + 8 + lo8))
-                            : *(const uint2*)(sp + hi8 + 8 + lo8);
+         * measured +10-12% stream / -3% in-engine, so this ships opt-in (R3D_Q8X_NT).
+         * The NT builtin takes only int/float/pointer operands (clang rejects the HIP
+         * vector type), so the 8B read goes through a u64 + bitcast: same global_load_b64. */
+        uint2 wc;
+        if (nt) { const uint64_t raw = __builtin_nontemporal_load(
+                            (const uint64_t*)(sp + hi8 + 8 + lo8));
+                  __builtin_memcpy(&wc, &raw, 8); }
+        else      wc = *(const uint2*)(sp + hi8 + 8 + lo8);
         const int g = (it << 3) + q;               /* the quad owns the 32-group */
         const float sc = r3d_e8m0_sc(sp[((q >> 2) * 136) + (q & 3)]);
 #pragma unroll
