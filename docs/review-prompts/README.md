@@ -21,6 +21,10 @@ Usage:
 3. The model must return exactly one fenced YAML block. Feed it back to the
    maintainer session unmodified.
 
+Proposals that survive desk-checking are tracked in `docs/REVIEW_QUEUE.md`
+(the ordered backlog). If an idea is already queued there, only propose it
+as a concrete refinement.
+
 Maintainer-side validation (not the reviewer's job):
 
 - Pass 1: every `isa_basis` mnemonic is cross-checked against `docs/isa/`
