@@ -1108,9 +1108,19 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
     if (le != hipSuccess) fprintf(stderr, "libr3d: w2a8 decode gemv launch FAILED (%s)\n",
                                   hipGetErrorName(le));
     else if (getenv("R3D_DEBUG_GEMM")) {
-        static bool once = false;
-        if (!once) { once = true;        fprintf(stderr, "libr3d: w2a8 decode gemv launched (mt=%d, %s, wc=%d)\n",
-                mt, c4 ? "q8c" : (B8 ? "q8" : "u2"), wc); }
+        /* Once per DISTINCT (mt, walk, window) triple, not once per process: a harness
+         * that sweeps M (repro_w2a8) otherwise prints the narrow tile's arm and leaves
+         * the wide-tile lever unproven -- an arm that silently never dispatched would
+         * still look bit-exact. Host-side only, debug-env only: never a codegen effect. */
+        static unsigned seen = 0;
+        const int mti = mt == 1 ? 0 : mt == 2 ? 1 : mt == 4 ? 2 : mt == 8 ? 3 : 4;
+        const int wci = wc == 0 ? 0 : wc > 0 ? 1 : 2;
+        const unsigned bit = 1u << (mti * 3 + wci);
+        if (!(seen & bit)) {
+            seen |= bit;
+            fprintf(stderr, "libr3d: w2a8 decode gemv launched (mt=%d, %s, wc=%d)\n",
+                    mt, c4 ? "q8c" : (B8 ? "q8" : "u2"), wc);
+        }
     }
 }
 
