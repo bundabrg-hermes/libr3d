@@ -376,6 +376,32 @@ constexpr uint32_t kScanThreads = 128;   /* one value column per thread: head_v 
 constexpr int32_t  kScanK       = 128;   /* the state column length: head_k == 128, register-bound */
 constexpr uint32_t kScanChunk   = 64;    /* the pack's chunk, kkt_solve's and libr4d's */
 
+/* Q20 (R3D_GDN_SB): the pressure lever for the st[128]-resident kernels (chunk_scan
+ * and both recurrent forms). All three pin at the 256-VGPR ceiling with real spill
+ * traffic INSIDE the hot loops (v134 census: in-loop scratch 374/420/453 static ops
+ * at vgpr_spill 189/222/320): the scheduler batches the 128-way unrolled d-chains'
+ * global/LDS loads for latency hiding, and with the state array permanently
+ * resident that in-flight window is the marginal pressure -- the allocator pays it
+ * in scratch. The donor toolbox (docs/LIBR35D_TRIAGE.md delta 2) names the cure:
+ * live-range caps. SB>0 fences the unrolled bodies every 16 d so loads stay near
+ * their uses; SB>=3 additionally fuses the recurrent token loop's rank-1 add into
+ * its q readout (same per-d bracketings, same d-ascending orders -- the chain is
+ * bit-identical by construction, only the loop boundary vanishes). SB=0 keeps
+ * every loop verbatim. */
+constexpr int kSbChunk = 16;
+__device__ __forceinline__ void r3d_sched_stop() { __builtin_amdgcn_sched_barrier(0); }
+
+/* Host lever: R3D_GDN_SB = 0 (stock, measurement-build default) | 1 (fences) |
+ * 3 (fences + rank-1/readout fusion). Anything else clamps to 0. chunk_scan has
+ * no fusion leg: any nonzero value maps to its fenced arm. */
+static inline int gdn_sb_lever() {
+    static const int v = []{ const char* s = std::getenv("R3D_GDN_SB");
+                             int x = s ? std::atoi(s) : 0;
+                             return (x == 1 || x == 3) ? x : 0; }();
+    return v;
+}
+
+template <int SB>
 __global__ __launch_bounds__(kScanThreads, 1) void gdn_chunk_scan_kernel(
     const uint8_t* __restrict__ q,  uint32_t dtQ, int64_t q_s0b, int64_t q_s1b,
     const uint8_t* __restrict__ k,  uint32_t dtK, int64_t k_s0b, int64_t k_s1b,
@@ -425,8 +451,21 @@ __global__ __launch_bounds__(kScanThreads, 1) void gdn_chunk_scan_kernel(
             for (int64_t j = 0; j < L; ++j) {
                 const uint8_t* __restrict__ kr = kb + (tb + j) * k_s0b;
                 float acc = 0.0f;
+                if constexpr (SB == 0) {
                 #pragma unroll
                 for (int d = 0; d < kScanK; ++d) acc += ldt2(kr, dtK, d) * st[d];
+                } else {
+                #pragma unroll
+                for (int c = 0; c < kScanK / kSbChunk; ++c) {
+                    r3d_sched_stop();
+                    #pragma unroll
+                    for (int jj = 0; jj < kSbChunk; ++jj) {
+                        const int d = c * kSbChunk + jj;
+                        acc += ldt2(kr, dtK, d) * st[d];
+                    }
+                }
+                r3d_sched_stop();
+                }
                 const float ge = r3d_exp_f(s_gc[j]);
                 s_W[j * vW + e] =
                     s_bc[j] * (ldt2(vb + (tb + j) * v_s0b, dtV, e) - ge * acc);
@@ -449,17 +488,43 @@ __global__ __launch_bounds__(kScanThreads, 1) void gdn_chunk_scan_kernel(
                 const uint8_t* __restrict__ qr = qb + (tb + i) * q_s0b;
                 const uint8_t* __restrict__ kr = kb + (tb + e) * k_s0b;
                 float acc = 0.0f;
+                if constexpr (SB == 0) {
                 #pragma unroll
                 for (int d = 0; d < kScanK; ++d)
                     acc += ldt2(qr, dtQ, d) * ldt2(kr, dtK, d);
+                } else {
+                #pragma unroll
+                for (int c = 0; c < kScanK / kSbChunk; ++c) {
+                    r3d_sched_stop();
+                    #pragma unroll
+                    for (int j = 0; j < kSbChunk; ++j) {
+                        const int d = c * kSbChunk + j;
+                        acc += ldt2(qr, dtQ, d) * ldt2(kr, dtK, d);
+                    }
+                }
+                r3d_sched_stop();
+                }
                 s_row[e] = (scale * r3d_exp_f(s_gc[i] - s_gc[e])) * acc;
             }
             __syncthreads();
             if (own) {
                 const uint8_t* __restrict__ qr = qb + (tb + i) * q_s0b;
                 float inr = 0.0f;
+                if constexpr (SB == 0) {
                 #pragma unroll
                 for (int d = 0; d < kScanK; ++d) inr += ldt2(qr, dtQ, d) * st[d];
+                } else {
+                #pragma unroll
+                for (int c = 0; c < kScanK / kSbChunk; ++c) {
+                    r3d_sched_stop();
+                    #pragma unroll
+                    for (int j = 0; j < kSbChunk; ++j) {
+                        const int d = c * kSbChunk + j;
+                        inr += ldt2(qr, dtQ, d) * st[d];
+                    }
+                }
+                r3d_sched_stop();
+                }
                 float acc = (scale * r3d_exp_f(s_gc[i])) * inr;
                 for (int64_t j = 0; j <= i; ++j) acc += s_row[j] * s_W[j * vW + e];
                 stt2(o + (tb + i) * o_s0b + h * o_s1b, dtO, e, acc);
@@ -477,8 +542,21 @@ __global__ __launch_bounds__(kScanThreads, 1) void gdn_chunk_scan_kernel(
                 const float vp = s_W[j * vW + e];
                 const float gs = r3d_exp_f(s_gc[L - 1] - s_gc[j]);
                 const uint8_t* __restrict__ kr = kb + (tb + j) * k_s0b;
+                if constexpr (SB == 0) {
                 #pragma unroll
                 for (int d = 0; d < kScanK; ++d) st[d] += vp * (gs * ldt2(kr, dtK, d));
+                } else {
+                #pragma unroll
+                for (int c = 0; c < kScanK / kSbChunk; ++c) {
+                    r3d_sched_stop();
+                    #pragma unroll
+                    for (int jj = 0; jj < kSbChunk; ++jj) {
+                        const int d = c * kSbChunk + jj;
+                        st[d] += vp * (gs * ldt2(kr, dtK, d));
+                    }
+                }
+                r3d_sched_stop();
+                }
             }
         }
     }
@@ -615,7 +693,7 @@ __global__ __launch_bounds__(kConvThreads) void gdn_conv_update_kernel(
 constexpr uint32_t kRecThreads = 128;   /* one value column per thread: head_v <= 128 */
 constexpr int32_t  kRecK       = 128;   /* head_k register bound: the column IS a register array */
 
-template <bool ANCHOR>
+template <bool ANCHOR, int SB>
 __global__ __launch_bounds__(kRecThreads, 1) void gdn_recurrent_update_kernel(
     const uint8_t* __restrict__ q,  uint32_t dtQ, int64_t q_s0b, int64_t q_s1b,
     const uint8_t* __restrict__ k,  uint32_t dtK, int64_t k_s0b, int64_t k_s1b,
@@ -722,11 +800,35 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_recurrent_update_kernel(
                     const float vrow = ldt2(ft + al_vb * st_eb, dtST, e);
                     const float dec = r3d_exp_f(g_);
                     float sk2 = 0.0f;
+                    if constexpr (SB == 0) {
                     #pragma unroll
                     for (int d = 0; d < kRecK; ++d) { st[d] *= dec; sk2 += st[d] * s_kn[d]; }
+                    } else {
+                    #pragma unroll
+                    for (int c = 0; c < kRecK / kSbChunk; ++c) {
+                        r3d_sched_stop();
+                        #pragma unroll
+                        for (int j = 0; j < kSbChunk; ++j) {
+                            const int d = c * kSbChunk + j;
+                            st[d] *= dec; sk2 += st[d] * s_kn[d];
+                        }
+                    }
+                    r3d_sched_stop();
+                    }
                     const float uu = bt_ * (vrow - sk2);
+                    if constexpr (SB == 0) {
                     #pragma unroll
                     for (int d = 0; d < kRecK; ++d) st[d] += uu * s_kn[d];
+                    } else {
+                    #pragma unroll
+                    for (int c = 0; c < kRecK / kSbChunk; ++c) {
+                        r3d_sched_stop();
+                        #pragma unroll
+                        for (int j = 0; j < kSbChunk; ++j)
+                            st[c * kSbChunk + j] += uu * s_kn[c * kSbChunk + j];
+                    }
+                    r3d_sched_stop();
+                    }
                 }
             }
         }
@@ -781,17 +883,69 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_recurrent_update_kernel(
              * the beta correction, then the rank-1 add -- all register-local per column. */
             const float dec = r3d_exp_f(gv);
             float sk2 = 0.0f;
+            if constexpr (SB == 0) {
             #pragma unroll
             for (int d = 0; d < kRecK; ++d) { st[d] *= dec; sk2 += st[d] * s_kn[d]; }
+            } else {
+            #pragma unroll
+            for (int c = 0; c < kRecK / kSbChunk; ++c) {
+                r3d_sched_stop();
+                #pragma unroll
+                for (int j = 0; j < kSbChunk; ++j) {
+                    const int d = c * kSbChunk + j;
+                    st[d] *= dec; sk2 += st[d] * s_kn[d];
+                }
+            }
+            r3d_sched_stop();
+            }
             const float uu = bt * (vreg - sk2);
-            #pragma unroll
-            for (int d = 0; d < kRecK; ++d) st[d] += uu * s_kn[d];
-
             float orow = 0.0f;                                /* the q readout, ascending d */
-            #pragma unroll
-            for (int d = 0; d < kRecK; ++d) orow += st[d] * s_q[d];
+            if constexpr (SB >= 3) {
+                /* fused rank-1 add + q readout: per-d values and the d-ascending
+                 * accumulation orders are the verbatim loops' own, so the chain is
+                 * bit-identical by construction; only the loop boundary vanishes. */
+                #pragma unroll
+                for (int c = 0; c < kRecK / kSbChunk; ++c) {
+                    r3d_sched_stop();
+                    #pragma unroll
+                    for (int j = 0; j < kSbChunk; ++j) {
+                        const int d = c * kSbChunk + j;
+                        st[d] += uu * s_kn[d];
+                        orow += st[d] * s_q[d];
+                    }
+                }
+                r3d_sched_stop();
+                s_orow[e] = orow * orow;                      /* squares for the serial rms */
+            } else {
+                if constexpr (SB == 1) {
+                #pragma unroll
+                for (int c = 0; c < kRecK / kSbChunk; ++c) {
+                    r3d_sched_stop();
+                    #pragma unroll
+                    for (int j = 0; j < kSbChunk; ++j)
+                        st[c * kSbChunk + j] += uu * s_kn[c * kSbChunk + j];
+                }
+                r3d_sched_stop();
+                } else {
+                #pragma unroll
+                for (int d = 0; d < kRecK; ++d) st[d] += uu * s_kn[d];
+                }
 
-            s_orow[e] = orow * orow;                          /* squares for the serial rms */
+                if constexpr (SB == 1) {
+                #pragma unroll
+                for (int c = 0; c < kRecK / kSbChunk; ++c) {
+                    r3d_sched_stop();
+                    #pragma unroll
+                    for (int j = 0; j < kSbChunk; ++j)
+                        orow += st[c * kSbChunk + j] * s_q[c * kSbChunk + j];
+                }
+                r3d_sched_stop();
+                } else {
+                #pragma unroll
+                for (int d = 0; d < kRecK; ++d) orow += st[d] * s_q[d];
+                }
+                s_orow[e] = orow * orow;                      /* squares for the serial rms */
+            }
             float sq2 = 0.0f;
             __syncthreads();
             if (e == 0) { sq2 = s_orow[0]; for (int64_t i = 1; i < V; ++i) sq2 += s_orow[i];
@@ -1035,7 +1189,7 @@ __global__ __launch_bounds__(32) void gdn_conv_prep_gate_kernel(
  */
 constexpr uint32_t kFusWidthMax = 4;
 
-template <bool ANCHOR>
+template <bool ANCHOR, int SB>
 __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kernel(
     const uint8_t* __restrict__ x, uint32_t dtX, int64_t x_pb,
     const uint8_t* __restrict__ w, uint32_t dtW, int64_t w_pb,
@@ -1207,11 +1361,35 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kern
                     const float vrow = ldt2(ft + al_vb * st_eb, dtST, e);
                     const float dec = r3d_exp_f(g_);
                     float sk2 = 0.0f;
+                    if constexpr (SB == 0) {
                     #pragma unroll
                     for (int d = 0; d < kRecK; ++d) { st[d] *= dec; sk2 += st[d] * s_kn[d]; }
+                    } else {
+                    #pragma unroll
+                    for (int c = 0; c < kRecK / kSbChunk; ++c) {
+                        r3d_sched_stop();
+                        #pragma unroll
+                        for (int j = 0; j < kSbChunk; ++j) {
+                            const int d = c * kSbChunk + j;
+                            st[d] *= dec; sk2 += st[d] * s_kn[d];
+                        }
+                    }
+                    r3d_sched_stop();
+                    }
                     const float uu = bt_ * (vrow - sk2);
+                    if constexpr (SB == 0) {
                     #pragma unroll
                     for (int d = 0; d < kRecK; ++d) st[d] += uu * s_kn[d];
+                    } else {
+                    #pragma unroll
+                    for (int c = 0; c < kRecK / kSbChunk; ++c) {
+                        r3d_sched_stop();
+                        #pragma unroll
+                        for (int j = 0; j < kSbChunk; ++j)
+                            st[c * kSbChunk + j] += uu * s_kn[c * kSbChunk + j];
+                    }
+                    r3d_sched_stop();
+                    }
                 }
             }
         }
@@ -1262,16 +1440,63 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kern
         if (own) {
             const float dec = r3d_exp_f(gv);
             float sk2 = 0.0f;
+            if constexpr (SB == 0) {
             #pragma unroll
             for (int d = 0; d < kRecK; ++d) { st[d] *= dec; sk2 += st[d] * s_kn[d]; }
+            } else {
+            #pragma unroll
+            for (int c = 0; c < kRecK / kSbChunk; ++c) {
+                r3d_sched_stop();
+                #pragma unroll
+                for (int j = 0; j < kSbChunk; ++j) {
+                    const int d = c * kSbChunk + j;
+                    st[d] *= dec; sk2 += st[d] * s_kn[d];
+                }
+            }
+            r3d_sched_stop();
+            }
             const float uu = bt * (vreg - sk2);
-            #pragma unroll
-            for (int d = 0; d < kRecK; ++d) st[d] += uu * s_kn[d];
-
             float orow = 0.0f;
-            #pragma unroll
-            for (int d = 0; d < kRecK; ++d) orow += st[d] * s_q[d];
-
+            if constexpr (SB >= 3) {
+                #pragma unroll
+                for (int c = 0; c < kRecK / kSbChunk; ++c) {
+                    r3d_sched_stop();
+                    #pragma unroll
+                    for (int j = 0; j < kSbChunk; ++j) {
+                        const int d = c * kSbChunk + j;
+                        st[d] += uu * s_kn[d];
+                        orow += st[d] * s_q[d];
+                    }
+                }
+                r3d_sched_stop();
+            } else {
+                if constexpr (SB == 1) {
+                #pragma unroll
+                for (int c = 0; c < kRecK / kSbChunk; ++c) {
+                    r3d_sched_stop();
+                    #pragma unroll
+                    for (int j = 0; j < kSbChunk; ++j)
+                        st[c * kSbChunk + j] += uu * s_kn[c * kSbChunk + j];
+                }
+                r3d_sched_stop();
+                } else {
+                #pragma unroll
+                for (int d = 0; d < kRecK; ++d) st[d] += uu * s_kn[d];
+                }
+                if constexpr (SB == 1) {
+                #pragma unroll
+                for (int c = 0; c < kRecK / kSbChunk; ++c) {
+                    r3d_sched_stop();
+                    #pragma unroll
+                    for (int j = 0; j < kSbChunk; ++j)
+                        orow += st[c * kSbChunk + j] * s_q[c * kSbChunk + j];
+                }
+                r3d_sched_stop();
+                } else {
+                #pragma unroll
+                for (int d = 0; d < kRecK; ++d) orow += st[d] * s_q[d];
+                }
+            }
             s_orow[e] = orow * orow;
             float sq2 = 0.0f;
             __syncthreads();
@@ -1746,8 +1971,10 @@ static int gdn_chunk_scan_impl(const RadArgs* a, RadStream s) {
 
     const uint32_t shm = (uint32_t)(kScanChunk * Vd * sizeof(float));
     const uint32_t dtH = h0_on ? h0->dtype : RAD_F32, dtT = ht_on ? ht->dtype : RAD_F32;
-    gdn_chunk_scan_kernel<<<dim3((uint32_t)H, (uint32_t)N), dim3(kScanThreads), shm,
-                            (hipStream_t)(uintptr_t)s>>>(
+    auto scan_kern = gdn_sb_lever() ? &gdn_chunk_scan_kernel<1>
+                                    : &gdn_chunk_scan_kernel<0>;
+    scan_kern<<<dim3((uint32_t)H, (uint32_t)N), dim3(kScanThreads), shm,
+                (hipStream_t)(uintptr_t)s>>>(
         (const uint8_t*)q->data, q->dtype, rad_dtype_bytes(q->dtype, q_s0), rad_dtype_bytes(q->dtype, q_s1),
         (const uint8_t*)k->data, k->dtype, rad_dtype_bytes(k->dtype, k_s0), rad_dtype_bytes(k->dtype, k_s1),
         (const uint8_t*)v->data, v->dtype, rad_dtype_bytes(v->dtype, v_s0), rad_dtype_bytes(v->dtype, v_s1),
@@ -1979,8 +2206,13 @@ static int gdn_recurrent_update_impl(const RadArgs* a, RadStream s) {
     bool q_on = false; R3dRow voq, vosc;
     int rq = r3d_qpair_view(oq, osc, T, Hv, Vd, &q_on, &voq, &vosc); if (rq) return rq;
 
-    auto rec_kern = anchor ? &gdn_recurrent_update_kernel<true>
-                           : &gdn_recurrent_update_kernel<false>;
+    const int sbq = gdn_sb_lever();
+    auto rec_kern = anchor ? (sbq >= 3 ? &gdn_recurrent_update_kernel<true, 3>
+                              : sbq == 1 ? &gdn_recurrent_update_kernel<true, 1>
+                                         : &gdn_recurrent_update_kernel<true, 0>)
+                             : (sbq >= 3 ? &gdn_recurrent_update_kernel<false, 3>
+                                         : sbq == 1 ? &gdn_recurrent_update_kernel<false, 1>
+                                                    : &gdn_recurrent_update_kernel<false, 0>);
     if (anchor && std::getenv("R3D_ANCHOR_TRACE"))
         std::fprintf(stderr, "[anchor-trace rec] T=%lld N=%lld Hv=%lld K=%lld V=%lld sw=%lld "
                      "q_len_param=%lld dtQ=%u dtV=%u dtST=%u dtS=%u dtN=%u dtCU=%u dtO=%u "
@@ -2384,8 +2616,13 @@ static int gdn_conv_recurrent_update_impl(const RadArgs* a, RadStream s) {
     if (smem > 48 * 1024) return RAD_E_UNSUPPORTED;   /* LDS budget, incl. the recurrent leg */
 
     const int32_t w32 = (int32_t)width;
-    auto fus_kern = anchor ? &gdn_conv_recurrent_update_kernel<true>
-                           : &gdn_conv_recurrent_update_kernel<false>;
+    const int sbf = gdn_sb_lever();
+    auto fus_kern = anchor ? (sbf >= 3 ? &gdn_conv_recurrent_update_kernel<true, 3>
+                              : sbf == 1 ? &gdn_conv_recurrent_update_kernel<true, 1>
+                                         : &gdn_conv_recurrent_update_kernel<true, 0>)
+                             : (sbf >= 3 ? &gdn_conv_recurrent_update_kernel<false, 3>
+                                         : sbf == 1 ? &gdn_conv_recurrent_update_kernel<false, 1>
+                                                    : &gdn_conv_recurrent_update_kernel<false, 0>);
     if (anchor && std::getenv("R3D_ANCHOR_TRACE"))
         std::fprintf(stderr, "[anchor-trace fus] T=%lld N=%lld Hv=%lld K=%lld V=%lld sw=%lld "
                      "q_len_param=%lld width=%d state_len=%lld cs_slots=%lld dtX=%u dtST=%u dtS=%u "
