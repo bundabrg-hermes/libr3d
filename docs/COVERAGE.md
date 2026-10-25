@@ -2227,3 +2227,55 @@ census whose parse coverage is unproven is noise.
 
 Card state: none spent this window (count-only per Q19's own scoping);
 spec9g untouched on build_v129 (health 200 verified at window open).
+
+---
+
+## Window 13 (2026-10-25, evening) -- Q22: DPP butterfly folds on the w2a8 row, SHIPPED
+
+The Q19 census's live finding closed the same day it was filed. Q6's
+`row_xmask` primitive (DPP_CTRL 0x160|mask, ISA Table 94) now folds every
+w2a8 butterfly: both octet folds (f32 sub[m] in the u2 walk, i32 isub[m] in
+the shared q8_dword_iter) and both whole-wave tails (xor16 stays shfl, it
+crosses the 16-lane row). Lever R3D_W2_DPP, default ON, literal "0"
+withdraws; stubs mirrored for non-gfx11 builds.
+
+Probe-first law earned a corollary: __builtin_amdgcn_update_dpp requires
+the control word as a COMPILE-TIME constant -- a runtime mask argument fails
+the build ('argument must be a constant integer'), which is why the shipped
+helpers template the mask. q22_probe: 4.19e9 lane-fold ops, both arms of all
+four fold sequences (f32/i32 x octet/tail), zero mismatches -> bit-identity
+is a source property before any card gate ran.
+
+Build-law re-earnings (both cheap only because the gates exist):
+(a) An insertion anchor that matches the kernel SIGNATURE but not the
+    TEMPLATE HEADER above it lands helpers between `template <...>` and
+    `__global__` -- the kernel loses its template, the helpers lose scope,
+    and the error cascade names neither cause. Single-TU compile (card-free,
+    4 min) is the right catcher; the -j1 full build wasted 22 min on it.
+(b) The container image keeps its llvm tools OFF PATH
+    (/opt/rocm/lib/llvm/bin): clang-offload-bundler and llvm-objcopy are
+    'command not found' there; carve_dis.py needs the PATH prefix. The
+    bundler in this ROCm wants --type=archive -unbundle --input/--output.
+
+Gates on build_v134 (SHIPPING artifact; spec9g not swapped -- zero w2a8
+lines in its whole log, grep-verified): repro 13/13 exact on four arms
+(default q8c+dpp / R3D_W2_DPP=0 / R3D_W2_C4=0 / kill-switch u2) with the
+default arm md5-identical to the withdrawal arm; battery 8/8 legs, all
+seven standing packs difflines=0 vs v133, plus a full-pack leg on the
+withdrawal lever (also 0). Census: v_add_*_dpp present in all 28 q8
+instantiations (208 at the <MT4,W16> hotspot); static bperm unchanged by
+design -- the runtime-lever shape compiles both chains and branches
+uniformly per wave (Q6 precedent, no new law).
+
+A/B same binary, 7 shapes x 5 rounds (two shapes got +2 rounds to chase
+outliers): every median positive, +1.5% (M=1) to +8.4% (M=14), the fold
+pricing better on wider tiles (more folds per dword fetched). Five shapes
+strictly non-overlapping; M=7 non-overlapping once its one noisy sample is
+trimmed; M=2's spread stays contaminated by two A-side outliers -- +2.9%
+median kept, labelled the softest adjudication of the set rather than
+quietly dropping the samples.
+
+Card state: spec9g stopped for the gates + A/B (~50 min), restarted clean:
+health 200, boot-asserted gfx1100 rank 0 / 6.65 GiB, coherent chat, still
+zero w2a8 lines. Runner artifacts on cat: q22_probe.cu, q22_gates.sh,
+q22_ab.sh, q22_ab.txt (144 rows), build_v134.sh.
