@@ -1448,12 +1448,15 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
             static const int q8x_pf = []{
                 const char* e = getenv("R3D_Q8X_PF");
                 return (e && e[0] == '2') ? 2 : 1; }();
-            /* Q6 (REVIEW_QUEUE): R3D_Q8X_DPP=1 swaps the butterfly folds to DPP
-             * row_xmask (VALU instead of ds_bpermute's DS pipe). Bit-identical by
-             * the q6probe2 lane-exact probe; default-off until the A/B speaks. */
+            /* Q6 (REVIEW_QUEUE): DPP row_xmask folds are DEFAULT ON (2026-10-25):
+             * 3/3 positive same-binary serve A/B (43.4/43.7/43.7 vs 41.5/42.4/42.1
+             * medians, non-overlapping, lever-ON boot-proven live), bit-identical
+             * by the q6probe2 lane-exact probe + v123 battery zero-diff (no numeric
+             * class -- the gates carry the proof). R3D_Q8X_DPP=0 withdraws the
+             * folds to the verbatim shfl chain (literal "0", the q8x law). */
             static const int q8x_dpp = []{
                 const char* e = getenv("R3D_Q8X_DPP");
-                return (e && e[0] == '1') ? 1 : 0; }();
+                return e && !std::strcmp(e, "0") ? 0 : 1; }();
             const unsigned pgrid = (unsigned)((P.M * (P.K >> 5) + 7) / 8);
             hipLaunchKernelGGL(m4_act_i8_kernel, dim3(pgrid), dim3(256), 0, stream,
                                P.A, q8x_x8, q8x_sg, (int)P.M, (int)P.K, P.a_pitch);
