@@ -2417,3 +2417,108 @@ fingerprint lines touched. spec9g was stopped for the card-exclusive battery
 and restarted (health 200, still build_v136 -- v137 changes nothing a live
 serve issues: unset lever = historical arms, and the arms it does issue are
 stream-identical).
+
+## Window 16 (2026-10-25, late night) -- Q18b/Q12c: the wide-tile register window, SHIPPED default-ON at MT=16 (build_v139)
+
+The census trap that started this row finally paid for itself. Since Q18, the
+MT>=8 q8 GEMV arms kept the pre-Q18 walk verbatim: the window is preloaded with a
+static index but CONSUMED through `for (d = 0; d < rem; ++d) ... bwin[d]`, and a
+dynamic array index is precisely what LLVM cannot register-allocate, so at MT=16
+the whole window lives in per-thread scratch (144 B private, 9 scratch sites/iter
+at W=8, 17 at W=16) on the row's hottest verify tile. Q18 had measured the
+obvious cure -- the full W-fold -- as a loss there (-8.1% M=7, -11.4% M=14: MT*W
+body copies price the tile past the traffic saved) and left Q18b to find a
+middle ground that beats BOTH schedules.
+
+Two middle grounds were built as one new template dimension on the q8 kernel
+(`WC`; 0 = verbatim, >0 = sub-window of that depth with both loops unrolled, <0 =
+select-window: the runtime consumption loop survives with ONE body copy and reads
+the operand through `w2_static_sel`, a static-index select chain). All three walk
+the dword indices in the shipped order, feed `q8_dword_iter` the same values, and
+keep `rem` block-uniform, so bit-identity is a source property again -- and the
+`WC = 0` default is the SAME specialization as the shipped `<MT,W,C4>` template,
+so nothing about the existing arms moved.
+
+**The census called the A/B before the card saw it** (`tools/wc_census.py`, card
+free, old-vs-new `.lto.s` per arm): WC=2 removes the scratch at MT=16 with the
+VGPR count UNCHANGED (122 -> 122) for a 1.46x body; WC=4 removes it but busts the
+`launch_bounds(256,2)` 128-VGPR cap at MT=16 (132 VGPR + 46 SGPR spills); and the
+select-window -- the elegant one, one body copy -- is WORSE than the disease
+(160 B private, 23 scratch sites vs the 144 B / 9 it replaces), because holding
+all W `uint4` operands live across the body is exactly the pressure the window
+was meant to relieve. The A/B then reproduced all three verdicts (+3.5% / +1.7% /
+-60.0% at M=14 cold, all spreads disjoint). A census that predicts the measurement
+is worth more than a measurement that only confirms it.
+
+**Q12's MT=16 gate is RE-ADJUDICATED, and that is the real finding.** Q12 gated
+the packed-u2 walk out of the wide tile because it measured -1..-3% and attributed
+it to the expansion VALU ("the same per-geometry law"). With `WC=2` the packed
+plane wins the same tile by +9.9% cold / +15.4% IC-fit. The loss was never the
+expansion's instruction count -- it was the expansion riding a scratch-demoted
+walk. The packed gate therefore follows the WINDOW now, not the tile size
+(`c4 = mt <= 8 || wc != 0`), and the ship is: MT=16 takes packed + depth-2
+sub-window; MT=8 stays exactly as shipped (every WC arm measured parity there --
+packed staging already keeps its small window in registers, so there is no scratch
+to remove and no reason to perturb a shipped schedule on a coin flip).
+
+Confirmation A/B on the shipped build (v139, same binary, `R3D_W2_WC=0`
+withdrawal the only axis, 3 interleaved rounds, every spread disjoint --
+~/scratch/r3d/q139_gates.log): withdrawal is slower at every MT=16 shape and both
+regimes -- M=14 cold 2.551->2.257 ms (+11.5%), M=16 +10.7%, M=10 +14.2%, M=14
+IC-fit +16.7%, M=16 IC-fit +14.3%. Gates: repro 13/13 exact on FIVE arms with the
+per-tile dispatch line as liveness (`def` = `mt=16, q8c, wc=2`; `w0` = `mt=16, q8,
+wc=0` == the v137 dispatch; `c40` = `q8, wc=2`; `kill` = u2), battery 7/7 with
+ALL SEVEN fingerprint packs byte-identical to v137, and -- because the change is
+additive -- the v138 pre-ship battery also ran 7/7 zero-diff, which is the
+evidence that the WC arms are inert until selected.
+
+Tools born this window: `tools/wc_census.py` (per-arm allocator + scratch census
+and instruction-stream identity across a template-arg change) and
+`tools/ab_parse.py` (A/B adjudicator: medians, spreads, and the DISJOINT verdict
+the ledger's adjudication standard demands).
+
+Laws and traps earned:
+- A `.lto.s` kernel LABEL line carries a trailing `; @mangled` comment and kernel
+  METADATA lines are indented TWO tabs: an anchored `^_Z\w+:$` regex parses zero
+  kernels (the ledger's own empty-slice trap, again) and a `\t`-prefixed "instruction"
+  filter silently ingests `.amdhsa_*` metadata. Match `^_Z[^:\s]+:` + allow the
+  comment; keep only lines matching `\t[a-z_]`.
+- Adding instantiations to a TU renumbers module-wide assembler labels
+  (`.LBB18_7`->`.LBB24_7`, `.Lfunc_end18`->`.Lfunc_end24`) with every operand
+  identical. Normalize the counter before any identity claim or you "find" 30
+  differing kernels that are byte-identical code.
+- A new template parameter MUST be mirrored in the non-RDMA3 stub -- and the stub's
+  own comment said so. The mangled name carries the template-arg list; a stub that
+  drifts registers a name the device image does not carry (invalid device function
+  on every launch). Caught here by a card-free TU compile in ~60 s.
+- `gate.sh` stages `$R3D_BUILD` (default `build13`, an ABI-22 relic). A gate script
+  that forgets to export it stages the WRONG build and the ABI-26 harness refuses
+  the whole library: seven instant FAIL legs and seven garbage reports. BUILD IMAGE
+  = GATE IMAGE ABI, and the staged dir must be the build under test -- export it at
+  the top of every gate script.
+- `cmd | ssh 'cat > f && ... &'` writes ZERO bytes: the `&` backgrounds the whole
+  remote chain and the piped stdin is lost -- and `bash -n` on an empty file says
+  SYNTAX_OK (vacuously). Copy and verify byte counts in one step, launch detached
+  (`setsid nohup`) in the next.
+- Never send a runner's stdout/stderr to `/dev/null`: it hid an awk syntax error
+  (`/ROW{...}` -- the pattern needs its closing slash) for 27 silently-lost bench
+  runs. Card time is cheap; silent loss is not.
+- The regime boundary on this card is the 96 MB INFINITY CACHE, not the 6 MB L2
+  (`l2Bytes=6291456` from the device query). The "cache-fit" arm that earned
+  +15.4% is IC-fit: 4x16 MB of packed plane resident while the repacked set
+  (4x64 MB) streams. Label regimes against the IC on RDNA3.
+- The vault's git credential helper failed once with a non-JSON unlock response and
+  the push died on `could not read Username`; a plain retry succeeded. Transient
+  vault failure is a retry case, not a credential problem -- assert length, retry
+  once, and do not go hunting for a broken token.
+- A launcher debug line guarded by `static bool once` proves one arm per PROCESS; a
+  harness that sweeps M then proves only the FIRST tile's arm, and a lever that
+  silently never dispatched would still look bit-exact. Print once per distinct
+  (mt, walk, window) tuple instead -- host-side, debug-env only.
+
+Serve: spec9g mounts build_v136 and has logged ZERO w2a8 lines ever (re-verified
+this window), so no swap rode the promotion; the row ships for the next
+DFlash-style drafter deployment on build_v139+, which collects +10..17% at the
+verify tile and never allocates the repack plane at any tile. Card session ran
+~25 min card-exclusive (spec9g stopped, restarted clean: gfx1100 asserted, health
+200).
