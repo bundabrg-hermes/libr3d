@@ -365,6 +365,63 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_repack_kernel(
  * transfer structurally. xs holds i8 codes at the RAW window position: with byte staging
  * the lane's sixteen codes are sixteen CONSECUTIVE slots, and quant_act_i8's step order
  * still rides the staging index exactly as before. */
+
+/* One dword-window iteration of the q8 walk: stage the 512-code activation window,
+ * fold the octet, flush ascending. Shared by BOTH window structures (Q18) so the two
+ * arms cannot drift arithmetically -- identical values by construction is a source
+ * property, not a bench finding. The b4 operand arrives by value: which walk fetched
+ * it (register window or runtime walk) is the ONLY difference between the arms. */
+template <int MT>
+__device__ __forceinline__ void q8_dword_iter(
+    const int8_t* __restrict__ A, int8_t* xs, float* acc, int g0, const uint4& b4,
+    int live, int rr, const __half* __restrict__ SC, const uint8_t* __restrict__ ZP,
+    const float* __restrict__ SUM, const float* __restrict__ AS, int u4zp,
+    int64_t a_pitch, int64_t sc_pitch, int64_t zp_pitch, int mpad, int64_t as_pitch)
+{
+    const int kbase = g0 << 7;
+    for (int i = threadIdx.x; i < live * 512; i += kThreads) {
+        const int m  = i >> 9, kk = i & 511;
+        xs[(m << 9) + kk] = A[(int64_t)m * a_pitch + kbase + w2_step_pos(kk)];
+    }
+    __syncthreads();
+
+    const int jj = (threadIdx.x & 31) >> 3, oo = threadIdx.x & 7;
+    int32_t isub[MT];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+        const uint4 av = *(const uint4*)&xs[(m << 9) + (jj << 7) + (oo << 4)];
+        /* this ROCm's spelling carries the sign flags in the builtin: (sA, a,
+         * sB, b, acc, clamp) -- lowers to v_dot4_i32_iu8 neg_lo:[1,0,0]. */
+        int32_t is = __builtin_amdgcn_sudot4(1, (int)av.x, 0, (int)b4.x, 0, 0);
+        is = __builtin_amdgcn_sudot4(1, (int)av.y, 0, (int)b4.y, is, 0);
+        is = __builtin_amdgcn_sudot4(1, (int)av.z, 0, (int)b4.z, is, 0);
+        is = __builtin_amdgcn_sudot4(1, (int)av.w, 0, (int)b4.w, is, 0);
+        isub[m] = is;                             /* integer, exact */
+    }
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {                /* octet fold: exact */
+        isub[m] += __shfl_xor(isub[m], 1);
+        isub[m] += __shfl_xor(isub[m], 2);
+        isub[m] += __shfl_xor(isub[m], 4);
+    }
+#pragma unroll
+    for (int g2 = 0; g2 < 4; ++g2) {              /* flush ascending */
+        const int grp = g0 + g2;
+        const float sb = __half2float(SC[(int64_t)rr * sc_pitch + grp]);
+        const float z = u4zp
+            ? (float)((ZP[(int64_t)rr * zp_pitch + (grp >> 1)] >> (4 * (grp & 1))) & 0xFu)
+            : (float)ZP[(int64_t)rr * zp_pitch + grp];
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+            if (m >= live) break;
+            const float is = (float)__shfl(isub[m], g2 << 3);
+            const float term = z * SUM[(int64_t)grp * mpad + m];
+            acc[m] += ((is - term) * AS[(int64_t)m * as_pitch]) * sb;
+        }
+    }
+    __syncthreads();                              /* xs rewritten next dword */
+}
+
 template <int MT, int W>
 __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     const int8_t* __restrict__ A,
@@ -387,7 +444,6 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     const int live = M < MT ? M : MT;
 
     const uint8_t* crow = B8 + (int64_t)rr * b8_pitch;
-    const int jj = lane >> 3, oo = lane & 7;
 
     for (int i = threadIdx.x; i < MT * 512; i += kThreads) xs[i] = 0;
     float acc[MT];
@@ -409,61 +465,51 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
      * register residence is the only option the compiler has. The d < rem guard is
      * BLOCK-UNIFORM (rem is a function of wbase/nd only), so the barriers inside it
      * keep equal arrival counts across the block. Consumed order, dot order and flush
-     * order are untouched: bit-identical by construction, schedule-only. */
-    for (int wbase = 0; wbase < nd; wbase += W) {
-        const int rem = (nd - wbase < W) ? (nd - wbase) : W;
-        uint4 bwin[W];
+     * order are untouched: bit-identical by construction, schedule-only.
+     *
+     * MT GATE (A/B, same card same session, 3 alternating rounds, all five shape
+     * classes non-overlapping -- log ~/scratch/r3d/q18_ab.txt): the unrolled body
+     * W-fold pays off on the narrow tiles -- M=1 K=8192 +24.7%, M=1 K=16384 +29.5%,
+     * M=4 +15.0% -- and LOSES on the wide ones: M=7 (MT=8) -8.1%, M=14 (MT=16)
+     * -11.4% (MT=16 arms also grow SGPR spill slots, ssp 178/439 at 118/154 VGPR).
+     * The schedule-transfer law is per-geometry here: MT<=4 takes the register
+     * window, MT>=8 keeps the verbatim old walk (whose scratch demotion remains the
+     * cheaper of the two measured costs at those tiles -- Q18b owns the Wc=4
+     * middle-ground probe for the verify band). */
+    if constexpr (MT <= 4) {
+        for (int wbase = 0; wbase < nd; wbase += W) {
+            const int rem = (nd - wbase < W) ? (nd - wbase) : W;
+            uint4 bwin[W];
 #pragma unroll
-        for (int d = 0; d < W; ++d)
-            bwin[d] = (d < rem)
-                ? *(const uint4*)(crow + (((int64_t)(wbase + d)) << 9) + (lane << 4))
-                : make_uint4(0u, 0u, 0u, 0u);
+            for (int d = 0; d < W; ++d)
+                bwin[d] = (d < rem)
+                    ? *(const uint4*)(crow + (((int64_t)(wbase + d)) << 9) + (lane << 4))
+                    : make_uint4(0u, 0u, 0u, 0u);
 #pragma unroll
-        for (int d = 0; d < W; ++d) {
-            if (d < rem) {
-            const int g0    = (wbase + d) << 2;
-            const int kbase = g0 << 7;
-            for (int i = threadIdx.x; i < live * 512; i += kThreads) {
-                const int m  = i >> 9, kk = i & 511;
-                xs[(m << 9) + kk] = A[(int64_t)m * a_pitch + kbase + w2_step_pos(kk)];
+            for (int d = 0; d < W; ++d)
+                if (d < rem)
+                    q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2, bwin[d], live, rr,
+                                      SC, ZP, SUM, AS, u4zp, a_pitch, sc_pitch,
+                                      zp_pitch, mpad, as_pitch);
+        }
+    } else {
+        /* MT >= 8: the verbatim pre-Q18 walk (see the gate note above). */
+        for (int wbase = 0; wbase < nd; wbase += W) {
+            const int rem = (nd - wbase < W) ? (nd - wbase) : W;
+            uint4 bwin[W];
+            if constexpr (W > 1) {
+#pragma unroll
+                for (int d = 0; d < W; ++d)
+                    bwin[d] = (d < rem)
+                        ? *(const uint4*)(crow + (((int64_t)(wbase + d)) << 9) + (lane << 4))
+                        : make_uint4(0u, 0u, 0u, 0u);
             }
-            __syncthreads();
-
-            const uint4 b4 = bwin[d];
-            int32_t isub[MT];
-#pragma unroll
-            for (int m = 0; m < MT; ++m) {
-                const uint4 av = *(const uint4*)&xs[(m << 9) + (jj << 7) + (oo << 4)];
-                /* this ROCm's spelling carries the sign flags in the builtin: (sA, a,
-                 * sB, b, acc, clamp) -- lowers to v_dot4_i32_iu8 neg_lo:[1,0,0]. */
-                int32_t is = __builtin_amdgcn_sudot4(1, (int)av.x, 0, (int)b4.x, 0, 0);
-                is = __builtin_amdgcn_sudot4(1, (int)av.y, 0, (int)b4.y, is, 0);
-                is = __builtin_amdgcn_sudot4(1, (int)av.z, 0, (int)b4.z, is, 0);
-                is = __builtin_amdgcn_sudot4(1, (int)av.w, 0, (int)b4.w, is, 0);
-                isub[m] = is;                             /* integer, exact */
-            }
-#pragma unroll
-            for (int m = 0; m < MT; ++m) {                /* octet fold: exact */
-                isub[m] += __shfl_xor(isub[m], 1);
-                isub[m] += __shfl_xor(isub[m], 2);
-                isub[m] += __shfl_xor(isub[m], 4);
-            }
-#pragma unroll
-            for (int g2 = 0; g2 < 4; ++g2) {              /* flush ascending */
-                const int grp = g0 + g2;
-                const float sb = __half2float(SC[(int64_t)rr * sc_pitch + grp]);
-                const float z = u4zp
-                    ? (float)((ZP[(int64_t)rr * zp_pitch + (grp >> 1)] >> (4 * (grp & 1))) & 0xFu)
-                    : (float)ZP[(int64_t)rr * zp_pitch + grp];
-#pragma unroll
-                for (int m = 0; m < MT; ++m) {
-                    if (m >= live) break;
-                    const float is = (float)__shfl(isub[m], g2 << 3);
-                    const float term = z * SUM[(int64_t)grp * mpad + m];
-                    acc[m] += ((is - term) * AS[(int64_t)m * as_pitch]) * sb;
-                }
-            }
-            __syncthreads();
+            for (int d = 0; d < rem; ++d) {
+                const uint4 b4  = (W > 1) ? bwin[d]
+                    : *(const uint4*)(crow + (((int64_t)wbase + d) << 9) + (lane << 4));
+                q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2, b4, live, rr, SC, ZP,
+                                  SUM, AS, u4zp, a_pitch, sc_pitch, zp_pitch, mpad,
+                                  as_pitch);
             }
         }
     }
