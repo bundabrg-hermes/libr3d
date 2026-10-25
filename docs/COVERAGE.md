@@ -1708,3 +1708,51 @@ Contig/W32 arms, dflash_conv u32 + tap-modulo hoist, band block-uniform split
 with the latent grid-x-wrap guard, kv_store VEC uint4 walk; q8x/w2a8
 launch_bounds pins), gated on build_v120 in the same window. Rope was already
 u32 in place (claim verified-then-rejected).
+
+## The review queue's first harvest: batch built, NT promoted, spec9g on build_v121 (2026-10-25)
+
+**The batch (Q3/Q4/Q5/Q8, commits 7156a03, f5e82dd, a748287).** Elementwise i64
+walks narrowed to u32 where provably in range (actmul Contig/W32 template arms
+on the cast precedent; dflash_conv's three divisions u32 via the launcher's
+existing 0xffff*kThreads cap, with the per-tap modulo hoisted; band's
+block-uniform split, which ALSO closed a latent grid-x-wrap the old code could
+hit at ngrp > 2^31 — refused at launch now). kv_store gained a VEC uint4 arm
+gated on 16B alignment + sd==1 with the scalar walk kept for odd layouts. The
+Q5 non-temporal builtin rejected the HIP vector type — the leg loads u64 +
+bitcast (same `global_load_b64`), compiled on the second attempt.
+
+**Verification chain, all on-card:**
+- Gates build_v120: 6/6 (stock 2011/6.952e-3, full 4737/6.994e-3, attr 480,
+  df2 702, df3 768, fp8 536) — and a per-op diff of the full pack, 36 libr3d
+  rows v119-vs-v120: ZERO worst-rel_l2 diffs. Every touched row runs device
+  per the report's reachability table.
+- Kernel-descriptor census (Q3's own gate): the shipped register allocations
+  already satisfied both pins (q8x 22-47 VGPR, w2a8 45-62, zero spills) —
+  pins closed as codegen-no-ops, KEPT as contracts. Side-bonus measured:
+  the u32 rewrite shrank footprints (dflash 21->17 VGPR/34->26 SGPR, band
+  38->27 SGPR).
+- Serve A/B (same box sequential, port 9022, probe pair-differenced ctx-512,
+  3 alternating rounds, every arm boot-asserted gfx1100-rank-0):
+  v119 medians 44.73/44.49/44.39; v120 (batch) 44.85/45.19/47.48 — positive
+  all rounds, ~+1.6%; v120+NT 46.03/45.96/45.86 — the within-binary NT pair
+  is +1.2/+1.7/+1.4 (3/3 positive). The donor's -3% engine warning did not
+  reproduce; the +10-12% stream claim was overstated, real is ~+2%.
+
+**NT default-ON (f5e82dd, build_v121).** A cache hint on identical bytes has
+no numeric class — the differential-KLD machinery does not apply and was not
+needed; the gates carry the proof: build_v121 battery 7/7 with NT on by
+default, all worst-rel_l2 identical to baseline, plus the R3D_Q8X_NT=0 lever
+arm re-ran the stock gate byte-identically (lever semantics = literal "0",
+the q8x law, gate.sh passes it through).
+
+**Promotion:** spec9g -> build_v121 (rename-rollback to v119 kept; chain
+v119/v116/v113 deep). Boot assertions: `[0:gfx1100]`, PCI 17:00.0 rank 0,
+736/736, 6.65 GiB VRAM mapped 0 B, 0 real refusals; live completion coherent
+at 53.05 t/s, drafter 11/21 accepts. flashnext untouched the entire window.
+
+**Harness lessons (both bitten, both fixed in-suite):** the serve-boot gate
+`load: rank 0` fires BEFORE the HTTP bind — every arm must poll /health
+until 200 before probing (first A/B pass burned 9 probes on this); and a
+fresh build dir created by a root container needs container-side cleanup
+(rm as host user fails) plus a source-sync check — an identical md5 between
+two "different" builds is the tell that the tree did not sync.
