@@ -167,6 +167,71 @@ __device__ __forceinline__ int w2_xs_idx(int j, int kk) {   /* j = kk >> 7 (0..3
 /* MT activation rows per block; W = prefetch window in dwords (a dword covers FOUR scale
  * groups -- the fp8 row's PF law, issue #7, with the window counted in load units). */
 template <int MT, int W>
+/* Q22 (REVIEW_QUEUE): RDNA3 DPP row_xmask folds on this row's butterflies --
+ * Q6's primitive, second row, from the Q19 census (tree's largest default-path
+ * ds_bpermute cluster: 468 static at each <MT=4,W=16> q8 leg, shared by both
+ * input walks). DPP_CTRL 0x160|mask fetches lane (n ^ mask) inside the 16-lane
+ * row on VALU; __shfl_xor lowers to ds_bpermute_b32 on the DS pipe. Bit-identical
+ * by construction: partner value + same add order (q22_probe, lane-exact on
+ * gfx1100 over all four sequences folded here, 4.19e9 lane ops, zero mismatches).
+ * xor16 crosses the row and stays shfl in both arms. The DPP control word must
+ * be a compile-time constant -- hence the template, not a mask argument.
+ * R3D_W2_DPP=0 withdraws to the verbatim shfl chain (literal "0", the lever law). */
+template <int MASK>
+__device__ __forceinline__ uint32_t w2_dpp_x(uint32_t p) {
+    return __builtin_amdgcn_update_dpp(p, p, 0x160u | MASK, 0xf, 0xf, 0);
+}
+__device__ __forceinline__ void w2_fold_octet_f32(float* s, const bool dpp) {
+    if (dpp) {
+        *s += __uint_as_float(w2_dpp_x<1>(__float_as_uint(*s)));
+        *s += __uint_as_float(w2_dpp_x<2>(__float_as_uint(*s)));
+        *s += __uint_as_float(w2_dpp_x<4>(__float_as_uint(*s)));
+    } else {
+        *s += __shfl_xor(*s, 1);
+        *s += __shfl_xor(*s, 2);
+        *s += __shfl_xor(*s, 4);
+    }
+}
+__device__ __forceinline__ void w2_fold_tail_f32(float* s, const bool dpp) {
+    *s += __shfl_xor(*s, 16);                     /* crosses the row: shfl both arms */
+    if (dpp) {
+        *s += __uint_as_float(w2_dpp_x<8>(__float_as_uint(*s)));
+        *s += __uint_as_float(w2_dpp_x<4>(__float_as_uint(*s)));
+        *s += __uint_as_float(w2_dpp_x<2>(__float_as_uint(*s)));
+        *s += __uint_as_float(w2_dpp_x<1>(__float_as_uint(*s)));
+    } else {
+        *s += __shfl_xor(*s, 8);
+        *s += __shfl_xor(*s, 4);
+        *s += __shfl_xor(*s, 2);
+        *s += __shfl_xor(*s, 1);
+    }
+}
+__device__ __forceinline__ void w2_fold_octet_i32(int32_t* s, const bool dpp) {
+    if (dpp) {
+        *s += (int32_t)w2_dpp_x<1>((uint32_t)*s);
+        *s += (int32_t)w2_dpp_x<2>((uint32_t)*s);
+        *s += (int32_t)w2_dpp_x<4>((uint32_t)*s);
+    } else {
+        *s += __shfl_xor(*s, 1);
+        *s += __shfl_xor(*s, 2);
+        *s += __shfl_xor(*s, 4);
+    }
+}
+__device__ __forceinline__ void w2_fold_tail_i32(int32_t* s, const bool dpp) {
+    *s += __shfl_xor(*s, 16);
+    if (dpp) {
+        *s += (int32_t)w2_dpp_x<8>((uint32_t)*s);
+        *s += (int32_t)w2_dpp_x<4>((uint32_t)*s);
+        *s += (int32_t)w2_dpp_x<2>((uint32_t)*s);
+        *s += (int32_t)w2_dpp_x<1>((uint32_t)*s);
+    } else {
+        *s += __shfl_xor(*s, 8);
+        *s += __shfl_xor(*s, 4);
+        *s += __shfl_xor(*s, 2);
+        *s += __shfl_xor(*s, 1);
+    }
+}
+
 __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_kernel(
     const int8_t* __restrict__ A,       /* [M, a_pitch] i8 codes, step order */
     const uint8_t* __restrict__ B,      /* [N, b_pitch] u2 codes, dense (stored as is) */
@@ -177,7 +242,7 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_kernel(
     const float* __restrict__ SUM,      /* SUM[g * mpad + m] f32, group-major */
     int M, int N, int K, int mpad, int u4zp,
     int64_t a_pitch, int64_t b_pitch, int64_t y_pitch, int64_t as_pitch,
-    int64_t sc_pitch, int64_t zp_pitch)
+    int64_t sc_pitch, int64_t zp_pitch, const bool dpp)
 {
     __shared__ __align__(16) float xs[MT * 512];
 
@@ -243,11 +308,8 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_kernel(
                 sub[m] = s;                             /* integer-valued, exact */
             }
 #pragma unroll
-            for (int m = 0; m < MT; ++m) {              /* octet fold: exact at every step */
-                sub[m] += __shfl_xor(sub[m], 1);
-                sub[m] += __shfl_xor(sub[m], 2);
-                sub[m] += __shfl_xor(sub[m], 4);
-            }
+            for (int m = 0; m < MT; ++m)               /* octet fold: exact at every step */
+                w2_fold_octet_f32(&sub[m], dpp);
 #pragma unroll
             for (int g2 = 0; g2 < 4; ++g2) {            /* flush ascending */
                 const int grp = g0 + g2;
@@ -291,13 +353,8 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_kernel(
             sub[m] = s;
         }
 #pragma unroll
-        for (int m = 0; m < MT; ++m) {                  /* full-wave fold: 32 lanes, 1 group */
-            sub[m] += __shfl_xor(sub[m], 16);
-            sub[m] += __shfl_xor(sub[m], 8);
-            sub[m] += __shfl_xor(sub[m], 4);
-            sub[m] += __shfl_xor(sub[m], 2);
-            sub[m] += __shfl_xor(sub[m], 1);
-        }
+        for (int m = 0; m < MT; ++m)                    /* full-wave fold: 32 lanes, 1 group */
+            w2_fold_tail_f32(&sub[m], dpp);
         const float sb = __half2float(SC[(int64_t)rr * sc_pitch + grp]);
         const float z = u4zp
             ? (float)((ZP[(int64_t)rr * zp_pitch + (grp >> 1)] >> (4 * (grp & 1))) & 0xFu)
@@ -387,7 +444,8 @@ __device__ __forceinline__ void q8_dword_iter(
     const int8_t* __restrict__ A, int8_t* xs, float* acc, int g0, const uint4& b4,
     int live, int rr, const __half* __restrict__ SC, const uint8_t* __restrict__ ZP,
     const float* __restrict__ SUM, const float* __restrict__ AS, int u4zp,
-    int64_t a_pitch, int64_t sc_pitch, int64_t zp_pitch, int mpad, int64_t as_pitch)
+    int64_t a_pitch, int64_t sc_pitch, int64_t zp_pitch, int mpad, int64_t as_pitch,
+    const bool dpp)
 {
     const int kbase = g0 << 7;
     for (int i = threadIdx.x; i < live * 512; i += kThreads) {
@@ -410,11 +468,8 @@ __device__ __forceinline__ void q8_dword_iter(
         isub[m] = is;                             /* integer, exact */
     }
 #pragma unroll
-    for (int m = 0; m < MT; ++m) {                /* octet fold: exact */
-        isub[m] += __shfl_xor(isub[m], 1);
-        isub[m] += __shfl_xor(isub[m], 2);
-        isub[m] += __shfl_xor(isub[m], 4);
-    }
+    for (int m = 0; m < MT; ++m)                  /* octet fold: exact */
+        w2_fold_octet_i32(&isub[m], dpp);
 #pragma unroll
     for (int g2 = 0; g2 < 4; ++g2) {              /* flush ascending */
         const int grp = g0 + g2;
@@ -454,7 +509,7 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     const float* __restrict__ SUM,
     int M, int N, int K, int mpad, int u4zp,
     int64_t a_pitch, int64_t bc_pitch, int64_t y_pitch, int64_t as_pitch,
-    int64_t sc_pitch, int64_t zp_pitch)
+    int64_t sc_pitch, int64_t zp_pitch, const bool dpp)
 {
     __shared__ __align__(16) int8_t xs[MT * 512];
 
@@ -517,7 +572,7 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
                         q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2,
                                           w2_expand16(pwin[d]), live, rr, SC, ZP, SUM,
                                           AS, u4zp, a_pitch, sc_pitch, zp_pitch, mpad,
-                                          as_pitch);
+                                          as_pitch, dpp);
             } else {
                 uint4 bwin[W];
 #pragma unroll
@@ -530,7 +585,7 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
                     if (d < rem)
                         q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2, bwin[d], live, rr,
                                           SC, ZP, SUM, AS, u4zp, a_pitch, sc_pitch,
-                                          zp_pitch, mpad, as_pitch);
+                                          zp_pitch, mpad, as_pitch, dpp);
             }
         }
     } else {
@@ -554,7 +609,7 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
                               crow + (((int64_t)wbase + d) << 7) + (lane << 2)));
                     q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2, b4, live, rr, SC, ZP,
                                       SUM, AS, u4zp, a_pitch, sc_pitch, zp_pitch, mpad,
-                                      as_pitch);
+                                      as_pitch, dpp);
                 }
             } else {
                 uint4 bwin[W];
@@ -570,7 +625,7 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
                         : *(const uint4*)(crow + (((int64_t)wbase + d) << 9) + (lane << 4));
                     q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2, b4, live, rr, SC, ZP,
                                       SUM, AS, u4zp, a_pitch, sc_pitch, zp_pitch, mpad,
-                                      as_pitch);
+                                      as_pitch, dpp);
                 }
             }
         }
@@ -595,13 +650,8 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
             isub[m] = __builtin_amdgcn_sudot4(
                 1, (int)*(const uint32_t*)&xs[(m << 9) + (lane << 2)], 0, (int)bb, 0, 0);
 #pragma unroll
-        for (int m = 0; m < MT; ++m) {                    /* full-wave fold */
-            isub[m] += __shfl_xor(isub[m], 16);
-            isub[m] += __shfl_xor(isub[m], 8);
-            isub[m] += __shfl_xor(isub[m], 4);
-            isub[m] += __shfl_xor(isub[m], 2);
-            isub[m] += __shfl_xor(isub[m], 1);
-        }
+        for (int m = 0; m < MT; ++m)                    /* full-wave fold */
+            w2_fold_tail_i32(&isub[m], dpp);
         const float sb = __half2float(SC[(int64_t)rr * sc_pitch + grp]);
         const float z = u4zp
             ? (float)((ZP[(int64_t)rr * zp_pitch + (grp >> 1)] >> (4 * (grp & 1))) & 0xFu)
@@ -637,7 +687,8 @@ namespace {
 template <int MT, int W>
 __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_kernel(
     const int8_t*, const uint8_t*, uint16_t*, const float*, const __half*, const uint8_t*,
-    const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) {}
+    const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+    bool) {}
 /* the q8 arm mirrors too (same rule): the repack kernel and the q8 GEMV. Q12 added
  * the C4 template parameter -- mirrored here or every q8c instantiation launches as
  * invalid device function on any non-gfx11 build of the plugin. */
@@ -645,7 +696,8 @@ __global__ void gemm_nt_w2a8_repack_kernel(const uint8_t*, uint8_t*, int64_t, in
 template <int MT, int W, int C4>
 __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     const int8_t*, const uint8_t*, uint16_t*, const float*, const __half*, const uint8_t*,
-    const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) {}
+    const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+    bool) {}
 }  /* anonymous namespace */
 
 #endif /* gfx11 family */
@@ -776,6 +828,14 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
      * equal); the packed walk expands with the repack kernel's own helper, so outputs
      * are bit-identical to the repack walk at every M (repro 13/13 exact both arms). */
     static const bool no_c4 = getenv("R3D_W2_C4") && atoi(getenv("R3D_W2_C4")) == 0;
+    /* Q22 (REVIEW_QUEUE): DPP row_xmask butterfly folds (Q6's primitive on this
+     * row). Bit-identical by construction -- q22_probe lane-exact, 4.19e9 lane
+     * ops zero mismatches, and the battery fingerprints are baseline-exact both
+     * arms (no numeric class; the gates carry the proof). Default ON; the A/B on
+     * the same binary adjudicates the speed. R3D_W2_DPP=0 withdraws to the
+     * verbatim shfl chain (literal "0", the lever law). */
+    static const bool w2_dpp = !(getenv("R3D_W2_DPP") &&
+                                 !std::strcmp(getenv("R3D_W2_DPP"), "0"));
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
     /* MT rounds UP to cover M: the tile computes min(M, MT) rows and there is no
      * m-loop, so MT < M silently drops rows (serve 2026-10-24: the drafter's block
@@ -847,7 +907,7 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
                        0, stream, P.A, P.B, (uint16_t*)ydata, P.AS, P.SC, P.ZP,    \
                        P.SUM, (int)P.M, (int)P.N, (int)P.K, P.mpad, P.u4zp,        \
                        P.a_pitch, P.b_pitch, y_pitch, P.as_pitch, P.sc_pitch,      \
-                       P.zp_pitch)
+                       P.zp_pitch, w2_dpp)
 #define R3D_W2_GEMV_SW(W_)                            \
     switch (mt) {                                     \
         case 1: R3D_W2_GEMV(1, W_); break;            \
@@ -861,14 +921,14 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
                        dim3(kThreads), 0, stream, P.A, B8, (uint16_t*)ydata,     \
                        P.AS, P.SC, P.ZP, P.SUM, (int)P.M, (int)P.N, (int)P.K,    \
                        P.mpad, P.u4zp, P.a_pitch, 4 * P.b_pitch, y_pitch,        \
-                       P.as_pitch, P.sc_pitch, P.zp_pitch)
+                       P.as_pitch, P.sc_pitch, P.zp_pitch, w2_dpp)
 /* Q12: same launch shape on the packed plane (b_pitch, not 4*b_pitch). */
 #define R3D_W2_Q8C(MT_, W_)                                                      \
     hipLaunchKernelGGL((gemm_nt_w2a8_gemv_q8_kernel<MT_, W_, 1>), grid,          \
                        dim3(kThreads), 0, stream, P.A, P.B, (uint16_t*)ydata,    \
                        P.AS, P.SC, P.ZP, P.SUM, (int)P.M, (int)P.N, (int)P.K,    \
                        P.mpad, P.u4zp, P.a_pitch, P.b_pitch, y_pitch,            \
-                       P.as_pitch, P.sc_pitch, P.zp_pitch)
+                       P.as_pitch, P.sc_pitch, P.zp_pitch, w2_dpp)
 #define R3D_W2_Q8_SW(W_)                            \
     switch (mt) {                                   \
         case 1: R3D_W2_Q8(1, W_); break;            \
