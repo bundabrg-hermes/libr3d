@@ -248,10 +248,12 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_kernel(
  *
  * kLdsPad CANNOT be reused: a uint4 LDS store needs the row stride 16B-aligned,
  * so this kernel carries kVecPad = 16 (stride 32 elements = 64B; the shipped
- * stride 20 is not). Consequence: LDS/WG grows 25 -> 38 KB, one workgroup per
- * CU instead of two -- exactly the occupancy trade the card A/B adjudicates.
- * (Padding also spreads fragment-load bank phases; the donor measured 16 and
- * attention's Carve strides are vec-friendly for the same reason.)
+ * stride 20 is not). LDS/WG grows 24.5 -> exactly 32 KB (8 As + 4 Bs + 20 Ys):
+ * two workgroups per CU now need the FULL 64KB bank vs 49 before, so occupancy
+ * is CU-granularity-limited -- exactly the occupancy trade the card A/B
+ * adjudicates. (Padding also spreads fragment-load bank phases; the donor
+ * measured 16 and attention's Carve strides are vec-friendly for the same
+ * reason.)
  *
  * Donor fold-ins (Q17 delta 1, operator-released), both host-gated in the
  * launcher and both off by default in this arm build:
