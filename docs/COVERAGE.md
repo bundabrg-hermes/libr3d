@@ -2279,3 +2279,70 @@ Card state: spec9g stopped for the gates + A/B (~50 min), restarted clean:
 health 200, boot-asserted gfx1100 rank 0 / 6.65 GiB, coherent chat, still
 zero w2a8 lines. Runner artifacts on cat: q22_probe.cu, q22_gates.sh,
 q22_ab.sh, q22_ab.txt (144 rows), build_v134.sh.
+
+## Window 14 (2026-10-25, night) -- Q20: the GDN pressure pass, fences transfer, SHIPPED default-ON (build_v136)
+
+Q17-delta2's toolbox finally transferred where its trap list never did: the
+sched_barrier live-range cap is the real cure for our st[128]-resident kernels.
+Baseline (fresh v134 census, loop-localized -- the severity dimension v2 missed):
+all four recurrent arms AND chunk_scan pin at 256 VGPR with vgpr_spill
+320/222/189/98(/73), and the scratch ops are INSIDE the hot loops (in-loop
+scratch 309/342/374/110/91 of the static totals): every decode token paid the
+delta-rule chain through scratch memory. Root cause: the scheduler batches the
+128-way unrolled d-chains' LDS/global loads for latency hiding; with the state
+array permanently resident, the in-flight window is the marginal pressure and
+the allocator pays it in scratch.
+
+The lever: `R3D_GDN_SB` (`42ab8a8` arms, `ead595f` promote), fences
+every 16 d via `__builtin_amdgcn_sched_barrier(0)` on chunk_scan + both
+recurrent forms (token loops AND the ANCHOR fold loops); slot SB=3 additionally
+fuses the token loop's rank-1 add into the q readout (same per-d bracketings,
+same d-ascending orders -- bit-identical by construction). The loops MUST stay
+fully unrolled (a dynamic `st[d]` index would demote the state array to scratch
+-- the Q18 trap, now armed against in both directions).
+
+Census after (`build_v135` measurement build): the four fenced recurrent arms
+carry ZERO scratch instructions at 167-187 VGPR (69-89 below ceiling -- the
+headroom Q11-class ideas were gated behind); instruction counts DROP (e.g.
+conv<1>: 14125 -> 13564). chunk_scan is the exception: fence spills MORE
+(189 -> 224) -- its pressure is the resident state itself, no window to cap, so
+chunk_scan ships STOCK and its fence stays a dark lever.
+SB=0 arms are instruction-for-instruction IDENTICAL to v134 (4/4, after
+retiring two false alarms: the disassembler's trailing `...` padding line and
+the template-mangling name map; ILb0ELi0E -> ILb0E).
+
+New harness `tools/bench_gdn.cpp` (the first GDN decode bench): decode shapes
+(slen 1, anchor fold nacc=2, live quantiser pair), ROTATING DISJOINT slot
+windows per launch (aliased windows across sequences RACE -- the fingerprint
+wobbles; SLOTS=64 with bases under 16 is the collision-free layout), per-launch
+events, medians/p25/p75, and an o+state FNV fingerprint per case.
+
+Kernel A/B (same binary v135, env-selected arms, 3 interleaved rounds x 200
+launches x 6 cases, ~/scratch/r3d/q20_ab.txt):
+  rec_pc_n1 +11.8%  rec_pc_n8 +17.3/+18.9%  rec_an_n1 +31.0/+31.2%
+  rec_an_n8 +44.6/+44.8%  fus_an_n1 +26.1/+24.1%  fus_an_n8 +50.1/+51.3%
+medians separated by multiples of the spreads (66 vs 120 us etc.); sb3 (fusion)
+is indistinguishable from sb1 -> ship the fences, keep fusion dark.
+Fingerprint: ONE hash per case across ALL nine runs (3 rounds x 3 arms, ~1000
+launches/case) -- the bit-identical claim measured, not asserted.
+
+Promotion gates on build_v136: battery 12/12 (7 standing packs fingerprint
+ZERO-diff vs v134 -- the packs contain the gdn ops, so the shipped arms pass
+the oracle where v134 passed; 3 gdn op legs on the kbench oracle default=fenced;
+2 withdrawal legs R3D_GDN_SB=0 with ZERO-line report diff vs the shipped legs).
+Serve: this lever is the FIRST on the live serving path (spec9g boots 24 GDN
+layers: kv_gdn_state/kv_gdn_conv 48 MiB/2.25 MiB per layer). Serve A/B (bench9b,
+9 reps/arm + trailing A-confirm 14.5-16.3 == A's cluster, no drift): decode
++2.6% median (15.2->15.6), prefill flat (chunk_scan unchanged -- consistent by
+construction), the kernel-level A/B is load-bearing per the Q1/Q18 class.
+spec9g RECREATED on build_v136 (API-exact config, only the radiance_home bind
+changed), rollback spec9g_v129_rollback prepended to the chain.
+
+Laws earned: (1) the docker ENGINE API create body IS the container Config
+(+nested HostConfig), name via query param -- the {Name,Config,HostConfig}
+swarm shape 400s with "config cannot be empty"; and bodyless POST /start fails
+SILENTLY under curl -s -- give it -d '{}'. (2) `ssh ... setsid nohup docker run`
+survives ssh-teardown kills -- the "container restarted itself" scare was
+cmake's 3-min HIP configure eating the wall clock. (3) The donor's fence
+transfers iff the kernel HAS a schedulable load window: recurrent rows yes,
+chunk_scan no (resident-state pressure) -- pressure triage before cures.
