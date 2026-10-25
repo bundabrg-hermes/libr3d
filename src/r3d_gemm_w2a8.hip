@@ -488,6 +488,20 @@ __device__ __forceinline__ void q8_dword_iter(
     __syncthreads();                              /* xs rewritten next dword */
 }
 
+/* Q18b (REVIEW_QUEUE) static-index read: the SAME value as win[d] with NO dynamic
+ * array index. A dynamic index is precisely what demoted the shipped MT>=8 window to
+ * per-thread scratch (an array indexed by a runtime value cannot be register
+ * allocated); a select chain over static indices can. The price is S-1 cndmask per
+ * iteration instead of a scratch load+store, and it buys the thing the W-fold could
+ * not: ONE copy of the MT-wide body at the wide tiles. */
+template <typename T, int S>
+__device__ __forceinline__ T w2_static_sel(const T (&win)[S], int d) {
+    T v = win[0];
+#pragma unroll
+    for (int i = 1; i < S; ++i) v = (d == i) ? win[i] : v;
+    return v;
+}
+
 /* Q12 compressed-input arm (C4=1, lever R3D_W2_C4): BC is the ENGINE's packed u2
  * plane at b_pitch (C4=0: the plugin's repacked B8 at 4*b_pitch, verbatim shipped).
  * The lane's sixteen window codes are ONE packed dword; the fetch expands it with the
@@ -496,8 +510,15 @@ __device__ __forceinline__ void q8_dword_iter(
  * window: 4 bytes instead of 16 (the cold-pass 4x is the whole point); the window
  * registers shrink 4x too (uint32 pwin vs uint4 bwin), and the repack cache, its side-
  * stream fill and its 1.5 GiB ceiling are bypassed wholesale at launch. Costs: the
- * expansion VALU per fetch and (at the tail) one byte load instead of one dword. */
-template <int MT, int W, int C4>
+ * expansion VALU per fetch and (at the tail) one byte load instead of one dword.
+ *
+ * Q18b adds the WC dimension (MT>=8 only; MT<=4 arms always take WC=0 and their
+ * shipped codegen is untouched): WC=0 is the verbatim pre-Q18 walk (dynamic-index
+ * window, the measured-cheaper of the two known schedules at the wide tiles), WC>0 is
+ * a SUB-WINDOW register walk of WC dwords with BOTH loops unrolled to the compile-time
+ * trip (the Q18 fix shape at a shallower depth), WC<0 is the select-window walk
+ * (|WC| dwords preloaded, one body copy, static-index reads). Lever R3D_W2_WC. */
+template <int MT, int W, int C4, int WC = 0>
 __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     const int8_t* __restrict__ A,
     const uint8_t* __restrict__ BC,     /* C4=0: repacked codes (pitch = 4*b_pitch);
@@ -588,7 +609,7 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
                                           zp_pitch, mpad, as_pitch, dpp);
             }
         }
-    } else {
+    } else if constexpr (WC == 0) {
         /* MT >= 8: the verbatim pre-Q18 walk (see the gate note above). */
         for (int wbase = 0; wbase < nd; wbase += W) {
             const int rem = (nd - wbase < W) ? (nd - wbase) : W;
@@ -626,6 +647,91 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
                     q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2, b4, live, rr, SC, ZP,
                                       SUM, AS, u4zp, a_pitch, sc_pitch, zp_pitch, mpad,
                                       as_pitch, dpp);
+                }
+            }
+        }
+    } else {
+        /* Q18b (REVIEW_QUEUE): register windows at the wide tiles, SHALLOWER than the
+         * full W-fold that lost the v126 whole-tile A/B (-8.1% at M=7, -11.4% at M=14:
+         * MT*W body copies price the tile past the scratch traffic saved). Both shapes
+         * below keep the CONSUMPTION ORDER identical -- the outer loop still walks the
+         * dword indices ascending, one dword per iteration, same operand values into
+         * q8_dword_iter -- so bit-identity vs the shipped walks is a source property,
+         * not a bench finding. `rem` stays block-uniform (a function of wbase/nd only),
+         * so the barriers inside the guarded region keep equal arrival counts across
+         * the block (the Q18 predicated-barrier legality). */
+        constexpr int S = (WC > 0) ? ((WC < W) ? WC : W)
+                                   : (((-WC) < W) ? (-WC) : W);
+        if constexpr (WC > 0) {
+            /* SUB-WINDOW = the Q18 fix shape (BOTH loops unrolled to the compile-time
+             * trip S) at depth S instead of W: S body copies, S*4 (C4=0) / S (C4=1)
+             * VGPRs of live window, and no dynamic index anywhere, so no scratch. */
+            for (int wbase = 0; wbase < nd; wbase += S) {
+                const int rem = (nd - wbase < S) ? (nd - wbase) : S;
+                if constexpr (C4) {
+                    uint32_t pwin[S];
+#pragma unroll
+                    for (int d = 0; d < S; ++d)
+                        pwin[d] = (d < rem)
+                            ? *(const uint32_t*)(crow + (((int64_t)(wbase + d)) << 7)
+                                                 + (lane << 2))
+                            : 0u;
+#pragma unroll
+                    for (int d = 0; d < S; ++d)
+                        if (d < rem)
+                            q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2,
+                                              w2_expand16(pwin[d]), live, rr, SC, ZP,
+                                              SUM, AS, u4zp, a_pitch, sc_pitch,
+                                              zp_pitch, mpad, as_pitch, dpp);
+                } else {
+                    uint4 bwin[S];
+#pragma unroll
+                    for (int d = 0; d < S; ++d)
+                        bwin[d] = (d < rem)
+                            ? *(const uint4*)(crow + (((int64_t)(wbase + d)) << 9)
+                                              + (lane << 4))
+                            : make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+                    for (int d = 0; d < S; ++d)
+                        if (d < rem)
+                            q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2, bwin[d],
+                                              live, rr, SC, ZP, SUM, AS, u4zp, a_pitch,
+                                              sc_pitch, zp_pitch, mpad, as_pitch, dpp);
+                }
+            }
+        } else {
+            /* SELECT-WINDOW: the runtime-index consumption loop SURVIVES with one body
+             * copy (the W-fold's cost never lands) and only the operand read changes --
+             * w2_static_sel keeps the window register-allocated at the price of S-1
+             * cndmask per iteration in place of the scratch round trip. */
+            for (int wbase = 0; wbase < nd; wbase += S) {
+                const int rem = (nd - wbase < S) ? (nd - wbase) : S;
+                if constexpr (C4) {
+                    uint32_t pwin[S];
+#pragma unroll
+                    for (int d = 0; d < S; ++d)
+                        pwin[d] = (d < rem)
+                            ? *(const uint32_t*)(crow + (((int64_t)(wbase + d)) << 7)
+                                                 + (lane << 2))
+                            : 0u;
+                    for (int d = 0; d < rem; ++d)
+                        q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2,
+                                          w2_expand16(w2_static_sel(pwin, d)), live, rr,
+                                          SC, ZP, SUM, AS, u4zp, a_pitch, sc_pitch,
+                                          zp_pitch, mpad, as_pitch, dpp);
+                } else {
+                    uint4 bwin[S];
+#pragma unroll
+                    for (int d = 0; d < S; ++d)
+                        bwin[d] = (d < rem)
+                            ? *(const uint4*)(crow + (((int64_t)(wbase + d)) << 9)
+                                              + (lane << 4))
+                            : make_uint4(0u, 0u, 0u, 0u);
+                    for (int d = 0; d < rem; ++d)
+                        q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2,
+                                          w2_static_sel(bwin, d), live, rr, SC, ZP, SUM,
+                                          AS, u4zp, a_pitch, sc_pitch, zp_pitch, mpad,
+                                          as_pitch, dpp);
                 }
             }
         }
@@ -836,6 +942,19 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
      * verbatim shfl chain (literal "0", the lever law). */
     static const bool w2_dpp = !(getenv("R3D_W2_DPP") &&
                                  !std::strcmp(getenv("R3D_W2_DPP"), "0"));
+    /* Q18b/Q12c (REVIEW_QUEUE): the wide-tile (MT>=8) window schedule. 0 = the verbatim
+     * shipped walk (default; MT>=8 keeps paying the scratch demotion, measured as the
+     * cheaper of the two known costs at these tiles); 2/4 = sub-window register walk
+     * (Q18's fix at depth WC); -8 = select-window (one body copy, static-index reads).
+     * All three consume dwords in the same order, so every arm is bit-identical; the
+     * A/B adjudicates the speed. Only W=8 (the shipped pf_w) carries WC arms: the
+     * opt-in pf_w=16 ladder keeps its verbatim walk. R3D_W2_C4_WIDE extends the Q12
+     * packed gate to MT=16 when a WC arm is selected (Q12c: does a shallower window
+     * recover the -1..-3% the packed walk lost at the wide tile?). */
+    static const int  w2_wc_raw = getenv("R3D_W2_WC") ? atoi(getenv("R3D_W2_WC")) : 0;
+    static const bool c4_wide   = getenv("R3D_W2_C4_WIDE") != nullptr;
+    const int  w2_wc = (w2_wc_raw == 2 || w2_wc_raw == 4 || w2_wc_raw == -8)
+                           ? w2_wc_raw : 0;
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
     /* MT rounds UP to cover M: the tile computes min(M, MT) rows and there is no
      * m-loop, so MT < M silently drops rows (serve 2026-10-24: the drafter's block
@@ -843,7 +962,9 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
      * lost 3). The band's M<=16 bound makes the 16 tile the ceiling. */
     const int mt = P.M >= 9 ? 16 : P.M >= 5 ? 8 : P.M >= 3 ? 4 : P.M >= 2 ? 2 : 1;
     /* the family kill-switch withdraws BOTH q8 fast arms (sibling-row law): C4 too. */
-    const bool c4 = (mt <= 8) && !no_c4 && !no_q8;   /* Q12 gate: MT=16 keeps the repack walk */
+    const bool c4 = ((mt <= 8) || (c4_wide && w2_wc != 0 && !no_pf && pf_w == 8))
+                        && !no_c4 && !no_q8;   /* Q12 gate: MT=16 keeps the repack walk
+                                                  unless Q18b's WC arm is selected */
     const dim3 grid((unsigned)((P.N + 7) / 8));
 
     /* ---- the q8 repack cache (the a16 rule from r3d_gemm_mxfp4.hip: the plugin's OWN
@@ -916,48 +1037,63 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
         case 8: R3D_W2_GEMV(8, W_); break;            \
         default: R3D_W2_GEMV(16, W_); break;          \
     }
-#define R3D_W2_Q8(MT_, W_)                                                       \
-    hipLaunchKernelGGL((gemm_nt_w2a8_gemv_q8_kernel<MT_, W_, 0>), grid,          \
+/* Q18b: the WC dimension on the two q8 walks (WC=0 == the shipped instantiations:
+ * a defaulted template argument is the SAME specialization, so the narrow-tile arms
+ * and the verbatim wide arms compile from one place and keep their codegen). */
+#define R3D_W2_Q8_WC(MT_, W_, WC_)                                                \
+    hipLaunchKernelGGL((gemm_nt_w2a8_gemv_q8_kernel<MT_, W_, 0, WC_>), grid,      \
                        dim3(kThreads), 0, stream, P.A, B8, (uint16_t*)ydata,     \
                        P.AS, P.SC, P.ZP, P.SUM, (int)P.M, (int)P.N, (int)P.K,    \
-                       P.mpad, P.u4zp, P.a_pitch, 4 * P.b_pitch, y_pitch,        \
+                       P.mpad, P.u4zp, P.a_pitch, 4 * P.b_pitch, y_pitch,         \
                        P.as_pitch, P.sc_pitch, P.zp_pitch, w2_dpp)
-/* Q12: same launch shape on the packed plane (b_pitch, not 4*b_pitch). */
-#define R3D_W2_Q8C(MT_, W_)                                                      \
-    hipLaunchKernelGGL((gemm_nt_w2a8_gemv_q8_kernel<MT_, W_, 1>), grid,          \
+#define R3D_W2_Q8C_WC(MT_, W_, WC_)                                               \
+    hipLaunchKernelGGL((gemm_nt_w2a8_gemv_q8_kernel<MT_, W_, 1, WC_>), grid,      \
                        dim3(kThreads), 0, stream, P.A, P.B, (uint16_t*)ydata,    \
                        P.AS, P.SC, P.ZP, P.SUM, (int)P.M, (int)P.N, (int)P.K,    \
-                       P.mpad, P.u4zp, P.a_pitch, P.b_pitch, y_pitch,            \
+                       P.mpad, P.u4zp, P.a_pitch, P.b_pitch, y_pitch,             \
                        P.as_pitch, P.sc_pitch, P.zp_pitch, w2_dpp)
-#define R3D_W2_Q8_SW(W_)                            \
-    switch (mt) {                                   \
-        case 1: R3D_W2_Q8(1, W_); break;            \
-        case 2: R3D_W2_Q8(2, W_); break;            \
-        case 4: R3D_W2_Q8(4, W_); break;            \
-        case 8: R3D_W2_Q8(8, W_); break;            \
-        default: R3D_W2_Q8(16, W_); break;          \
+#define R3D_W2_Q8_SW_W(W_, WC_)                            \
+    switch (mt) {                                          \
+        case 1: R3D_W2_Q8_WC(1, W_, 0); break;             \
+        case 2: R3D_W2_Q8_WC(2, W_, 0); break;             \
+        case 4: R3D_W2_Q8_WC(4, W_, 0); break;             \
+        case 8: R3D_W2_Q8_WC(8, W_, WC_); break;           \
+        default: R3D_W2_Q8_WC(16, W_, WC_); break;         \
     }
-#define R3D_W2_Q8C_SW(W_)                           \
-    switch (mt) {                                   \
-        case 1: R3D_W2_Q8C(1, W_); break;           \
-        case 2: R3D_W2_Q8C(2, W_); break;           \
-        case 4: R3D_W2_Q8C(4, W_); break;           \
-        case 8: R3D_W2_Q8C(8, W_); break;           \
-        default: R3D_W2_Q8C(16, W_); break;         \
+#define R3D_W2_Q8C_SW_W(W_, WC_)                           \
+    switch (mt) {                                          \
+        case 1: R3D_W2_Q8C_WC(1, W_, 0); break;            \
+        case 2: R3D_W2_Q8C_WC(2, W_, 0); break;            \
+        case 4: R3D_W2_Q8C_WC(4, W_, 0); break;            \
+        case 8: R3D_W2_Q8C_WC(8, W_, WC_); break;          \
+        default: R3D_W2_Q8C_WC(16, W_, WC_); break;        \
     }
+    /* The WC arms are instantiated on the shipped W=8 ladder only; every other
+     * prefetch ladder dispatches WC=0 (the verbatim walk), never a silent no-op. */
+    const int wc = (!no_pf && pf_w == 8) ? w2_wc : 0;
     if (c4) {
-        if (no_pf)          { R3D_W2_Q8C_SW(1) }
-        else if (pf_w == 16){ R3D_W2_Q8C_SW(16) }
-        else                { R3D_W2_Q8C_SW(8) }
+        if (no_pf)          { R3D_W2_Q8C_SW_W(1, 0) }
+        else if (pf_w == 16){ R3D_W2_Q8C_SW_W(16, 0) }
+        else if (wc == 2)   { R3D_W2_Q8C_SW_W(8, 2) }
+        else if (wc == 4)   { R3D_W2_Q8C_SW_W(8, 4) }
+        else if (wc == -8)  { R3D_W2_Q8C_SW_W(8, -8) }
+        else                { R3D_W2_Q8C_SW_W(8, 0) }
     }
     else if (B8) {
-        if (no_pf)          { R3D_W2_Q8_SW(1) }
-        else if (pf_w == 16){ R3D_W2_Q8_SW(16) }
-        else                { R3D_W2_Q8_SW(8) }
+        if (no_pf)          { R3D_W2_Q8_SW_W(1, 0) }
+        else if (pf_w == 16){ R3D_W2_Q8_SW_W(16, 0) }
+        else if (wc == 2)   { R3D_W2_Q8_SW_W(8, 2) }
+        else if (wc == 4)   { R3D_W2_Q8_SW_W(8, 4) }
+        else if (wc == -8)  { R3D_W2_Q8_SW_W(8, -8) }
+        else                { R3D_W2_Q8_SW_W(8, 0) }
     }
     else if (no_pf)      { R3D_W2_GEMV_SW(1) }
     else if (pf_w == 16) { R3D_W2_GEMV_SW(16) }
     else                 { R3D_W2_GEMV_SW(8) }
+#undef R3D_W2_Q8C_SW_W
+#undef R3D_W2_Q8C_WC
+#undef R3D_W2_Q8_SW_W
+#undef R3D_W2_Q8_WC
 #undef R3D_W2_Q8C_SW
 #undef R3D_W2_Q8C
 #undef R3D_W2_Q8_SW
@@ -970,8 +1106,8 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
                                   hipGetErrorName(le));
     else if (getenv("R3D_DEBUG_GEMM")) {
         static bool once = false;
-        if (!once) { once = true; fprintf(stderr, "libr3d: w2a8 decode gemv launched (mt=%d, %s)\n",
-                                          mt, c4 ? "q8c" : (B8 ? "q8" : "u2")); }
+        if (!once) { once = true;        fprintf(stderr, "libr3d: w2a8 decode gemv launched (mt=%d, %s, wc=%d)\n",
+                mt, c4 ? "q8c" : (B8 ? "q8" : "u2"), wc); }
     }
 }
 

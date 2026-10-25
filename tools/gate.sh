@@ -48,6 +48,8 @@ stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
     [ -n "${R3D_FP4_CHAIN:-}" ] && envs+=(-e R3D_FP4_CHAIN="$R3D_FP4_CHAIN")
     [ -n "${R3D_FP4_RP:-}" ] && envs+=(-e R3D_FP4_RP="$R3D_FP4_RP")
     [ -n "${R3D_NO_DFLASH:-}" ] && envs+=(-e R3D_NO_DFLASH="$R3D_NO_DFLASH")
+    [ -n "${R3D_W2_WC:-}" ] && envs+=(-e R3D_W2_WC="$R3D_W2_WC")
+    [ -n "${R3D_W2_C4_WIDE:-}" ] && envs+=(-e R3D_W2_C4_WIDE="$R3D_W2_C4_WIDE")
     [ -n "${R3D_NO_W2A8_Q8X:-}" ] && envs+=(-e R3D_NO_W2A8_Q8X="$R3D_NO_W2A8_Q8X")
     [ -n "${R3D_MXFP4_Q8X:-}" ] && envs+=(-e R3D_MXFP4_Q8X="$R3D_MXFP4_Q8X")
     [ -n "${R3D_Q8X_NT:-}" ] && envs+=(-e R3D_Q8X_NT="$R3D_Q8X_NT")

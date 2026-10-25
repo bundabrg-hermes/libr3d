@@ -48,11 +48,15 @@ def streams(objs):
 def norm_key(name):
     """Mangling gains a trailing Li0E per defaulted template arg: v136's 7-arg
     kernel1 names must compare equal to v137's 8-arg names. Key = name text
-    minus template ints + int tuple zero-padded to 8 for kernel1."""
+    minus template ints + int tuple zero-padded to 8 for kernel1.
+    Q18b: the same rule for the w2a8 q8 kernel (WC defaulted, 3 -> 4 ints; note
+    LLVM mangles a NEGATIVE int arg as Lin8E, which must not drop out of the key)."""
     head = re.match(r"(_ZN12_GLOBAL__N_1\d+attn_paged_wmma_kernel\d*)", name)
-    ints = [int(x) for x in re.findall(r"Li(\d+)E", name)]
+    ints = [int(("-" if n else "") + d) for n, d in re.findall(r"Li(n?)(\d+)E", name)]
     if head and not head.group(1).endswith(("2", "3")):
         while len(ints) < 8: ints.append(0)
+    if "gemm_nt_w2a8_gemv_q8_kernel" in name:
+        while len(ints) < 4: ints.append(0)
     return (head.group(1) if head else name, tuple(ints))
 
 a, b = sys.argv[1], sys.argv[2]
