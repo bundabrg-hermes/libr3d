@@ -399,17 +399,28 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     const int nd    = ngrp >> 2;
     const int ntail = ngrp & 3;
 
+    /* Q18 (spill census, build-head @ 75a4eca): the old shape preloaded the window
+     * into `uint4 bwin[W]` but CONSUMED it through the runtime index of a d loop whose
+     * trip count is `rem`, so the array could not live in registers and LLVM demoted
+     * the whole window to per-thread local memory -- 16x scratch_store_b128 + 1
+     * scratch_load site per iteration (the donor's LICM trap, LIBR35D_TRIAGE #1, on our
+     * own decode row). Fix: BOTH the preload and the consumption loop carry
+     * `#pragma unroll` to the compile-time trip W, so every bwin index is static and a
+     * register residence is the only option the compiler has. The d < rem guard is
+     * BLOCK-UNIFORM (rem is a function of wbase/nd only), so the barriers inside it
+     * keep equal arrival counts across the block. Consumed order, dot order and flush
+     * order are untouched: bit-identical by construction, schedule-only. */
     for (int wbase = 0; wbase < nd; wbase += W) {
         const int rem = (nd - wbase < W) ? (nd - wbase) : W;
         uint4 bwin[W];
-        if constexpr (W > 1) {
 #pragma unroll
-            for (int d = 0; d < W; ++d)
-                bwin[d] = (d < rem)
-                    ? *(const uint4*)(crow + (((int64_t)(wbase + d)) << 9) + (lane << 4))
-                    : make_uint4(0u, 0u, 0u, 0u);
-        }
-        for (int d = 0; d < rem; ++d) {
+        for (int d = 0; d < W; ++d)
+            bwin[d] = (d < rem)
+                ? *(const uint4*)(crow + (((int64_t)(wbase + d)) << 9) + (lane << 4))
+                : make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+        for (int d = 0; d < W; ++d) {
+            if (d < rem) {
             const int g0    = (wbase + d) << 2;
             const int kbase = g0 << 7;
             for (int i = threadIdx.x; i < live * 512; i += kThreads) {
@@ -418,8 +429,7 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
             }
             __syncthreads();
 
-            const uint4 b4 = (W > 1) ? bwin[d]
-                : *(const uint4*)(crow + (((int64_t)wbase + d) << 9) + (lane << 4));
+            const uint4 b4 = bwin[d];
             int32_t isub[MT];
 #pragma unroll
             for (int m = 0; m < MT; ++m) {
@@ -454,6 +464,7 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
                 }
             }
             __syncthreads();
+            }
         }
     }
 
