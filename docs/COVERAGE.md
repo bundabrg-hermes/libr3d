@@ -2583,3 +2583,62 @@ VERDICT: Q21 closed as WIN-with-M-gate; integration (lever R3D_W2_SK, dispatch
 MT>=8 -> skinny, repro/battery/withdrawal) booked as Q21b -- it is a kernel
 family on a row spec9g never issues, so promotion needs no serve swap.
 Serve restored at close: health 200, gfx1100 boot-asserted, on build_v136.
+
+---
+
+## 2026-10-26 window 18 -- Q21b: the WMMA skinny arm ships default-ON (build_v140)
+
+The 1-ulp datum died first, and it died with a control. CMakeLists carries
+-ffp-contract=off as a per-unit CORRECTNESS flag (the rad_plugin.h oracle forbids
+contraction) -- including on r3d_gemm_w2a8.hip -- while tools/bench_skinny.cpp was
+compiled with plain hipcc (contract=fast default). Rebuilding the bench both ways
+and running both in-process: fast reproduces the datum exactly (229375/229376, the
+same element, 1 bf16 ulp), off is 229376/229376 at M=14 and 114688/114688 at M=7.
+Bit-identity of the port is therefore a library-build property, inherited, not
+hoped for. LAW: a dlopen bench compiled under different FMA contraction than the
+library fabricates ulp drift and misattributes it to the kernel -- benches inherit
+the project's correctness flags.
+
+The port: gemm_nt_w2a8_gemv_sk_kernel is the bench kernel made library-faithful
+(all six pitches, u4zp nibble zero-points, mpad SUM rows, the shipped epilogue
+shape verbatim), 16-row i8 fragment tile per wave, tokens as matrix_b columns,
+per-wave staging (the window-17 dead-row lesson kept in the comment), dead waves
+EXIT rather than clamp (bar.sync excludes exited wavefronts). Lever R3D_W2_SK
+default ON, dispatch gate MT>=8 && M<=16; =0 withdraws to the verbatim v139
+dispatch; the kill-switch withdraws it too (sibling-row law); the arm reads the
+engine's packed u2 plane and skips the repack cache fill entirely -- the c40
+repro leg proves the independence (narrow tiles repack, wide tiles still sk).
+gate.sh learned to forward R3D_W2_SK alongside its C4/DPP siblings.
+
+Gates (card session ~7 min, spec9g stopped, operator-granted exclusivity):
+repro 13/13 exact on four arms with per-tile liveness lines (def: mt1/2/4 q8c,
+mt8/16 sk; sk0: the full legacy ladder; kill: u2; c40: q8 narrow + sk wide).
+Battery 7/7 packs zero-diff vs v139 -- the new default is output-identical --
+and the SK=0 full-pack withdrawal leg zero-diff vs v139 as well. Library census
+on the linked .so: sk body 1212 instructions, 8x v_wmma_i32_16x16x16_i8 (the u8
+silent-no-op landmine was NOT stepped on), zero scratch.
+
+A/B on v140, same binary, R3D_W2_SK the only axis, 3 interleaved rounds,
+q18_bw2 ROW with full non-zero liveness: M=14 +145.6%, M=16 +165.7%, M=10
++101.5%, M=7 +8.8%, M=14@8k +28.9% -- every spread disjoint (the 8k M=14 spread
+is the loosest, 0.403..0.515 vs 0.545..0.556, still separated). The M=7 gap to
+the bench's +46.6% is regime, not contradiction: this rot=4 plane set is
+4x64 MB >> the 96 MB Infinity Cache (cold, bandwidth-bound), the bench's M=7 row
+was rot=1 cache-fit (compute overlap wins there). Serve untouched: spec9g never
+issues w2a8; the next drafter deployment mounts v140+ and the verify band
+(7-token block pass included) runs ~1.5x on the same weights.
+
+Parsing traps earned (the census family again, all silent-failure class):
+- substring-probing mangled names needs a namespace-unique anchor: "sk_kernel"
+  is a substring of "mask_kernel" -- the first census hit the wrong code object
+  AND the wrong label, and only the asserts caught it (they fired on numbers,
+  loudly, which is the whole point of a coverage guard).
+- llvm-objdump prints instruction addresses in the TRAILING COMMENT on this
+  stack; a `^\s+[0-9a-f]+:` instruction regex matches nothing (the window-12
+  uppercase-hex trap's sibling).
+- awk: a file path that falls inside the program string becomes a regex
+  division -- silent garbage, no error. Quote programs, pass files as arguments.
+
+VERDICT: Q21b closed SHIPPED default-ON, v140 is the drafter-mount build.
+Serve restored at close: health 200, gfx1100 rank 0 boot-asserted, coherent
+(one-sentence answer, 767 reasoning tokens -- the window-16 probe law respected).

@@ -146,6 +146,8 @@ constexpr int kWave    = 32;
 
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
 
+#include <rocwmma/rocwmma.hpp>   /* Q21b: i8 fragment tiles on the skinny decode arm */
+
 namespace {
 
 /* ref_common.h's bf16 narrowing (the fp8a8/logits TUs' shared form): RTNE, NaN -> quiet. */
@@ -779,6 +781,107 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     }
 }
 
+/* Q21b (REVIEW_QUEUE delta5, donor r35d_8a8_narrow): the WMMA skinny decode arm.
+ * The GEMV prices its M>=5 tiles by staging every token's 128-code group per block
+ * and flushing per-lane sudot4 partials through octet-fold butterflies; the i8
+ * fragment tile needs neither: the 16 weight rows are matrix_a, the tokens are
+ * matrix_b columns, and each lane's i32 accumulator registers ARE output elements
+ * (lane l holds row 2k+(l>>4), col l&15 -- the map tools/probe_wmma.cpp pinned on
+ * THIS card, identical for the f32 and i32 accumulators). The probe measured i8
+ * WMMA at 3.31x the dot4 chain; the bench A/B (tools/bench_skinny.cpp, alternating,
+ * same operands) priced M=14 +208%/+211% cold/cache-fit and M=7 +46.6%, while M=1
+ * LOSES -47% -- single-token decode stays on the GEMV -- so the dispatch gate is
+ * MT>=8 (M>=5) and M<=16 (the fragment width; the band's M<=16 ceiling makes the
+ * second free).
+ * Bit-identical to the GEMV by construction: per 128-group the fragment's i32 sum
+ * is the SAME exact integer as the GEMV's group sum (integer addition is
+ * order-free; the group never crosses a w2_step_pos swap boundary), and the float
+ * epilogue runs per group in ascending order with the shipped operands and pitches.
+ * The bench's 1-element-1-ulp datum was ADJUDICATED as a bench-flag artifact: this
+ * TU compiles with the project's correctness flag -ffp-contract=off (CMakeLists)
+ * while the bench's default hipcc ran contract=fast; at -ffp-contract=off the bench
+ * is 229376/229376 (M=14) and 114688/114688 (M=7) against the library. The library
+ * build inherits off.
+ * Lever R3D_W2_SK=0 withdraws to the pre-Q21b dispatch; the family kill-switch
+ * R3D_NO_W2A8_Q8X withdraws this arm too. This walk reads the ENGINE's packed u2
+ * plane (like C4) and never touches the repack cache. NO cross-lane flush exists
+ * here, so the DPP levers have nothing to fold. */
+__global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_sk_kernel(
+    const int8_t* __restrict__ A, const uint8_t* __restrict__ BC, uint16_t* __restrict__ Y,
+    const float* __restrict__ AS, const __half* __restrict__ SC,
+    const uint8_t* __restrict__ ZP, const float* __restrict__ SUM,
+    int M, int N, int K, int mpad, int u4zp,
+    int64_t a_pitch, int64_t b_pitch, int64_t y_pitch, int64_t as_pitch,
+    int64_t sc_pitch, int64_t zp_pitch)
+{
+    constexpr int kSkLdm = 136;                 /* pad 8: break 128B row conflicts */
+    __shared__ __align__(16) int8_t xs[16 * kSkLdm];        /* tokens x slots */
+    __shared__ __align__(16) int8_t ws[8][16 * kSkLdm];     /* per-wave rows x slots */
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int tile = (blockIdx.x * (kThreads / kWave) + w) * 16;   /* first row of tile */
+    if (tile >= N) return;                      /* dead waves EXIT (bar.sync excludes them) */
+    const int live = M < 16 ? M : 16;
+    const int tok  = lane & 15;
+    const long ngrp = K >> 7;
+    rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, int8_t, rocwmma::row_major> fa;
+    rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, int8_t, rocwmma::col_major> fb;
+    rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, int32_t> fc;
+    float y[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) y[k] = 0.0f;
+
+    const int64_t row_dw = b_pitch >> 2;        /* packed dwords a row (4 codes a byte) */
+    for (long g = 0; g < ngrp; ++g) {
+        const long k0 = g * 128;
+        for (int i = threadIdx.x; i < 16 * 128; i += kThreads) {   /* stage tokens */
+            const int m = i >> 7, s = i & 127;
+            xs[m * kSkLdm + s] = (m < live)
+                ? A[(int64_t)m * a_pitch + k0 + w2_step_pos(s)] : 0;
+        }
+        {   /* EVERY wave stages its OWN tile: the bench's first build gated this on
+             * tid<128, which is waves 0..3 only, and waves 4..7 then read stale LDS --
+             * near-miss values, the dead-row trap in an LDS disguise (window 17). */
+            const uint32_t* b32 = (const uint32_t*)BC;
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int idx = q * 32 + lane;              /* 0..127 within the wave */
+                const int r = idx >> 3, d = idx & 7, rr = tile + r;
+                uint4 e = make_uint4(0, 0, 0, 0);
+                if (rr < N)
+                    e = w2_expand16(b32[(int64_t)rr * row_dw + (k0 >> 4) + d]);
+                *(uint4*)&ws[w][r * kSkLdm + d * 16] = e;   /* codes 0..3: sign-free i8 */
+            }
+        }
+        __syncthreads();
+        rocwmma::fill_fragment(fc, (int32_t)0);
+#pragma unroll
+        for (int kk = 0; kk < 128; kk += 16) {
+            rocwmma::load_matrix_sync(fa, (const int8_t*)&ws[w][kk], kSkLdm);
+            rocwmma::load_matrix_sync(fb, (const int8_t*)&xs[kk], kSkLdm);
+            rocwmma::mma_sync(fc, fa, fb, fc);
+        }
+        if (tok < live) {                       /* epilogue, per group, ascending */
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int rr = tile + 2 * k + (lane >> 4);      /* pinned lane map (i32) */
+                if (rr >= N) continue;
+                const float sb = __half2float(SC[(int64_t)rr * sc_pitch + g]);
+                const float z = u4zp
+                    ? (float)((ZP[(int64_t)rr * zp_pitch + (g >> 1)] >> (4 * (g & 1))) & 0xFu)
+                    : (float)ZP[(int64_t)rr * zp_pitch + g];
+                const float term = z * SUM[(int64_t)g * mpad + tok];
+                y[k] += (((float)fc.x[k] - term) * AS[(int64_t)tok * as_pitch]) * sb;
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const int rr = tile + 2 * k + (lane >> 4);
+        if (tok < live && rr < N) Y[(int64_t)tok * y_pitch + rr] = w2_f32_to_bf16(y[k]);
+    }
+}
+
 }  /* anonymous namespace */
 
 #else  /* non-RDNA3: host-visible no-op */
@@ -807,6 +910,11 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     const int8_t*, const uint8_t*, uint16_t*, const float*, const __half*, const uint8_t*,
     const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
     bool) {}
+/* Q21b added the WMMA skinny arm -- mirrored with the SAME 16-argument signature (no
+ * dpp bool, no template parameters: the mangled-name rule above applies to it too). */
+__global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_sk_kernel(
+    const int8_t*, const uint8_t*, uint16_t*, const float*, const __half*, const uint8_t*,
+    const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) {}
 }  /* anonymous namespace */
 
 #endif /* gfx11 family */
@@ -949,6 +1057,18 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
      * verbatim shfl chain (literal "0", the lever law). */
     static const bool w2_dpp = !(getenv("R3D_W2_DPP") &&
                                  !std::strcmp(getenv("R3D_W2_DPP"), "0"));
+    /* Q21b (REVIEW_QUEUE delta5): the WMMA skinny decode arm -- i8 fragment tiles,
+     * NO cross-lane flush (lane registers ARE outputs). Bench A/B same-operands:
+     * M=14 +208%/+211% (cold/cache-fit), M=7 +46.6%, M=4 tie, M=1 -47% -- so the
+     * gate is MT>=8 AND M<=16 (fragment width; the band ceiling makes it free).
+     * Bit-identical to the GEMV by construction (see the kernel comment: exact-
+     * integer group sums, ascending epilogue; the bench's lone 1-ulp element was
+     * ADJUDICATED as its own -ffp-contract=fast flag -- at contract=off, the
+     * project's correctness flag, the bench is 229376/229376 at M=14).
+     * R3D_W2_SK=0 withdraws to the pre-Q21b dispatch; R3D_NO_W2A8_Q8X withdraws
+     * this arm too (sibling-row law). The WC/C4 levers stop mattering at MT>=8
+     * while sk is on: this walk is not a window walk. */
+    static const bool sk_off = getenv("R3D_W2_SK") && atoi(getenv("R3D_W2_SK")) == 0;
     /* Q18b/Q12c SHIPPED default-ON at the wide tile (A/B on v138, same binary, lever
      * the only axis, 3 interleaved rounds, spreads disjoint -- ~/scratch/r3d/q18_gates
      * .log + q18_ab2.log): at M=14 cold (both plane sets past L2) the sub-window walk
@@ -985,6 +1105,9 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
     const bool c4 = (mt <= 8 || wc != 0) && !no_c4 && !no_q8;   /* Q12 + Q12c: the packed
         plane serves every tile whose walk is register-resident (wc != 0); with the
         withdrawal lever set it retracts to MT<=8 exactly as shipped in v133. */
+    const bool sk = !sk_off && !no_q8 && mt >= 8 && P.M <= 16;  /* Q21b: the fragment arm
+        takes EVERY wide tile the band has (the M<=16 bound is the band's own; the guard
+        is there for any caller outside it). */
     const dim3 grid((unsigned)((P.N + 7) / 8));
 
     /* ---- the q8 repack cache (the a16 rule from r3d_gemm_mxfp4.hip: the plugin's OWN
@@ -1002,7 +1125,7 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
     static int   ncache = 0;
     static bool  q8_dead = no_q8;
     uint8_t* B8 = nullptr;
-    if (!c4 && !q8_dead) {
+    if (!sk && !c4 && !q8_dead) {
         for (int i = 0; i < ncache; ++i)
             if (cache[i].src == P.B && cache[i].N == P.N && cache[i].K == P.K &&
                 cache[i].bp4 == 4 * P.b_pitch) { B8 = cache[i].dst; break; }
@@ -1088,7 +1211,17 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
         case 8: R3D_W2_Q8C_WC(8, W_, WC_); break;          \
         default: R3D_W2_Q8C_WC(16, W_, WC_); break;        \
     }
-    if (c4) {
+    if (sk) {
+        /* Q21b: one instantiation serves both wide tiles (the fragment is 16 rows
+         * wide either way); the grid is 128 rows a block, 8 waves x 16 rows. */
+        const dim3 grid_sk((unsigned)((P.N + 127) / 128));
+        hipLaunchKernelGGL(gemm_nt_w2a8_gemv_sk_kernel, grid_sk, dim3(kThreads), 0, stream,
+                           P.A, P.B, (uint16_t*)ydata, P.AS, P.SC, P.ZP, P.SUM,
+                           (int)P.M, (int)P.N, (int)P.K, P.mpad, P.u4zp,
+                           P.a_pitch, P.b_pitch, y_pitch, P.as_pitch, P.sc_pitch,
+                           P.zp_pitch);
+    }
+    else if (c4) {
         if (no_pf)          { R3D_W2_Q8C_SW_W(1, 0) }
         else if (pf_w == 16){ R3D_W2_Q8C_SW_W(16, 0) }
         else if (wc == 2)   { R3D_W2_Q8C_SW_W(8, 2) }
@@ -1129,11 +1262,12 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
         static unsigned seen = 0;
         const int mti = mt == 1 ? 0 : mt == 2 ? 1 : mt == 4 ? 2 : mt == 8 ? 3 : 4;
         const int wci = wc == 0 ? 0 : wc > 0 ? 1 : 2;
-        const unsigned bit = 1u << (mti * 3 + wci);
+        const unsigned bit = sk ? (1u << (16 + mti))     /* sk has no wc axis: own range */
+                                : (1u << (mti * 3 + wci));
         if (!(seen & bit)) {
             seen |= bit;
             fprintf(stderr, "libr3d: w2a8 decode gemv launched (mt=%d, %s, wc=%d)\n",
-                    mt, c4 ? "q8c" : (B8 ? "q8" : "u2"), wc);
+                    mt, sk ? "sk" : (c4 ? "q8c" : (B8 ? "q8" : "u2")), wc);
         }
     }
 }
