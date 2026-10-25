@@ -448,14 +448,20 @@ int r3d_gemm_nt_m64_launch(const void* A, const void* B, void* Y, float* Yf,
         return RAD_E_DEVICE;
     }
     static const bool dbuf = getenv("R3D_GEMM_NO_DBUF") == nullptr;
-    /* Q1 arms, dark until released. R3D_M64_VEC selects the staging variant:
-     *   unset/"0" -> scalar walk (shipped); "2" -> b64 LDS stores, pad 4
-     *   (occupancy-preserving Astra fallback); anything else -> uint4 stores,
-     *   pad 16. R3D_M64_ROT adds the K%4096==0-gated issue rotation.
-     * Withdraw law (issue #6/Q6): the literal "0" is OFF. */
+    /* Q1 SHIPPED 2026-10-25: b64 staging (uint4 loads, 8B LDS stores, shipped pad
+     * 4, LDS byte-equal to the scalar arm) is the DEFAULT on MT>=2 aligned
+     * operands: kernel A/B +6.2/+9.0/+7.5/+7.0/+18.1% non-overlapping across
+     * prefill shapes, bit-identical outputs (md5-equal Y dumps), battery
+     * byte-identical. R3D_M64_VEC selects the staging variant:
+     *   "0" -> scalar walk (withdrawal, Q6 law); "1" -> uint4 LDS stores on
+     *   pad 16 (kept dark: measured -0.6..-9.1%, the 32KB LDS costs the second
+     *   workgroup per CU); unset/other -> b64/pad4. R3D_M64_ROT stays dark
+     *   (rotation measured a consistent LOSS on top of every staging arm).
+     * MT==1 tiles keep the scalar walk (donor gate: staging loses 3-10% there;
+     * the vec arm's mt=1 control row confirmed parity by construction). */
     static const char* vev = getenv("R3D_M64_VEC");
     static const int   vecv = (!vev || strcmp(vev, "0") == 0) ? 0
-                              : (strcmp(vev, "2") == 0 ? 2 : 1);
+                              : (strcmp(vev, "1") == 0 ? 1 : 2);
     static const bool  rot  = getenv("R3D_M64_ROT") && strcmp(getenv("R3D_M64_ROT"), "0") != 0;
     dim3 grid((unsigned)((N + kNB - 1) / kNB), (unsigned)((M + kMB - 1) / kMB));
     const int MT = (M + kMB - 1) / kMB;

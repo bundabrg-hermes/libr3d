@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
     // bench line can never quietly measure a different arm than it claims.
     const int MT = (M + 63) / 64;
     const char* vev = getenv("R3D_M64_VEC");
-    const int   vecv = (!vev || strcmp(vev, "0") == 0) ? 0 : (strcmp(vev, "2") == 0 ? 2 : 1);
+    const int   vecv = (!vev || strcmp(vev, "0") == 0) ? 0 : (strcmp(vev, "1") == 0 ? 1 : 2);
     const bool ronen = getenv("R3D_M64_ROT") && strcmp(getenv("R3D_M64_ROT"), "0") != 0;
     const bool vec_ok = vecv != 0 && MT >= 2 && (K % 8 == 0);   // pitch=K here; bases 256B
     const bool expect_rot = vec_ok && ronen && (K % 4096 == 0);
