@@ -797,9 +797,12 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_kernel(
     bool) {}
 /* the q8 arm mirrors too (same rule): the repack kernel and the q8 GEMV. Q12 added
  * the C4 template parameter -- mirrored here or every q8c instantiation launches as
- * invalid device function on any non-gfx11 build of the plugin. */
+ * invalid device function on any non-gfx11 build of the plugin. Q18b added the WC
+ * parameter -- mirrored for the same reason (the mangled name carries the template-arg
+ * list; a drifted stub and a device image that disagrees is an invalid device function
+ * on every launch, which is exactly what the comment above this stub records). */
 __global__ void gemm_nt_w2a8_repack_kernel(const uint8_t*, uint8_t*, int64_t, int64_t) {}
-template <int MT, int W, int C4>
+template <int MT, int W, int C4, int WC = 0>
 __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     const int8_t*, const uint8_t*, uint16_t*, const float*, const __half*, const uint8_t*,
     const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
