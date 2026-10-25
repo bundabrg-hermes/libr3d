@@ -2089,3 +2089,75 @@ the battery env. Runners cat ~/scratch/r3d/q10_gates.sh, q10_ab.sh,
 q10_promote_gates.sh. Two host-execution laws re-earned: bench binaries run
 INSIDE the device container (host hipGetDevice = phantom run), and scratch paths
 mount at /scratch in-container, not /scratch/r3d.
+
+
+## Q12 SHIPPED default-ON (MT<=8): compressed-input dot4 -- drop the u8 expansion plane, expand inline (2026-10-25, window 11)
+
+The queue's 4x-traffic premise held, and the donor-law risk note (delta7, L2
+convoy) fired exactly where it said it would -- as a BENCH-HARNESS trap, not a
+kernel defect. The row now walks the engine's packed u2 plane directly: one
+dword per lane per window unit (16 codes) expanded in registers to the shipped
+`b4` operand, tail one byte per lane. The repack kernel's bit-expansion moved
+into ONE `__device__` helper (`w2_expand4/16`) used by the offline repack AND
+both C4 fetch sites: "expanded inline" == "repacked offline" is a source
+property (the Q18 law again), and `q8_dword_iter` never learns which world the
+operand came from. Lever `R3D_W2_C4=0` withdraws to the verbatim repack walk.
+
+Census (save-temps, gfx1100, all 15 C4 instantiations): every C4 arm priv=0 and
+the whole TU zero scratch instructions -- the Q18 trap avoided at every tile,
+including the MT>=8 arms whose runtime-indexed pwin LLVM kept in registers
+anyway (packed = W VGPRs). Pressure at the W=16 ceiling arms DROPPED: 117-122
+(C0) -> 70-81 (C1). The 15 C0 descriptors stayed byte-equal to v131 pre-flip.
+
+A/B (same binary v132, lever the only axis, 6 paired samples/shape, EVERY
+spread non-overlapping -- ~/scratch/r3d/q12_ab2.txt). Regimes labelled, because
+the packed plane is 4x SMALLER and the rot<=4 harness (repack-cache bound) can
+leave it CACHE-RESIDENT while the repacked set streams cold:
+  cold-vs-cold (both sets past the card cache, K=16384 N=16384 rot=4):
+    M=1 +24..30%, M=4 +7..14%, M=7 +12..16%.
+  cache-fit regime (packed set resident -- the regime the packed walk EXISTS to
+    win for per-token head streams): M=1 K=8192 rot=4 +15%.
+  MT=16 wide tile: -1..-3% non-overlapping LOSE -- expansion VALU prices the
+  verify tile past the traffic cut. THE Q18 MT-LAW REPRODUCED INSIDE THE NEW
+  ARM: the ship gates `c4 = mt <= 8 && !R3D_W2_C4(0) && !R3D_NO_W2A8_Q8X` (the
+  family kill-switch withdraws BOTH q8 fast arms, sibling-row law); MT=16 keeps
+  the repack walk and its cache verbatim, filled on demand by the first wide
+  call. The first (preview) A/B pass was DISCARDED: the v132 rebuild raced the
+  bench's dlopen and the unlabelled rot=1/4 shapes mixed cache regimes.
+
+Promotion (v133): repro 13/13 bit-exact on all three arms with per-arm liveness
+lines (default=q8c, C4=0=q8, NO_Q8=u2); battery 7/7 with all seven fingerprints
+zero-diff; and the new cheap promotion proof: the flip touched ONLY the host
+launcher, proven by full instruction-stream diff of the save-temps gfx1100
+slice -- 46/46 kernels byte-identical (asm_identity.py; first parse was
+VACUOUS, kernels=0/0 -- label lines carry `; @` trailing comments and the
+empty-slice trap the ledger warns about nearly caught us again; non-emptiness
+assertion now baked in). The 46-way asm identity is what licenses skipping the
+second battery pass for the withdrawal arm (the withdrawal shares device code
+by object; the 3-arm repro is its row-level proof).
+
+ABI trap, new era-marker: gate.sh now runs kbench from radiance-dev:v1.11.0
+(engine ABI 26); a plugin configured inside radiance-dev:v1.8.1 is ABI 22 and
+the harness REFUSES the whole library ("built against ABI version 22; this
+engine is version 26"). v131 rode that cache unknowingly; build_v132/133
+fresh-configured in v1.11.0. BUILD IMAGE = GATE IMAGE ABI, check before any
+battery; the first v132 battery died in 60 s on this (all legs refused, the
+difflines of that run are garbage, keep only the second log). Also: direct
+dlopen harnesses (repro/bench) do NOT check the ABI -- they run green while the
+engine refuses, so a green repro is not battery insurance.
+
+Serve: spec9g never issues w2a8 lines (Q18 established); no swap rode Q12,
+serve restored to build_v129 home after ~40 min card session, health 200,
+boot-asserted gfx1100 rank 0, coherent chat. The next DFlash-style drafter
+deployment mounts build_v133+ and eats the +7..30% at the draft head for free;
+the repack plane (and its 1.5 GiB ceiling) never allocates for MT<=8-only
+processes -- one less side-stream sync at first draft too.
+
+Memory-fit corollary for the serving drafter (untested, flag for the next
+drafter deployment): the packed walk cuts the per-token weight footprint 4x,
+which for heads whose packed set fits the card cache turns the row's regime
+from streaming to cache-fit -- the +15% fit-regime arm is the preview. Q18b
+(Wc=4 middle ground for MT>=8) is now also the Q12c candidate: an MT=16 arm
+that keeps the packed walk but recovers the wide-tile -2% (e.g. expand into
+preallocated regs with the fold shape the wide tile likes); gate on beating
+BOTH at M=7/14.

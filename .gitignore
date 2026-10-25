@@ -19,3 +19,4 @@ docs/isa/isa.db
 diagb/
 __pycache__/
 tools/kf_probe_q.bin
+HANDOVER-local.md
