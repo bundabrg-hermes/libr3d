@@ -2161,3 +2161,69 @@ from streaming to cache-fit -- the +15% fit-regime arm is the preview. Q18b
 that keeps the packed walk but recovers the wide-tile -2% (e.g. expand into
 preallocated regs with the fold shape the wide tile likes); gate on beating
 BOTH at M=7/14.
+
+
+## Q19 count-only compiler-trap audit: the donor traps do not transfer (again) — and the census tool needed its own audit (2026-10-25, window 12)
+
+Scope: every shipped gfx1100 kernel in build_v133. The device objects are
+fat ELF binaries (`clang-offload-bundler` target
+`hip-amdgcn-amd-amdhsa--gfx1100`, via the radiance-dev container; the host
+objdump 21 cannot read the bundle); slices extracted for all 25 `.hip.o`
+with zero skips, then parsed by the new `tools/trap_census.py`: 286 symbols,
+960,703 instructions, per-kernel counts of the four donor trap families
+plus bpermute and ds_swizzle attribution.
+
+Verdicts (all count-only, no kernel code touched, no card time):
+1. true16 no-op pairs: ZERO. `v_lshrrev_b32` with shift-imm 16 appears
+   nowhere in 960k instructions; `v_alignbyte_b32` nowhere. The d16-class
+   traffic (5,858) is all by-design unpack (the Q12 u2 walk, the e4m3/e2m1
+   decode paths). The donors' volatile-asm failure mode never existed here:
+   `asm volatile` occurs zero times in src/ (both surviving dot2c sites are
+   plain asm).
+2. Guards inside unrolled K steps: NEGLIGIBLE. Branch instructions within 8
+   of a `v_wmma_*`: 143 static across the tree's 1,100 WMMA sites, max 4 per
+   kernel — the DBUF page-boundary class, not the per-WMMA exec-mask branch
+   the donor fixed.
+3. Natural-order LDS row + dword rename: 67 tree-wide, worst 6 (gdn conv).
+   Not a cost center on any serving row.
+4. Unmerged adjacent `ds_load_b64` pairs (same base, offsets 8 B apart):
+   ZERO tree-wide. Q10's widening already removed the class it would find.
+5. dead-`__shared__` (the Q10 trap, source sweep): zero declarations without
+   uses tree-wide.
+
+The finding that was NOT on the donor list: the tree still pays 6,090
+`ds_bpermute_b32`, and the default-path hotspot is the w2a8 q8 GEMV's
+kWave=32 butterflies (468 static at <MT=4,W=16>, identical across both C4
+legs since the reduction is shared by both input walks). Q6's DPP
+`row_xmask` fold was applied only to the mxfp4 q8x row. Spawned as Q22.
+Attribution cross-checks: the mxfp4 q8x kernels' 96/48/24 are their
+R3D_Q8X_DPP=0 fallback arms compiled in the same function (expected, off at
+runtime); every butterfly site is wave-local per the closed TPR<=32 audit.
+
+Bonus attribution for the DS-pipe ledger: the attention family feeds
+column-major WMMA B fragments through `ds_swizzle_b32` (13,339 tree-wide;
+h256 arms top at 404 per static kernel) — rocwmma's gfx11 lowering, NOT
+ds_read. Any future ds-pipe traffic note should count swizzles, not just
+loads.
+
+Tooling lesson — the census tool committed the very sin Q19 audits for:
+silent zeros. Three RDNA format mismatches, each found only because a
+number refused to add up between two independent counts (awk vs python):
+(a) GCN mnemonics match nothing on RDNA3: LDS traffic is `ds_load_*`/
+    `ds_store_*` (not `ds_read_*`), bpermute is `ds_bpermute_b32` (exact
+    match on the stem still works, on `ds_read` it silently died), movs
+    carry `_e32/_e64` suffixes.
+(b) The container objdump prints UPPERCASE hex in the address comment
+    (`// 000000017E24:`) — a `[0-9a-f]+:` regex silently drops every
+    instruction whose address contains a-f: measured loss 6.8x
+    (140,408 parsed of 960,703 real). First two census tables retracted.
+(c) `v_lshrrev_b32` takes the shift imm FIRST (`v, 16, v`) — a
+    tail-imm-only regex would "prove" the true16 census zero without ever
+    looking.
+Countermeasure baked into the tool: a coverage guard — loose-format line
+count vs strict parse, refuse to print any table below 95% coverage. The
+empty-slice law generalized: a census that reports zero is a hypothesis, a
+census whose parse coverage is unproven is noise.
+
+Card state: none spent this window (count-only per Q19's own scoping);
+spec9g untouched on build_v129 (health 200 verified at window open).
