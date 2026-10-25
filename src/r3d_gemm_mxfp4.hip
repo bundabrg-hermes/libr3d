@@ -1357,7 +1357,14 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
         }
 
         if (plane && q8x_x8) {
-            static const int q8x_nt = getenv("R3D_Q8X_NT") ? 1 : 0;
+            /* Q5 NT leg is DEFAULT-ON (2026-10-25): paired serve A/B, same binary one
+             * env apart, 3/3 round medians positive (+1.2/+1.7/+1.4 t/s), bit-identical
+             * bytes by construction (a cache hint on the same loads -- no numeric class,
+             * hence no differential-KLD gate needed). The donor's -3% engine warning did
+             * not reproduce. R3D_Q8X_NT=0 withdraws the hint (literal "0", q8x law). */
+            static const int q8x_nt = []{
+                const char* e = getenv("R3D_Q8X_NT");
+                return e && !std::strcmp(e, "0") ? 0 : 1; }();
             const unsigned pgrid = (unsigned)((P.M * (P.K >> 5) + 7) / 8);
             hipLaunchKernelGGL(m4_act_i8_kernel, dim3(pgrid), dim3(256), 0, stream,
                                P.A, q8x_x8, q8x_sg, (int)P.M, (int)P.K, P.a_pitch);
