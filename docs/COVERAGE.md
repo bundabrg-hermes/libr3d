@@ -1756,3 +1756,46 @@ until 200 before probing (first A/B pass burned 9 probes on this); and a
 fresh build dir created by a root container needs container-side cleanup
 (rm as host user fails) plus a source-sync check — an identical md5 between
 two "different" builds is the tell that the tree did not sync.
+
+## Q7 measured: depth-2 prefetch built, gated, lands NULL on the serving arm (2026-10-25)
+
+The Q2 close transferred its residual (wait placement -> prefetch DEPTH) here.
+Built on `61e4432`: `R3D_Q8X_PF=2` opts into a register-staged depth-2 walk on
+the q8x decode gemv -- the 136B-group code + scale byte for iteration it+2 load
+into a parity ping-pong on explicit VGPR locals before iteration it's dot chain
+consumes its operands. Parity ping-pong on named locals (an array indexed by
+`it&1` would sink to private memory). Math order verbatim in both arms: pf
+moves issue cycles, never bytes-to-instruction mapping -- bit-identical by
+construction, no numeric class, no differential KLD. Default-off (unset or any
+other value == the shipped walk).
+
+Gates (build_v122, battery 9/9): stock 2011 (6.952e-3), full 4737 (6.994e-3),
+attr 480 (6.994e-3), df2 702 (7.306e-3), df3 768, fp8 536 (3.686e-4) -- every
+fingerprint identical to the shipped v121 line; the three PF=2 replays
+(stock/full/attr) likewise, and per_op_cmp shows ZERO worst-rel_l2 diffs on
+v121-vs-v122 (34 ops), stock-vs-pf2 (34), full-vs-pf2full (36),
+attr-vs-pf2attr (1) -- the bit-identity claim holds on measured outputs.
+
+Serve A/B (spec9g stopped for the pass -- two all-VRAM serves never coexist on
+the 16 GiB card; 6 arms same binary, env apart, 3 alternating rounds, all six
+boot-asserted gfx1100 rank 0 + /health-polled): pf1 medians 52.67/52.33/51.50
+vs pf2 52.61/52.52/51.59 t/s. Noise band, no signal. The lever was verifiably
+ON in the measured arms: live re-check `mxfp4 q8x dot4 arm launched (mt=4
+pf=2)` (the boot.log snapshots in the A/B script predate the first request,
+which is when the once-flag debug line fires -- harness lesson, move the
+capture after the probe).
+
+Verdict: NULL, kept DORMANT default-off (same disposition as the #8 arms).
+Depth is not the binding term of the q8x walk -- at 16 waves/CU occupancy the
+walk's latency is already hidden, which is the same occupancy answer the #7
+PF-window falsification hinted at and the #8 wave study named; this time it is
+measured directly on the serving arm, as the schedule-transfer law demands.
+The ballot-gated lazy rescale half of Q7 moves to Q6's scope -- the rescale/
+fold chain is exactly where the DPP folds live.
+
+Harness note: the deterministic-text probe (`temperature 0` completions) is
+byte-STABLE across arms but INCOHERENT on this checkpoint (no
+generation_config.json -> whole-vocabulary live, the boot warning says so; the
+sample reads "help me" in Chinese at "The capital of France is"). Fine as a
+hash matrix, useless as a coherence check -- coherence stays asserted via the
+live-chat line on promotions and the battery carries correctness.
