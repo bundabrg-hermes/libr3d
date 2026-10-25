@@ -98,3 +98,37 @@ Read: GDN is our worst unit by register pressure and it is on the serving path f
 hybrid layers; the h256 MT=3 WMMA attention arms (prefill family behind the DBUF work) spill
 before any new scheduling idea is attempted on them. The w2a8 q8 GEMV private segment with zero
 spill looks like stack/LDS-path traffic, not register spill — verify before chasing.
+
+## Verification and classification (2026-10-25, window 7 — operator-released)
+
+Re-censused at 75a4eca (fresh radiance-dev:v1.11.0 container build, full tree). Deltas
+classified into the queue: delta1 -> Q1 row (rotation gated on K%4096, MT>=2 staging gate,
+rejected variants noted); delta3 -> Q10 row (3-inst widening as staged-block constraint,
+Q9 already cites it as the fp8-retry knob); delta4 -> TPR butterfly sub-check CLOSED zero-hit
+(all eight GEMV butterfly sites are wave-local by construction, audit lines in REVIEW_QUEUE
+closed-table; incl. the 4578e2d off<32 poison lesson already guarded) + Q19 (true16-pair /
+guard / LDS-order count pass); delta2 -> Q20 (GDN pressure pass, gates Q11-class scheduling);
+delta5 -> Q21 (skinny WMMA GEMM A/B, parked medium); delta6 -> adopted as standing card
+protocol (REVIEW_QUEUE); delta7 -> risk note on Q12 + any future prefetch work.
+
+Spill-census verification results — the v1 tool DID miss signal classes:
+1. gdn carries SGPR spills 95/79/67/49 (v1 printed only the VGPR column; no kernel was
+   missed from the row set — no sgpr-only-spill kernel exists — but the pressure story was
+   understated by a third).
+2. All four gdn recurrent kernels and every attn_paged_wmma_kernel2 arm are PINNED at the
+   256-VGPR ceiling (vsp>0 implies pinned; invisible in v1).
+3. The cliff's edge, invisible to v1 by definition (zero spill): attn_paged_wmma_kernel
+   <256,3,0,0,*,0/1> at 249/242 VGPR — the non-DBUF h256 MT=3 arms are one edit from
+   spilling. Any Q11-class scheduling idea lands on arms already at 97% of ceiling.
+4. The w2a8 question RESOLVED, and it is traffic, not metadata: objdump of <8,16> shows 16x
+   `scratch_store_b128` (offsets 0..240) + 1 `scratch_load` site in the activation-staging
+   preamble — the hoisted global_load_b128 window demoted to per-thread local memory
+   (256B/lane/staging round). Donor trap #1 (LICM/reg-held group) reproduced on our own
+   hottest decode row. Not the Q3 (256,2) pin: arms sit at 60-90 VGPR vs the 128 cap; this is
+   array-demote, not PEI spill. Filed Q18 (ready). Same signature, smaller, on all <*,8> arms
+   (8 stores, 144B).
+5. m64 GEMM LDS footprints 43,072/43,008 (occupancy budget partner of the VGPR lists).
+tools/spill_census.py upgraded to v2: ssp column, near-ceiling list (vgpr>=200, no spill),
+big-LDS list, and an explicit "private w/o spill -> objdump for scratch_store" flag. The
+61e4432 head numbers (320/222/189/98 + 88/138) carried unchanged to 75a4eca (193 kernels now,
++12 from Q7/Q9 arms; same 25 flagged rows).

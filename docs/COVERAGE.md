@@ -1911,3 +1911,26 @@ If an fp8 serve model returns to the hot seat, the retry knob is LIBR35D_TRIAGE 
 Unrelated-but-noted: operator merged PR #14 (docs/LIBR35D_TRIAGE.md + tools/spill_census.py,
 the gfx1151 radiance-strix-halo triage). Its "queue deltas" section is intake-logged as
 Q17, parked on the operator's "to be looked at later" instruction.
+
+## 2026-10-25 window 7: Q17 classified; spill census verified and upgraded v2; TPR zero-hit
+
+Operator released the libr35d triage for look+classify (explicitly the spill test: "we may
+be missing things"). Desk audit of tools/spill_census.py v1 found four blind spots
+(SGPR spills unread; VGPR/LDS sizes unprinted so non-spilling pressure is invisible; stale
+census commit; open w2a8 private-segment question) and one non-issue (src/ is flat, the
+one-level glob misses nothing). Fresh full container build at 75a4eca (26 units, 193 gfx1100
+kernels) confirmed the donor census numbers carry (same 25 flagged rows as 61e4432), then the
+extended census found what v1 structurally could not:
+- gdn SGPR spills 95/79/67/49 on top of the printed VGPR spills; all gdn recurrent kernels
+  and every attn kernel2 arm pinned at the 256-VGPR ceiling.
+- NON-spilling near-cliff arms: attn_paged_wmma_kernel <256,3,0,0,*,*> at 249/242 VGPR —
+  the non-DBUF h256 MT=3 family, one edit from spilling (v1 prints nothing here by design).
+- w2a8 q8 GEMV private segment = real traffic: 16x scratch_store_b128 + 1 scratch_load site
+  in <8,16> (8 stores <*,8>), the activation-staging b128 window demoted to local memory —
+  the donor's LICM trap on our row, not metadata noise. Q18 filed ready.
+TPR<=32 butterfly audit CLOSED zero-hit (site-by-site in the REVIEW_QUEUE closed-table).
+Census tool rewritten v2 (ssp/near-ceiling/LDS/scratch-flag) and re-verified on the same
+tree. Deltas folded: Q1 (rotation gate + MT>=2 gate + rejected-variant skips), Q10 (3-inst
+widening constraint), Q12 (L2-convoy risk note), new Q18-Q21, card bench protocol adopted
+(verify widths, L2-rotating harnesses, A-B-A-B, rocprofv3 limits, census-after-change).
+No kernel code touched; spec9g untouched (build_v124, health 200); no serve ran this window.
