@@ -60,6 +60,10 @@ int main() {
                prop.name, dev, prop.gcnArchName, (long long)(prop.totalGlobalMem >> 20));
     }
 
+    // AB_KVDT=f8: fp8_e4m3 KV planes (one byte per element, random codes with the
+    // NaN pair excluded). The row entry takes the fp8 arms; the Q10 staging lever
+    // (R3D_F8ST) is read by the .so once per process -- run one process per arm.
+    const int kvf8 = getenv("AB_KVDT") && strstr(getenv("AB_KVDT"), "f8");
     const int QH = getenv("AB_QH") ? atoi(getenv("AB_QH")) : 16;
     const int KVH = getenv("AB_KVH") ? atoi(getenv("AB_KVH")) : 2;
     const int BS = 16;
@@ -83,18 +87,21 @@ int main() {
         std::vector<uint16_t> hq((size_t)QLEN * ROWW);
         for (auto& v : hq)  v = (uint16_t)(rnd() & 0x3fff);   // small finite bf16 patterns
         std::vector<std::vector<uint16_t>> hkv(ROT);          // distinct planes, same seed
+        auto f8code = [&]() { unsigned b = rnd() & 0xffu;     // random e4m3 byte,
+            if ((b & 0x7fu) == 0x7fu) b ^= 1u;                // NaN codes kept out
+            return (uint16_t)b; };                            // (hash stays meaningful)
         for (int r = 0; r < ROT; ++r) {                       // law (both arms replay the
             hkv[r].resize((size_t)NB * KVH * BS * SLOTW);     // same sequence -> hashes
-            for (auto& v : hkv[r]) v = (uint16_t)(rnd() & 0x3fff); }  // stay comparable)
+            for (auto& v : hkv[r]) v = kvf8 ? f8code() : (uint16_t)(rnd() & 0x3fff); }  // stay comparable)
         std::vector<int32_t> hbt(NB), hsu(1, CTX);
         for (int i = 0; i < NB; ++i) hbt[i] = i;
 
         uint16_t *dq, *dout; int32_t *dbt, *dsu;
         std::vector<uint16_t*> kvbufs(ROT);
         hipMalloc(&dq, hq.size() * 2);   hipMemcpy(dq, hq.data(), hq.size() * 2, hipMemcpyHostToDevice);
-        for (int r = 0; r < ROT; ++r) {
-            hipMalloc(&kvbufs[r], hkv[r].size() * 2);
-            hipMemcpy(kvbufs[r], hkv[r].data(), hkv[r].size() * 2, hipMemcpyHostToDevice);
+        for (int r = 0; r < ROT; ++r) {                       // fp8: one byte per element
+            hipMalloc(&kvbufs[r], hkv[r].size() * (kvf8 ? 1 : 2));
+            hipMemcpy(kvbufs[r], hkv[r].data(), hkv[r].size() * (kvf8 ? 1 : 2), hipMemcpyHostToDevice);
         }
         hipMalloc(&dout, hq.size() * 2); hipMemset(dout, 0, hq.size() * 2);
         hipMalloc(&dbt, NB * 4);         hipMemcpy(dbt, hbt.data(), NB * 4, hipMemcpyHostToDevice);
@@ -106,7 +113,7 @@ int main() {
         t_q.data = dq; t_q.dtype = RAD_BF16; t_q.rank = 3;
         t_q.shape[0] = QLEN; t_q.shape[1] = QH; t_q.shape[2] = HD;
         t_q.stride[0] = ROWW; t_q.stride[1] = HD; t_q.stride[2] = 1;
-        t_kv.data = kvbufs[0]; t_kv.dtype = RAD_BF16; t_kv.rank = 4;
+        t_kv.data = kvbufs[0]; t_kv.dtype = kvf8 ? RAD_F8E4M3 : RAD_BF16; t_kv.rank = 4;
         t_kv.shape[0] = NB; t_kv.shape[1] = KVH; t_kv.shape[2] = BS; t_kv.shape[3] = SLOTW;
         t_kv.stride[0] = (int64_t)KVH * BS * SLOTW; t_kv.stride[1] = (int64_t)BS * SLOTW;
         t_kv.stride[2] = SLOTW; t_kv.stride[3] = 1;
@@ -122,7 +129,7 @@ int main() {
             RAD_INT("q_len", QLEN), RAD_INT("head_dim", HD), RAD_INT("gqa", GQA),
             RAD_INT("block_size", BS), RAD_INT("causal", 1), RAD_INT("window", 0),
             RAD_INT("n_head", QH), RAD_INT("max_seqs", 8), RAD_INT("max_ctx", CTX),
-            RAD_STR("q_dtype", "bf16"), RAD_STR("kv_dtype", "bf16"),
+            RAD_STR("q_dtype", "bf16"), RAD_STR("kv_dtype", kvf8 ? "fp8" : "bf16"),
         };
         RadArgs a{}; a.p = pv; a.n_p = sizeof pv / sizeof pv[0];
         a.t = tensors; a.n_t = 8;
@@ -148,11 +155,11 @@ int main() {
         hipMemcpy(got.data(), dout, got.size() * 2, hipMemcpyDeviceToHost);
 
         const double tiles_q = (QLEN + 63) / 64;
-        const double kv_read = tiles_q * QH * (double)CTX * 2.0 * HD * 2.0;   // per launch
+        const double kv_read = tiles_q * QH * (double)CTX * 2.0 * HD * (kvf8 ? 1.0 : 2.0);
         const double gflops = 2.0 * 2.0 * tiles_q * (double)CTX * HD * QH     // QK+PV, causal ~half
                             * 0.5;
-        printf("geom hd=%d qlen=%d ctx=%d: min_us=%.1f med_us=%.1f kv_gbs=%.1f gf/s=%.0f hash=%016llx\n",
-               HD, QLEN, CTX, best * 1e3f, (all / REPS) * 1e3f,
+        printf("geom hd=%d qlen=%d ctx=%d kv=%s: min_us=%.1f med_us=%.1f kv_gbs=%.1f gf/s=%.0f hash=%016llx\n",
+               HD, QLEN, CTX, kvf8 ? "f8" : "bf", best * 1e3f, (all / REPS) * 1e3f,
                kv_read / (best * 1e-3) / 1e9,
                gflops / (best * 1e-3) / 1e9,
                (unsigned long long)fnv(got));

@@ -130,7 +130,7 @@ namespace {
  * stubs, and a missing default arg mangles the host launch's symbol differently from
  * the device image's kernel -- the loader then fails with "Cannot find Symbol" at the
  * first real launch (see COVERAGE fold postmortem). */
-template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0>
+template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams) {}
 template <int D, int KVDT, int SPLITK>
 __global__ __launch_bounds__(kT) void attn_paged_wmma_kernel2(R3dAttnParams) {}
@@ -262,6 +262,14 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
 #else
     if (dbuf < 0) dbuf = getenv("R3D_ATTN_NO_DBUF") ? 0 : 1;
 #endif
+    /* Q10 fp8 staging arms (see r3d_attn_wmma_body.inc stage_kv_tile). */
+    static int f8st = -1;
+#ifdef R3D_DBG
+    f8st = 0;
+#else
+    if (f8st < 0) { const char* sv = getenv("R3D_F8ST"); f8st = sv ? atoi(sv) : 0;
+                    if (f8st < 0 || f8st > 3) f8st = 0; }
+#endif
 
     const unsigned bm = v3 ? (unsigned)kBM3 : (unsigned)kBM;
     const unsigned tiles = (unsigned)((P.rows + bm - 1) / bm);
@@ -312,6 +320,16 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
         return r3d_launch256<0, 0>(P, grid, stream, dbg256);
     }
     else if (dbuf_ok)   { R3D_ARMS4(attn_paged_wmma_kernel, 0, 1) }
+    else if (f8st && !kvbf) {   /* Q10 armed fp8 staging (v1 only; dbuf_ok implies bf16) */
+        #define R3D_LAUNCH8(D, ST) hipLaunchKernelGGL((attn_paged_wmma_kernel<D, RAD_F8E4M3, 0, 0, 0, 0, ST>), grid, block, 0, stream, P)
+        if      (d128 && f8st == 1) R3D_LAUNCH8(128, 1);
+        else if (d128 && f8st == 2) R3D_LAUNCH8(128, 2);
+        else if (d128 && f8st == 3) R3D_LAUNCH8(128, 3);
+        else if (!d128 && f8st == 1) R3D_LAUNCH8(64, 1);
+        else if (!d128 && f8st == 2) R3D_LAUNCH8(64, 2);
+        else                        R3D_LAUNCH8(64, 3);
+        #undef R3D_LAUNCH8
+    }
     else                { R3D_ARMS(attn_paged_wmma_kernel)   }
     #undef R3D_ARMS4
     #undef R3D_LAUNCH4

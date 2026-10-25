@@ -125,7 +125,7 @@ using bf16 = roCW::bfloat16_t;
         * the launcher's gcnArchName gate never dispatches it on such a chip. */
 
 namespace {
-template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0>
+template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams) {}
 template <int D, int KVDT, int SPLITK>
 __global__ __launch_bounds__(kT) void attn_paged_wmma_kernel2(R3dAttnParams) {}
@@ -397,6 +397,17 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
 #else
     if (dbuf < 0) dbuf = getenv("R3D_ATTN_NO_DBUF") ? 0 : 1;
 #endif
+    /* Q10 fp8 staging arms (stage_kv_tile's F8ST slot): 0 verbatim default,
+     * 1 branchless VALU decode, 2 LDS LUT, 3 LUT + wide gather. Read once per
+     * process. R3D_DBG forces verbatim: the dbg wire keeps its own instrumented
+     * scalar loop that bypasses stage_kv_tile (same law as DBUF above). */
+    static int f8st = -1;
+#ifdef R3D_DBG
+    f8st = 0;
+#else
+    if (f8st < 0) { const char* sv = getenv("R3D_F8ST"); f8st = sv ? atoi(sv) : 0;
+                    if (f8st < 0 || f8st > 3) f8st = 0; }
+#endif
     const bool dbuf_ok = dbuf && !v2 && kvbf && (P.kv_sd == 1) && ((((uintptr_t)P.kv) & 15) == 0);
     #define R3D_DK_LAUNCH4(K, D, KV, SK, DB, FD)                                                           \
         do {                                                                                               \
@@ -415,6 +426,25 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
         else if (d128 && !kvbf) R3D_DK_LAUNCH(K, 128, RAD_F8E4M3);                   \
         else if (!d128 &&  kvbf) R3D_DK_LAUNCH(K, 64, RAD_BF16);                     \
         else                     R3D_DK_LAUNCH(K, 64, RAD_F8E4M3);
+    /* Q10 armed fp8 staging arms: same launch shapes as DK_LAUNCH/DK_LAUNCH4,
+     * F8ST template slot filled. Only attn_paged_wmma_kernel (v1) is armed --
+     * kernel2/kernel3 keep their own 3-arg templates and their own macro arms. */
+    #define R3D_DK_LAUNCH8(K, D, FD, ST)                                                                   \
+        do {                                                                                               \
+            hipLaunchKernelGGL((K<D, RAD_F8E4M3, 1, 0, FD, 0, ST>),                                        \
+                               dim3((unsigned)((FD) ? gx : P.q_heads), (unsigned)P.n_seq, (unsigned)gz),   \
+                               dim3(kThreads), 0, stream, P);                                              \
+            hipError_t e0 = hipGetLastError();                                                             \
+            if (e0 != hipSuccess) return RAD_E_DEVICE;                                                     \
+            hipLaunchKernelGGL((attn_splitk_merge_kernel<D>),                                              \
+                               dim3((unsigned)P.q_heads, (unsigned)P.rows), dim3(D), 0, stream, P, spl);   \
+            hipError_t e1 = hipGetLastError();                                                             \
+            return e1 == hipSuccess ? RAD_OK : RAD_E_DEVICE;                                               \
+        } while (0)
+    #define R3D_DK_F8(K, D, FD)                    \
+        if      (f8st == 1) R3D_DK_LAUNCH8(K, D, FD, 1); \
+        else if (f8st == 2) R3D_DK_LAUNCH8(K, D, FD, 2); \
+        else if (f8st == 3) R3D_DK_LAUNCH8(K, D, FD, 3)
     if (v2)           { R3D_DK_ARMS(attn_paged_wmma_kernel2) }
     else if (use_fold) {
         /* GQA fold: one block per kv head (grid x = gx = kv_heads), rows = the group's
@@ -425,9 +455,11 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
         if      (dbuf_ok &&  d128) R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 128, RAD_BF16,   1, 1, 1);
         else if (dbuf_ok)          R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 64,  RAD_BF16,   1, 1, 1);
         else if (d128 &&  kvbf)    R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 128, RAD_BF16,   1, 0, 1);
-        else if (d128 && !kvbf)    R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 128, RAD_F8E4M3, 1, 0, 1);
+        else if (d128 && !kvbf)    { R3D_DK_F8(attn_paged_wmma_kernel, 128, 1);
+                                     else R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 128, RAD_F8E4M3, 1, 0, 1); }
         else if (!d128 &&  kvbf)   R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 64,  RAD_BF16,   1, 0, 1);
-        else                       R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 64,  RAD_F8E4M3, 1, 0, 1);
+        else                       { R3D_DK_F8(attn_paged_wmma_kernel, 64, 1);
+                                     else R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 64, RAD_F8E4M3, 1, 0, 1); }
     }
     else if (dbuf_ok) {
         if      (d128 &&  kvbf) R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 128, RAD_BF16, 1, 1, 0);
@@ -435,9 +467,17 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
         else if (!d128 &&  kvbf) R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 64, RAD_BF16, 1, 1, 0);
         else                     R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 64, RAD_F8E4M3, 1, 0, 0);
     }
+    else if (f8st && !kvbf) {            /* v1 plain split-K, armed (v2 caught above) */
+        if (d128) { R3D_DK_F8(attn_paged_wmma_kernel, 128, 0);
+                    else R3D_DK_LAUNCH(attn_paged_wmma_kernel, 128, RAD_F8E4M3); }
+        else      { R3D_DK_F8(attn_paged_wmma_kernel, 64, 0);
+                    else R3D_DK_LAUNCH(attn_paged_wmma_kernel, 64, RAD_F8E4M3); }
+    }
     else              { R3D_DK_ARMS(attn_paged_wmma_kernel)  }
     #undef R3D_DK_ARMS
     #undef R3D_DK_LAUNCH4
+    #undef R3D_DK_LAUNCH8
+    #undef R3D_DK_F8
     #undef R3D_DK_LAUNCH
     return RAD_E_DEVICE;   /* unreachable: every macro arm returns */
 }
