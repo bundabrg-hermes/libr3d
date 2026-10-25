@@ -224,6 +224,152 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_kernel(
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Q1: vector-staged sibling of the shipped tile (docs/REVIEW_QUEUE.md Q1:
+ * QFN-P1 + Astra-P3 convergence + the Q17-delta1 donor fold-ins).
+ *
+ * The shipped tile stages each 64x16 slice with per-thread uint16 loads. This
+ * arm ports the attention body's shipped vec pattern (ld_kv_regs/st_kv_regs in
+ * r3d_attn_wmma_body.inc): 256 threads split by operand -- threads 0..127 stage
+ * A, threads 128..255 stage B, and each thread moves one uint4 (8 bf16 = a 32B
+ * contiguous wave segment per row pair). The operand split is wave-aligned
+ * (waves 0-3 only ever touch A, waves 4-7 only B), so there is no intra-wave
+ * divergence on the operand branch.
+ *
+ * BIT-IDENTITY BY SLOT BIJECTION: thread s = tid&127 names LDS slot (row s>>1,
+ * 8-column group s&1); every slot of every slice gets exactly one writer, the
+ * same global bytes land in the same slot as the scalar walk, and the fragment
+ * loads consume the identical slice contents in the identical order. The only
+ * permitted divergence is WHERE a thread's bytes come from in issue order, via
+ * the ROT fold below -- and rotation maps slot->slot by the same permutation it
+ * applies to global rows, so contents stay exact. Ragged-K rows fill the slot
+ * with guarded scalars (attention's odd-base fallback shape); ragged rows write
+ * zeros; both match the scalar walk's zero-fill contract exactly.
+ *
+ * kLdsPad CANNOT be reused: a uint4 LDS store needs the row stride 16B-aligned,
+ * so this kernel carries kVecPad = 16 (stride 32 elements = 64B; the shipped
+ * stride 20 is not). Consequence: LDS/WG grows 25 -> 38 KB, one workgroup per
+ * CU instead of two -- exactly the occupancy trade the card A/B adjudicates.
+ * (Padding also spreads fragment-load bank phases; the donor measured 16 and
+ * attention's Carve strides are vec-friendly for the same reason.)
+ *
+ * Donor fold-ins (Q17 delta 1, operator-released), both host-gated in the
+ * launcher and both off by default in this arm build:
+ *   R3D_M64_VEC -- vec staging, gated to MT>=2 row tiles: the donor measured
+ *       3-10% LOSES at one row tile, so the single-tile regime keeps the scalar
+ *       walk. Needs 16B bases + pitch%8==0 (else the "vec" load walks a row
+ *       that can straddle the buffer end -- fall back to the scalar arm).
+ *   R3D_M64_ROT -- per-(tile, k-slice) issue rotation (blockIdx.x + blockIdx.y
+ *       + ks) % 32, gated to K % 4096 == 0: the donor's 60-vs-185 GB/s
+ *       channel-camp pair came from K%4096==0 streams, and rotation costs a few
+ *       % at odd K. Skipped donor variants (recorded so nobody retries them):
+ *       64B windows, 16-step groups, register-held groups across a start switch.
+ * DBUF only: the single-buffer path is the kill switch and stays the shipped
+ * scalar walk verbatim.
+ * ------------------------------------------------------------------------- */
+constexpr int kVecPad = 16;
+
+template <bool ROT>
+__global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_vec_kernel(
+    const uint16_t* __restrict__ A, const uint16_t* __restrict__ B,
+    uint16_t* __restrict__ Y, float* __restrict__ Yf,
+    int M, int N, int K, int64_t a_pitch, int64_t b_pitch, int64_t y_pitch) {
+
+    constexpr int kLD = kKB + kVecPad;               /* 32 elements: 16B-aligned rows */
+    static_assert(kLD * 2 % 16 == 0, "vec LDS stores need 16B-aligned rows");
+    __shared__ uint16_t As[2][kMB][kLD];             /* DBUF only: always doubled */
+    __shared__ uint16_t Bs[kNB][kLD];                /* B single-buffered (block-06 law) */
+    __shared__ float    Ys[kMB][kNB + kVecPad];
+
+    const int m0 = blockIdx.y * kMB;
+    const int n0 = blockIdx.x * kNB;
+    const int w = threadIdx.x / kWave;
+    const int tw = w >> 1;
+    const int tc = (w & 1) * 2;
+
+    rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, bf16, rocwmma::row_major> fa;
+    rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, bf16, rocwmma::col_major> fb0, fb1;
+    rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> fc0, fc1;
+    rocwmma::fill_fragment(fc0, 0.0f);
+    rocwmma::fill_fragment(fc1, 0.0f);
+
+    const int srow = (threadIdx.x & 127) >> 1;       /* this thread's tile row 0..63 */
+    const int d8   = (threadIdx.x & 1) << 3;         /* its 8-column group: 0 or 8 */
+    const bool is_b = threadIdx.x >= 128;
+
+    /* Slot index after the (optional) issue rotation: a permutation of rows, so
+     * every slot keeps exactly one writer. */
+    auto slot = [&](int ks) {
+        return ROT ? (srow + (int)(((unsigned)(blockIdx.x + blockIdx.y + ks)) % kWave)) & (kMB - 1)
+                   : srow;
+    };
+
+    uint4 areg, breg;
+    auto ld_vec = [&](const uint16_t* __restrict__ Op, int64_t pitch, int base, int lim,
+                      int k0, int r, uint4* dst) {
+        const int gr = base + r;
+        if (gr < lim && k0 + d8 + 8 <= K) {
+            *dst = *reinterpret_cast<const uint4*>(Op + (int64_t)gr * pitch + k0 + d8);
+        } else if (gr < lim) {                       /* ragged K tail: guarded scalars */
+            uint16_t t8[8];
+            #pragma unroll
+            for (int u = 0; u < 8; ++u)
+                t8[u] = (k0 + d8 + u < K) ? Op[(int64_t)gr * pitch + k0 + d8 + u]
+                                          : (uint16_t)0;
+            *dst = *reinterpret_cast<const uint4*>(t8);
+        } else *dst = make_uint4(0u, 0u, 0u, 0u);    /* ragged rows: zero-fill */
+    };
+    auto prefetch = [&](int k0, int rot) {
+        if (is_b) ld_vec(B, b_pitch, n0, N, k0, rot, &breg);
+        else      ld_vec(A, a_pitch, m0, M, k0, rot, &areg);
+    };
+    auto stage_a = [&](int ab, int rot) {
+        if (!is_b) *reinterpret_cast<uint4*>(&As[ab][rot][d8]) = areg;
+    };
+    auto stage_b = [&](int rot) {
+        if (is_b) *reinterpret_cast<uint4*>(&Bs[rot][d8]) = breg;
+    };
+
+    const int nks = (K + kKB - 1) / kKB;
+    prefetch(0, slot(0));
+    stage_a(0, slot(0)); stage_b(slot(0));
+    __syncthreads();                                 /* prologue slices visible */
+    for (int ks = 0; ks < nks; ++ks) {
+        if (ks + 1 < nks) { prefetch((ks + 1) * kKB, slot(ks + 1));
+                            stage_a((ks + 1) & 1, slot(ks + 1)); }
+
+        const bf16* ap = reinterpret_cast<const bf16*>(&As[ks & 1][tw * 16][0]);
+        const bf16* bp0 = reinterpret_cast<const bf16*>(&Bs[tc * 16][0]);
+        const bf16* bp1 = reinterpret_cast<const bf16*>(&Bs[(tc + 1) * 16][0]);
+        rocwmma::load_matrix_sync(fa,  ap,  kLD, rocwmma::mem_row_major);
+        rocwmma::load_matrix_sync(fb0, bp0, kLD);
+        rocwmma::load_matrix_sync(fb1, bp1, kLD);
+        rocwmma::mma_sync(fc0, fa, fb0, fc0);
+        rocwmma::mma_sync(fc1, fa, fb1, fc1);
+
+        __syncthreads();                             /* As[ab]/Bs reads finished */
+        if (ks + 1 < nks) stage_b(slot(ks + 1));
+        __syncthreads();                             /* next slices visible */
+    }
+
+    __syncthreads();
+    rocwmma::store_matrix_sync(&Ys[tw * 16][tc * 16], fc0, kNB + kVecPad,
+                               rocwmma::mem_row_major);
+    rocwmma::store_matrix_sync(&Ys[tw * 16][(tc + 1) * 16], fc1, kNB + kVecPad,
+                               rocwmma::mem_row_major);
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < kMB * kNB; i += kThreads) {
+        const int r = i / kNB, c = i % kNB;
+        const int m = m0 + r, n = n0 + c;
+        if (m < M && n < N) {
+            const int64_t yb = (int64_t)m * y_pitch;
+            if (Yf) Yf[yb + n] = Ys[r][c];
+            else    Y[yb + n]  = r3d_f32_to_bf16_m64(Ys[r][c]);
+        }
+    }
+}
+
 } /* anonymous namespace */
 
 #else  /* generic and every non-RDNA3 target: the kernel exists as a no-op so the host
@@ -232,6 +378,10 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_kernel(
 namespace {
 template <bool DBUF>
 __global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_kernel(
+    const uint16_t*, const uint16_t*, uint16_t*, float*,
+    int, int, int, int64_t, int64_t, int64_t) {}
+template <bool ROT>
+__global__ __launch_bounds__(kThreads) void gemm_nt_bf16_m64_vec_kernel(
     const uint16_t*, const uint16_t*, uint16_t*, float*,
     int, int, int, int64_t, int64_t, int64_t) {}
 } /* anonymous namespace */
@@ -271,8 +421,25 @@ int r3d_gemm_nt_m64_launch(const void* A, const void* B, void* Y, float* Yf,
         return RAD_E_DEVICE;
     }
     static const bool dbuf = getenv("R3D_GEMM_NO_DBUF") == nullptr;
+    /* Q1 arms, both dark until released: vec staging (MT>=2 rows, aligned
+     * operands, DBUF schedule) and the K%4096==0-gated issue rotation on top. */
+    static const bool vec  = getenv("R3D_M64_VEC") != nullptr;
+    static const bool rot  = getenv("R3D_M64_ROT") != nullptr;
     dim3 grid((unsigned)((N + kNB - 1) / kNB), (unsigned)((M + kMB - 1) / kMB));
-    if (dbuf)
+    const int MT = (M + kMB - 1) / kMB;
+    const bool vec_ok = vec && dbuf && MT >= 2 &&
+                        (a_pitch % 8 == 0) && (b_pitch % 8 == 0) &&
+                        ((((uintptr_t)A) & 15) == 0) && ((((uintptr_t)B) & 15) == 0);
+    const bool rot_on = vec_ok && rot && (K % 4096 == 0);
+    if (vec_ok && rot_on)
+        hipLaunchKernelGGL((gemm_nt_bf16_m64_vec_kernel<true>), grid, dim3(kThreads), 0, stream,
+                           (const uint16_t*)A, (const uint16_t*)B, (uint16_t*)Y, Yf,
+                           M, N, K, a_pitch, b_pitch, y_pitch);
+    else if (vec_ok)
+        hipLaunchKernelGGL((gemm_nt_bf16_m64_vec_kernel<false>), grid, dim3(kThreads), 0, stream,
+                           (const uint16_t*)A, (const uint16_t*)B, (uint16_t*)Y, Yf,
+                           M, N, K, a_pitch, b_pitch, y_pitch);
+    else if (dbuf)
         hipLaunchKernelGGL((gemm_nt_bf16_m64_kernel<true>), grid, dim3(kThreads), 0, stream,
                            (const uint16_t*)A, (const uint16_t*)B, (uint16_t*)Y, Yf,
                            M, N, K, a_pitch, b_pitch, y_pitch);
@@ -286,7 +453,9 @@ int r3d_gemm_nt_m64_launch(const void* A, const void* B, void* Y, float* Yf,
     else if (getenv("R3D_DEBUG_GEMM")) {
         static bool once = false;
         if (!once) { once = true; fprintf(stderr, "libr3d: m64 WMMA tile launched (%s)\n",
-                                          dbuf ? "dbuf pipeline" : "single-buffer"); }
+                                          rot_on ? "vec staging rot=on"
+                                       : vec_ok ? "vec staging rot=off"
+                                       : dbuf   ? "dbuf pipeline" : "single-buffer"); }
     }
     return le == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
