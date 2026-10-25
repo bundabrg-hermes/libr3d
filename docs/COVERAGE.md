@@ -2035,6 +2035,6 @@ regimes; per-tile row rotation does not.
 
 Harness: tools/bench_m64.cpp (arm-expectation line mirrors the launcher gates;
 liveness %; Y-dump for cross-arm md5). Runners cat ~/scratch/r3d/q1_ab{,2}.sh.
-Zombie note: the shadow container q1serve went zombie (no --init) and survives
-undead as a docker entry -- harmless, next reboot clears; use --init (q1serve2
-did).
+Shadow-container note: the first one went zombie on teardown without --init (took
+a second before the runtime reaped it); q1serve2 ran --init and died cleanly.
+Always --init for serve shadows.
