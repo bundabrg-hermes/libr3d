@@ -1799,3 +1799,51 @@ generation_config.json -> whole-vocabulary live, the boot warning says so; the
 sample reads "help me" in Chinese at "The capital of France is"). Fine as a
 hash matrix, useless as a coherence check -- coherence stays asserted via the
 live-chat line on promotions and the battery carries correctness.
+
+## Q6: DPP row_xmask folds — the review queue's first shipped win (2026-10-25)
+
+Mechanism, verbatim from ISA Table 94: DPP_CTRL 0x160|mask (ROW_XMASK)
+fetches lane (n ^ mask) within the 16-lane row -- the butterfly partner,
+delivered on VALU (`v_mov_b32_dpp ... row_xmask:k`). GCN's row_xor (0xe)
+does NOT exist on RDNA3 -- LLVM renders it as a quad_perm and the folds
+come out wrong (probe v1: 32/32 lanes mismatched; RDNA replaced the GCN
+DPP table with DPP8/DPP16, chapters 15.3.8-9). The shipped `__shfl_xor`
+chain lowers to `ds_bpermute_b32` -- DS-pipe traffic that competes with
+every LDS read on the machine.
+
+Probe gate (q6probe2, exact q8x fold shape int 1/2 + float 4/8 + float 16):
+PROBE-BITEXACT, all 32 lanes vs the shipped chain. xor16 crosses the row
+(rows are 16 lanes) and stays shfl; V_PERMLANE16/X16 (opcodes 603/604) are
+the cross-row gathers if a later campaign wants them -- deliberately NOT
+used yet: 7.2.8 makes PERMLANE adjacent-to-V_CMPX illegal and inline asm
+gets no LLVM nop-insertion for it.
+
+Ship path: lever `R3D_Q8X_DPP` on the q8x decode gemv (both walk arms share
+the fold helpers). v123 (default-off): battery 9/9 all baseline fingerprints,
+per_op zero-diff stock/full/attr lever-vs-off, serve A/B 3/3 positive
+non-overlapping (same binary, env apart): base 41.52/42.42/42.11 vs dpp
+43.38/43.65/43.66 t/s -- +4.5/+2.9/+3.7%, lever-ON boot-proven live
+(`mt=4 pf=1 dpp=1`). Promoted default-ON (`8faec08`, NT evidence class:
+bit-identical, no numeric class, gates carry the proof); `R3D_Q8X_DPP=0`
+withdraws to the verbatim shfl chain (literal "0" law). v124 battery 9/9:
+default (dpp-on) and =0 arms all baseline-fingerprint, zero per-op diffs.
+**spec9g -> build_v124** (v121 rollback kept; chain v121/v119/v116/v113):
+boot-asserted [0:gfx1100], rank 0, mover 6.65 GiB, 736/736 bands, health
+200, coherent chat (reasoning-model trace reads correctly), decode probe
+44.18 t/s ctx-512 on the shipped default.
+
+Two same-day results bracket the bound: Q7 depth was NULL (load latency is
+hidden by 16 waves/CU occupancy -- the #7/#8 story again) while Q6 folds
+bought +3-4% (the DS pipe was the contended resource). A/B absolute values
+run lower on some days (52 vs 42 t/s) -- card clock state; only same-session
+pairs are comparable.
+
+Harness notes: the once-flag launch proof prints at FIRST REQUEST, after the
+boot.log a naive script snapshots -- capture logs AFTER the probe; and this
+checkpoint (no generation_config.json) emits `reasoning_content` before
+`content`, so a 12-token chat probe reads empty content -- budget >= 200 for
+coherence checks.
+
+Unrelated-but-noted: `radiance-flashnext` was RECREATED on cat at 14:10 AWST
+with a different model (qwen4exp, 262k ctx) -- operator action, predates this
+window's A/B, untouched by it.
