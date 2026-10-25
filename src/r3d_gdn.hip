@@ -391,13 +391,19 @@ constexpr uint32_t kScanChunk   = 64;    /* the pack's chunk, kkt_solve's and li
 constexpr int kSbChunk = 16;
 __device__ __forceinline__ void r3d_sched_stop() { __builtin_amdgcn_sched_barrier(0); }
 
-/* Host lever: R3D_GDN_SB = 0 (stock, measurement-build default) | 1 (fences) |
- * 3 (fences + rank-1/readout fusion). Anything else clamps to 0. chunk_scan has
- * no fusion leg: any nonzero value maps to its fenced arm. */
+/* Host lever: R3D_GDN_SB selects the GDN pressure arms. UNSET (shipping
+ * default): the recurrent rows run the fenced arm (SB=1: +24..+50% anchor
+ * decode, +12..+19% per-candidate, vgpr_spill 320/222/98 -> 0, fingerprint
+ * identical across 1000-launch rotating-slot runs); chunk_scan runs STOCK
+ * (its fence spills MORE -- 189->224 -- the pressure there is the resident
+ * st[128] itself, not a load window; the donor cure does not transfer).
+ * Explicit values: 0 = verbatim stock everywhere (withdrawal), 1 = fences,
+ * 3 = fences + rank-1/q-readout fusion on the recurrent rows (measured no
+ * different from 1; kept dark). chunk_scan: any nonzero value -> fenced arm. */
 static inline int gdn_sb_lever() {
     static const int v = []{ const char* s = std::getenv("R3D_GDN_SB");
-                             int x = s ? std::atoi(s) : 0;
-                             return (x == 1 || x == 3) ? x : 0; }();
+                             int x = s ? std::atoi(s) : -1;
+                             return (x == 0 || x == 1 || x == 3) ? x : (x < 0 ? -1 : 0); }();
     return v;
 }
 
@@ -1971,8 +1977,9 @@ static int gdn_chunk_scan_impl(const RadArgs* a, RadStream s) {
 
     const uint32_t shm = (uint32_t)(kScanChunk * Vd * sizeof(float));
     const uint32_t dtH = h0_on ? h0->dtype : RAD_F32, dtT = ht_on ? ht->dtype : RAD_F32;
-    auto scan_kern = gdn_sb_lever() ? &gdn_chunk_scan_kernel<1>
-                                    : &gdn_chunk_scan_kernel<0>;
+    const int sbc = gdn_sb_lever();          /* unset (-1): chunk_scan stays stock */
+    auto scan_kern = (sbc > 0) ? &gdn_chunk_scan_kernel<1>
+                               : &gdn_chunk_scan_kernel<0>;
     scan_kern<<<dim3((uint32_t)H, (uint32_t)N), dim3(kScanThreads), shm,
                 (hipStream_t)(uintptr_t)s>>>(
         (const uint8_t*)q->data, q->dtype, rad_dtype_bytes(q->dtype, q_s0), rad_dtype_bytes(q->dtype, q_s1),
@@ -2206,7 +2213,7 @@ static int gdn_recurrent_update_impl(const RadArgs* a, RadStream s) {
     bool q_on = false; R3dRow voq, vosc;
     int rq = r3d_qpair_view(oq, osc, T, Hv, Vd, &q_on, &voq, &vosc); if (rq) return rq;
 
-    const int sbq = gdn_sb_lever();
+    int sbq = gdn_sb_lever(); if (sbq < 0) sbq = 1;   /* unset: fenced arm ships */
     auto rec_kern = anchor ? (sbq >= 3 ? &gdn_recurrent_update_kernel<true, 3>
                               : sbq == 1 ? &gdn_recurrent_update_kernel<true, 1>
                                          : &gdn_recurrent_update_kernel<true, 0>)
@@ -2616,7 +2623,7 @@ static int gdn_conv_recurrent_update_impl(const RadArgs* a, RadStream s) {
     if (smem > 48 * 1024) return RAD_E_UNSUPPORTED;   /* LDS budget, incl. the recurrent leg */
 
     const int32_t w32 = (int32_t)width;
-    const int sbf = gdn_sb_lever();
+    int sbf = gdn_sb_lever(); if (sbf < 0) sbf = 1;   /* unset: fenced arm ships */
     auto fus_kern = anchor ? (sbf >= 3 ? &gdn_conv_recurrent_update_kernel<true, 3>
                               : sbf == 1 ? &gdn_conv_recurrent_update_kernel<true, 1>
                                          : &gdn_conv_recurrent_update_kernel<true, 0>)
