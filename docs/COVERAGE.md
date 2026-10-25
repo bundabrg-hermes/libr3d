@@ -2522,3 +2522,64 @@ DFlash-style drafter deployment on build_v139+, which collects +10..17% at the
 verify tile and never allocates the repack plane at any tile. Card session ran
 ~25 min card-exclusive (spec9g stopped, restarted clean: gfx1100 asserted, health
 200).
+
+
+## Window 17 (2026-10-26, morning) -- Q17 unparked; Q21 A/B: the WMMA skinny GEMM TRANSFERS at MT>=8 (+46..+211%)
+
+Operator released the Q17 drawer item ("unpark ... it may affect what next to
+look at") and the release proved out exactly that way. Queue rows re-stamped
+(Q17 released, Q21 parked->ready); the triage doc's remaining open datum --
+"i8a8 WMMA rate on gfx1100 not measured by us" -- became a probe, and the probe
+became the window.
+
+`tools/probe_wmma.cpp`, one binary, four stages, card session on the XTX:
+(1) RATES, liveness-gated per stage (per-stage memset + nonzero count -- the
+first pass skipped it and the ledger's dead-row law caught a lie in flight):
+WMMA i8 x s8 sustains 59,394 GMAC/s against the shipped dot4 chain's 17,933 --
+3.31x, with f16/bf16 in the same 56-62k band (the donor's "iu8 no faster than
+f16" holds engine-vs-engine on gfx1100 too, but the transfer comparison is
+WMMA-vs-dot4, and the 241 GB/s APU numbers were never the point). (2) The
+ACCUMULATOR lane map pinned by manufacturing a coordinate fragment: bf16
+A[i][k]=i*16+k, B=identity, dump fragment.x[] per lane -> lane l holds row
+2k+(l>>4), col l&15; the donor's `2e+(l>>4)` claim verified on our card; the
+i32 accumulator map is IDENTICAL. matrix_a row-major: row l&15, k = reg +
+8*(l>>4). This datum was Q11's single blocker -- UNBLOCKED.
+(3) THE ROCWMMA 8-BIT LANDMINE: u8 x u8 `mma_sync` compiles, loads run, and the
+gemm EMITS NOTHING -- accumulator all-zero under an identity-trick gemm, rate
+stage 1442x "faster than physics" (live=0/49152 once the liveness gate existed).
+The int8 x int8 path is the live one. Any u8-on-u8 WMMA code on this stack is a
+silent no-op; the two liveness stages that caught it (impossible rate, then
+zero accumulator under identity) are the detection recipe. (4) B-fragment
+contract probe under the skinny kernel's exact staging (col_major, token-major
+LDS, ldm=136): 256/256 CONFIRMED.
+
+Q21 itself (`tools/bench_skinny.cpp`, donor r35d_8a8_narrow_kernel pattern --
+16-row weight tile as matrix_a, tokens as matrix_b, i32 accumulate, per-128-
+group epilogue verbatim so the i32 group sums are order-free exact and the
+float tail is bit-identical by construction): SKINNY==NAIVE oracle everywhere;
+against the shipped ROW one element in 229,376 differs by 1 bf16 ulp, same
+element across shapes -- hypothesis: fma contraction in the library build's
+epilogue (NOT yet proven; the integration gate must test it, e.g. -ffp-contract
+=off repro arm). Timing (alternating, same process, same planes, IC-fit + cold):
+
+    M=1   -47.5% / -41.4%   (GEMV owns single-token decode)
+    M=4    -3.3%  (overlapping spreads: tie)
+    M=7   +46.6%  (separated)
+    M=14 +208.3% / +211.2%  (separated in both regimes)
+
+The pre-adjudication read it right directionally (the row at M=14 runs at 10.6%
+of even the dot4 peak -- staging-bound, and fragments cut LDS bytes per MAC 4x
+and remove the cross-lane flush entirely: the accumulator registers ARE the
+outputs). Two laws this window: a fragment engine's win can live in the STAGE,
+not the MAC ceiling (the M-scaling of GEMV was the xs re-stage, not dot4
+throughput); and wave-wide staging loops must be written per-wave -- the first
+build gated ws staging on tid<128 (waves 0..3) indexed by the writer's wave id,
+leaving every tile quarter-staged and LDS[4..7] uninitialized: near-miss
+outputs from stale LDS, the dead-row trap wearing an LDS disguise. A misread of
+my own probe output ("lane pairs") sent the first fix down a false path; the
+bmap probe, not the panic, found the real bug.
+
+VERDICT: Q21 closed as WIN-with-M-gate; integration (lever R3D_W2_SK, dispatch
+MT>=8 -> skinny, repro/battery/withdrawal) booked as Q21b -- it is a kernel
+family on a row spec9g never issues, so promotion needs no serve swap.
+Serve restored at close: health 200, gfx1100 boot-asserted, on build_v136.
