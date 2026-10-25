@@ -1990,3 +1990,51 @@ schedule that beats BOTH, e.g. partial unroll or a 4-deep sub-window; gate behin
 fresh bench win). Q12 (compressed-input dot4 on the same row) should re-read this
 section before touching the walk.
 
+
+## Q1 SHIPPED default-ON: b64 staging on the m64 WMMA tile, pad-16 falsified, rotation falsified (2026-10-25, window 9)
+
+The queue asked for attention's vec staging on the m64 tile loader plus the Q17
+donor fold-ins (rotation gated K%4096, staging gated MT>=2). All three shipped as
+one kernel (gemm_nt_bf16_m64_vec_kernel<ROT,PAD16>, shipped scalar kernel
+untouched) and split into three verdicts on the same gates:
+
+THE WIN (shipped default, build_v129): uint4 global loads + b64 LDS stores,
+rows keep the SHIPPED pad 4 (a 40B row is 8B-aligned at every 8-col slot, so no
+repadding is needed); threads 0-127 stage A, 128-255 stage B (wave-aligned, no
+divergence), slot bijection = bit-identical slices. Descriptor census:
+b64 arms vgpr 64/66 lds 25088 = BYTE-EQUAL to the shipped DBUF arm (72/25088)
+-- occupancy preserved. Kernel A/B (bench_m64, 3 interleaved rounds, same
+binary env apart, L2-rotating B planes): vs scalar +6.2% (1024x4096x4096),
++9.0% (1961), +7.5% (1024x11008), +7.0% (K=3584 odd), +18.1% (K=4104 odd),
+ALL non-overlapping spreads; MT=1 control rows parity. Bit-identity: md5-equal
+Y dumps across scalar/vec16/b64/b64+rot arms at every shape that ran.
+Battery v129: 8/8; full pack BYTE-IDENTICAL to v124; stock pack identical
+except the gate-budget note (1.45->1.58 GiB is gate.sh, predates this); the
+VEC=0 withdrawal arm stock byte-equal too. Serve A/B (v128 shadow container,
+bench9b 3281-token prompts): TTFT base med 18.861 vs b64 18.819 -- positive,
+non-overlapping by a hair; the bf16 tile is a small slice of this model's
+prefill, so the kernel-level SEP wins are the load-bearing evidence (Q18's
+promotion class). spec9g now on build_v129 (rollback spec9g_v124_rollback kept).
+
+THE FALSIFICATION (VEC=1, dark): uint4 LDS stores force 16B-aligned rows ->
+kVecPad 16 -> LDS/WG exactly 32768 -- two workgroups would need the FULL 64KB
+CU bank and the second one falls off. Measured -0.6..-9.1% (non-overlapping
+losses) at MT>=2. The queue's "kLdsPad 4->16" was the poison in the donor's
+recipe: padding bought the store width at the price of half the occupancy, and
+that price dominates. Astra's b64 fallback is what the donor's win actually
+needed (their engine's tile was presumably already pad-friendly).
+
+THE FALSIFICATION (ROT, dark): (blockIdx.x+blockIdx.y+ks)%32 row-issue rotation
+was a consistent LOSS on top of every staging arm (-2.4..-6.3% off its own
+baseline, mostly SEP), never a win. The donor's 60-vs-185 GB/s channel-camp pair
+does not reproduce here: the m64 wave already reads 2 rows x 32B contiguous per
+instruction (their law bit at 64B/16-step granularity -- skipped donor variants
+stayed skipped), so there is no camp to break and the rotation only scatters
+the row-walk. L2-convoy thinking (Q17 delta 7) covers this card's camping
+regimes; per-tile row rotation does not.
+
+Harness: tools/bench_m64.cpp (arm-expectation line mirrors the launcher gates;
+liveness %; Y-dump for cross-arm md5). Runners cat ~/scratch/r3d/q1_ab{,2}.sh.
+Zombie note: the shadow container q1serve went zombie (no --init) and survives
+undead as a docker entry -- harmless, next reboot clears; use --init (q1serve2
+did).
