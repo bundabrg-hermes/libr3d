@@ -1653,3 +1653,58 @@ by DRM number) — DRM numbers do NOT index ROCr; the authoritative proof is the
 own boot line, verified: `1 device(s) [0:gfx1100]`, `card 0000:17:00.0 rank 0`,
 selection libavx 736 / libr3d 736, weights 6.65 GiB VRAM mapped 0 B, 0 real refusals,
 67.4 t/s on a live chat completion, 88/99 drafter accepts.
+
+## The review queue opens: objdump-gated closures and the three ledger fixes (2026-10-25)
+
+`docs/REVIEW_QUEUE.md` (external-model passes) arrived with three owed ledger
+entries and two objdump-gated closures. All adjudicated against the SHIPPED
+v119 code objects (fatbin carve, per-target slice, llvm-objdump) before any
+card time was booked — the gpu-kernel-dev law that compiler-codegen claims are
+adjudicated by disassembly, and it paid immediately.
+
+**Ledger fix 1 — the `R3D_FP4_DOT2` leg.** Present in `r3d_gemm_mxfp4.hip`
+since issue #6 (M==1 only, opt-in, +5% best / 0% at deep ctx, default-off
+pending the profiling re-attribution), absent from this ledger until now.
+The external reviewer citing "a ledger entry that doesn't exist" was citing
+real code through a gap in OUR record. Recorded: the leg exists, the numbers
+above are its measured verdict, and it is NOT the shipped path.
+
+**Ledger fix 2 — flat-vs-global load selection: CLOSED, compiler already
+optimal.** v119 attention-family slices: 2,902 `global_load_*`, ZERO flat,
+ZERO buffer loads; m64 tiles 110 global / 0 flat. There is no load-class
+choice left to make. (The queue's 1,192-vs-11 count was a per-slice subset;
+the full-family scan is strictly cleaner — the closure stands on better data.)
+
+**Ledger fix 3 — the ds-pipe traffic census (motivates Q6/Q11).** Per-kernel
+`ds_bpermute_b32` totals from the shipped objects: the queue's "96/iter in
+q8x MT=8" actually describes the W2A8 gemv_q8 family (96 -> 148 across
+MT 1..16, x3 instantiations); the mxfp4 q8x production row itself carries 40
+at MT=8 — five `__shfl_xor` folds per m row (two integer, three float), so
+the Q6 target is half the advertised size on the serving kernel. The
+attention WMMA body carries 8,736 `ds_swizzle_b32` aggregate across its
+42 instantiations (232-404 per kernel — all from rocwmma fragment staging,
+zero from our hand-written code). Dot instructions confirm Phase A/B shipped:
+465 `v_dot4_i32_iu8` + 30 `v_dot4_i32_i8` across the family slices.
+
+**Q2 — the `s_barrier`-drains-loads claim — closed WITHOUT card time, the
+ISA-first rule applied.** The donor rationale (verbatim in Strata + hipfire:
+"s_barrier drains all in-flight global loads") is GCN-era law. The RDNA3
+ISA reference (S_BARRIER, p.254) says the opposite: "Barrier instructions do
+not wait for any counters to go to zero before issuing." The v119 disasm
+agrees with the ISA, not the donors: half the attention barriers are bare
+(`s_waitcnt lgkmcnt(0); s_barrier` with in-flight global loads crossing the
+barrier unharmed), and the other half carry explicit `vmcnt(0)` because
+`__syncthreads()` lowers through LLVM's conservative wait-insertion, which
+hoists `vmcnt(0)` whenever any vector global is live near the barrier — that
+is a CODEGEN artifact, not a hardware law. The DBUF arm's prefetches are
+therefore being drained by LLVM's wait insertion, not by the barrier — which
+means Q2's proposed donor idiom has nothing to fix at the hardware level, and
+any residual gain is an LLVM wait-placement problem (attackable, if ever, by
+narrowing live-global windows, not by porting Strata's wait-idiom). Status:
+closed-as-misdiagnosed, with the disasm numbers recorded above as the record.
+
+**Q3/Q4/Q8 batch shipped the same day** (elementwise u32 walks: actmul
+Contig/W32 arms, dflash_conv u32 + tap-modulo hoist, band block-uniform split
+with the latent grid-x-wrap guard, kv_store VEC uint4 walk; q8x/w2a8
+launch_bounds pins), gated on build_v120 in the same window. Rope was already
+u32 in place (claim verified-then-rejected).

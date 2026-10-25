@@ -16,13 +16,13 @@ land; each reorder cites the evidence that moved it.
 | # | Item | Source | Status | Notes |
 |---|------|--------|--------|-------|
 | Q1 | m64 GEMM vec staging (uint4/b128 + kLdsPad 4→16) | QFN-P1 + Astra-P3 (independent convergence) | ready | Ports the shipped attention vec-staging pattern into the m64 tile loader; ledger says scalar staging deliberate only as fraction-of-tile-traffic argument. Astra b64 variant = fallback arm. |
-| Q2 | DBUF barrier wait-idiom (`s_barrier` drains all in-flight global loads) | QFN pass2-P1 | gated | Gate: objdump the v119 DBUF attention body; count `vmcnt(0)` before `s_barrier`. If bare, closes as no-op. Donor rationale verbatim-verified in Strata + hipfire. Attacks the 171 GB/s binding term; 10 sites in DBUF arm, 16 more non-DBUF. |
-| Q3 | launch_bounds pins: mxfp4 (32,16), w2a8 (256,2) | QFN pass2-P5 | ready | Target arithmetic corrected from donor (w2a8 GEMVs use kThreads=256, not wave-per-row). Grouped with Q4 as the cheap batch. |
-| Q4 | Kill i64 div/mod in elementwise kernels | QFN-P3 | ready | 5 sites (actmul, dflash_conv decode x3, kvstore, rope, band); cast Contig precedent in-tree. |
-| Q5 | `__builtin_nontemporal_load` on q8x weight legs | QFN pass2-P8 | ready | Donor: +10–12% stream, −3% in-engine (cited honestly). q8x repack layout already satisfies precondition. |
-| Q6 | DPP/permute folds replacing `__shfl_xor` chains | Astra-P5 + QFN pass2 (independent convergence) | ready | CONFIRMED by disasm: `__shfl_xor` lowers to `ds_bpermute_b32`, 96/iter in q8x MT=8; attention body also carries 5,184 `ds_swizzle_b32` from rocwmma. Donor measured −27% with XOR tree preserved (bit-exactness law satisfied). |
-| Q7 | Depth-2 prefetch + ballot-gated lazy rescale | QFN pass2-P2 | parked | Sequenced after Q2: the cheap barrier is what lets the deeper prefetch survive. |
-| Q8 | 16B elementwise walks (copy-style kernels) | QFN-P4 + Astra-P6 | ready | kvstore scalar walk confirmed. Same class as Q4; merge bench arms. |
+| Q2 | DBUF barrier wait-idiom (`s_barrier` drains all in-flight global loads) | QFN pass2-P1 | **closed** | Gate ran on the v119 shipped slices: RDNA3 `S_BARRIER` does NOT drain counters (ISA p.254 verbatim: "Barrier instructions do not wait for any counters to go to zero before issuing") — the donor law is GCN-era, and half the attention barriers cross live global loads untouched (lgkmcnt-only waits). The `vmcnt(0)` before the other half is LLVM wait-insertion, not hardware. Donor idiom has no hardware target here; the residual (prefetch drained too early by the compiler) is a wait-placement problem whose only real lever is PREFETCH DEPTH — transferred to Q7. COVERAGE 2026-10-25 holds the census (8/16 DBUF barriers full-drain, 8-13 loads caught each). |
+| Q3 | launch_bounds pins: mxfp4 (32,16), w2a8 (256,2) | QFN pass2-P5 | **built** | Landed 7156a03 (+twins, gate.sh); build_v120 gates + kernel-descriptor VGPR occupancy census pending. Pin is a cap, not a boost: if the VGPR census shows the pins are already satisfied, close as codegen-no-op. |
+| Q4 | Kill i64 div/mod in elementwise kernels | QFN-P3 | **built** | Landed 7156a03: actmul Contig/W32 arms, dflash_conv u32 (provably in range via the launcher's 0xffff*kThreads cap) + tap-modulo hoist, band block-uniform split + latent grid-x-wrap guard. ROPE SITE REJECTED: `w / half` was already u32 in place — the claim conflated rope with band. |
+| Q5 | `__builtin_nontemporal_load` on q8x weight legs | QFN pass2-P8 | **built** | Opt-in `R3D_Q8X_NT` weight-leg-only (activations inline, cold-plane law); same-binary paired bench pending. |
+| Q6 | DPP/permute folds replacing `__shfl_xor` chains | Astra-P5 + QFN pass2 (independent convergence) | ready | Attribution CORRECTED from v119 disasm: the 96/iter@MT=8 figure is the w2a8 gemv_q8 family (96->148 across MT, x3 insts); the mxfp4 q8x serving row carries 40 (5 folds/m x 8). Attention swizzle aggregate is 8,736 across 42 instantiations (rocwmma fragment staging — not our code). Q6's true target is half the advertised size on the serving kernel. |
+| Q7 | Depth-2 prefetch + ballot-gated lazy rescale | QFN pass2-P2 | ready | RESEQUENCED from parked: the Q2 close transfers its residual here. Depth is the only lever that survives LLVM's barrier wait-insertion (issue #8 schedule-transfer law applies — A/B the mxfp4 q8x family separately, template the depth). |
+| Q8 | 16B elementwise walks (copy-style kernels) | QFN-P4 + Astra-P6 | **built** | kv_store VEC uint4 arm (16B alignment + sd==1 gate, byte-identical copies, scalar kept); lands with the Q4 batch on build_v120. |
 | Q9 | `v_dot2c_f32_bf16` in decode GEMVs | QFN-P2 | ready | 3-operand form via `dot2c_f16_m4` asm precedent (4-operand rejected by this ROCm's assembler — probe first). fp8→bf16 LUT already exists. |
 | Q10 | fp8 attention / KV staging widening campaign | Astra-P4 + QFN pass2-P3/P4 | ready | Merged campaign; hipfire leg of QFN-P4 is the load-bearing donor cite (`load_int_b2` anchor at pinned llama.cpp commit was stale). |
 | Q11 | Fragment lane-map epic: fragment-side softmax (QFN pass1-P7) + VGPR group flushes (Astra-P2) | both models | gated | Single blocker: pin WMMA accumulator lane map on-card (no rocWMMA coordinate fragments; ledger :858). Two branches, one probe. |
@@ -36,13 +36,14 @@ land; each reorder cites the evidence that moved it.
 
 | Item | Source | Closure |
 |------|--------|---------|
-| flat-vs-global load selection | QFN-P5 | Objdump of v119 build on cat: attention emits 1,192 `global_load_*` vs 11 stray flat; m64 all-global; `global_load_b128` present. Compiler already optimal. Enter in COVERAGE.md. |
+| flat-vs-global load selection | QFN-P5 | Objdump of v119 build, MAINTAINER-RE-VERIFIED on the full family (not a slice subset): attention family 2,902 `global_load_*` / ZERO flat / ZERO buffer; m64 tiles 110 global / 0 flat. Compiler already optimal. Entered in COVERAGE.md 2026-10-25. |
+| Q2 DBUF barrier idiom | QFN pass2-P1 | ISA p.254 + shipped-slice disasm (see queue row above and COVERAGE chronicle). |
 
 ## Ledger fixes owed to COVERAGE.md
 
-1. Record the `R3D_FP4_DOT2` opt-in leg (present in mxfp4.hip, absent from ledger) — QFN cited a ledger entry that doesn't exist; the code leg is real.
-2. Record the flat-vs-global closure above.
-3. Record the ds-pipe traffic census (96 `ds_bpermute`/iter q8x MT=8; 5,184 `ds_swizzle_b32` attention body) — motivates Q6/Q11.
+ALL THREE LANDED 2026-10-25 (COVERAGE.md, "The review queue opens" section):
+the `R3D_FP4_DOT2` leg record, the flat-vs-global closure, and the ds-pipe
+traffic census (with the Q6 attribution correction).
 
 ## Submission integrity record
 
@@ -51,5 +52,6 @@ land; each reorder cites the evidence that moved it.
 | QFN | 1 | 14/15 | `buffer_load_dword` mnemonic slip (fixed in full version); missing `validation_notes` + `no_op_findings` blocks (silence carries no weight) |
 | Astra | 1 | 12/12 (cleanest) | Reviewed snapshot 44b614b, one commit behind; anchors verified |
 | QFN | 2 | 15 donor files at pinned SHAs, rationale comments verbatim | P5 w2a8 mapping corrected (kThreads=256); P4 `load_int_b2` anchor stale at pinned llama.cpp commit; q8x issue count 5 not 7; some line anchors drifted 5–20 lines (HEAD moved) |
+| maintainer | desk | — | Desk-verify of pass-2 against the tree + shipped disasm: P1 donor law false on RDNA3 (closed above); P3 rope site already u32 (rejected); P1/P6 "96 @ q8x MT=8" belongs to the w2a8 family, mxfp4 q8x row carries 40; pass-2's flat/global closure re-verified with strictly cleaner numbers |
 
 Pending: Astra pass 2. When it lands, cross-verify its donor reads against QFN pass 2 (especially the Q2 barrier idiom — a second gfx11 sighting would downgrade the objdump gate to a spot check).
