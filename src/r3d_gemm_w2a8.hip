@@ -341,6 +341,24 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_kernel(
  * weight bytes and sixteen activation bytes per lane per group, which is also the
  * bytes-in-flight direction the MLP-starvation finding (issue #8 follow-up) names.
  */
+/* THE single u2->u8 bit-expansion (Q12): one byte's four 2-bit codes, one code a byte
+ * lane of a dword. The repack kernel AND the compressed-input arm (C4=1) both go
+ * through these two functions, so "expanded inline" and "repacked offline" are equal by
+ * SOURCE, not by bench (the Q18 law: identical values are a construction, adjudicated
+ * afterwards, never proven afterwards). Exact bijection: codes are 2-bit, 0..3. */
+__device__ __forceinline__ uint32_t w2_expand4(uint32_t b) {
+    return (b & 3u) | ((b >> 2 & 3u) << 8) | ((b >> 4 & 3u) << 16) | ((b >> 6) << 24);
+}
+/* one packed dword = sixteen codes = exactly one lane's window operand b4. */
+__device__ __forceinline__ uint4 w2_expand16(uint32_t w) {
+    uint4 o;
+    o.x = w2_expand4(w & 0xffu);
+    o.y = w2_expand4((w >> 8) & 0xffu);
+    o.z = w2_expand4((w >> 16) & 0xffu);
+    o.w = w2_expand4(w >> 24);
+    return o;
+}
+
 __global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_repack_kernel(
     const uint8_t* __restrict__ B, uint8_t* __restrict__ B8,
     int64_t b_pitch, int64_t kb)
@@ -349,14 +367,7 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_repack_kernel(
     const int u = blockIdx.y * kThreads + threadIdx.x;      /* sixteen-code units */
     if (u >= (kb >> 2)) return;
     const uint32_t w = *(const uint32_t*)(B + row * b_pitch + ((int64_t)u << 2));
-    const uint32_t b0 = w & 0xffu, b1 = (w >> 8) & 0xffu, b2 = (w >> 16) & 0xffu,
-                   b3 = w >> 24;
-    uint4 o;
-    o.x = (b0 & 3u) | ((b0 >> 2 & 3u) << 8) | ((b0 >> 4 & 3u) << 16) | ((b0 >> 6) << 24);
-    o.y = (b1 & 3u) | ((b1 >> 2 & 3u) << 8) | ((b1 >> 4 & 3u) << 16) | ((b1 >> 6) << 24);
-    o.z = (b2 & 3u) | ((b2 >> 2 & 3u) << 8) | ((b2 >> 4 & 3u) << 16) | ((b2 >> 6) << 24);
-    o.w = (b3 & 3u) | ((b3 >> 2 & 3u) << 8) | ((b3 >> 4 & 3u) << 16) | ((b3 >> 6) << 24);
-    *(uint4*)(B8 + (row << 2) * b_pitch + ((int64_t)u << 4)) = o;
+    *(uint4*)(B8 + (row << 2) * b_pitch + ((int64_t)u << 4)) = w2_expand16(w);
 }
 
 /* crow walks B8 at FOUR times the u2 pitch (the repack preserves row padding); the lane
@@ -422,17 +433,27 @@ __device__ __forceinline__ void q8_dword_iter(
     __syncthreads();                              /* xs rewritten next dword */
 }
 
-template <int MT, int W>
+/* Q12 compressed-input arm (C4=1, lever R3D_W2_C4): BC is the ENGINE's packed u2
+ * plane at b_pitch (C4=0: the plugin's repacked B8 at 4*b_pitch, verbatim shipped).
+ * The lane's sixteen window codes are ONE packed dword; the fetch expands it with the
+ * repack kernel's own helper, so b4 is the shipped operand by construction and
+ * q8_dword_iter never learns which world it came from. Weight traffic per lane per
+ * window: 4 bytes instead of 16 (the cold-pass 4x is the whole point); the window
+ * registers shrink 4x too (uint32 pwin vs uint4 bwin), and the repack cache, its side-
+ * stream fill and its 1.5 GiB ceiling are bypassed wholesale at launch. Costs: the
+ * expansion VALU per fetch and (at the tail) one byte load instead of one dword. */
+template <int MT, int W, int C4>
 __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     const int8_t* __restrict__ A,
-    const uint8_t* __restrict__ B8,     /* repacked codes, pitch = 4 * b_pitch bytes */
+    const uint8_t* __restrict__ BC,     /* C4=0: repacked codes (pitch = 4*b_pitch);
+                                           C4=1: the packed u2 plane at b_pitch */
     uint16_t* __restrict__ Y,
     const float* __restrict__ AS,
     const __half* __restrict__ SC,
     const uint8_t* __restrict__ ZP,
     const float* __restrict__ SUM,
     int M, int N, int K, int mpad, int u4zp,
-    int64_t a_pitch, int64_t b8_pitch, int64_t y_pitch, int64_t as_pitch,
+    int64_t a_pitch, int64_t bc_pitch, int64_t y_pitch, int64_t as_pitch,
     int64_t sc_pitch, int64_t zp_pitch)
 {
     __shared__ __align__(16) int8_t xs[MT * 512];
@@ -443,7 +464,7 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     const int rr   = r < N ? r : N - 1;
     const int live = M < MT ? M : MT;
 
-    const uint8_t* crow = B8 + (int64_t)rr * b8_pitch;
+    const uint8_t* crow = BC + (int64_t)rr * bc_pitch;
 
     for (int i = threadIdx.x; i < MT * 512; i += kThreads) xs[i] = 0;
     float acc[MT];
@@ -479,37 +500,78 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     if constexpr (MT <= 4) {
         for (int wbase = 0; wbase < nd; wbase += W) {
             const int rem = (nd - wbase < W) ? (nd - wbase) : W;
-            uint4 bwin[W];
+            if constexpr (C4) {
+                /* Q12: same window SHAPE (both loops unrolled to W, block-uniform
+                 * guard) on packed dwords -- four bytes per lane per window unit --
+                 * expanded at CONSUMPTION so the window lives in W VGPRs, not 4W. */
+                uint32_t pwin[W];
 #pragma unroll
-            for (int d = 0; d < W; ++d)
-                bwin[d] = (d < rem)
-                    ? *(const uint4*)(crow + (((int64_t)(wbase + d)) << 9) + (lane << 4))
-                    : make_uint4(0u, 0u, 0u, 0u);
+                for (int d = 0; d < W; ++d)
+                    pwin[d] = (d < rem)
+                        ? *(const uint32_t*)(crow + (((int64_t)(wbase + d)) << 7)
+                                             + (lane << 2))
+                        : 0u;
 #pragma unroll
-            for (int d = 0; d < W; ++d)
-                if (d < rem)
-                    q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2, bwin[d], live, rr,
-                                      SC, ZP, SUM, AS, u4zp, a_pitch, sc_pitch,
-                                      zp_pitch, mpad, as_pitch);
-        }
-    } else {
-        /* MT >= 8: the verbatim pre-Q18 walk (see the gate note above). */
-        for (int wbase = 0; wbase < nd; wbase += W) {
-            const int rem = (nd - wbase < W) ? (nd - wbase) : W;
-            uint4 bwin[W];
-            if constexpr (W > 1) {
+                for (int d = 0; d < W; ++d)
+                    if (d < rem)
+                        q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2,
+                                          w2_expand16(pwin[d]), live, rr, SC, ZP, SUM,
+                                          AS, u4zp, a_pitch, sc_pitch, zp_pitch, mpad,
+                                          as_pitch);
+            } else {
+                uint4 bwin[W];
 #pragma unroll
                 for (int d = 0; d < W; ++d)
                     bwin[d] = (d < rem)
                         ? *(const uint4*)(crow + (((int64_t)(wbase + d)) << 9) + (lane << 4))
                         : make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+                for (int d = 0; d < W; ++d)
+                    if (d < rem)
+                        q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2, bwin[d], live, rr,
+                                          SC, ZP, SUM, AS, u4zp, a_pitch, sc_pitch,
+                                          zp_pitch, mpad, as_pitch);
             }
-            for (int d = 0; d < rem; ++d) {
-                const uint4 b4  = (W > 1) ? bwin[d]
-                    : *(const uint4*)(crow + (((int64_t)wbase + d) << 9) + (lane << 4));
-                q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2, b4, live, rr, SC, ZP,
-                                  SUM, AS, u4zp, a_pitch, sc_pitch, zp_pitch, mpad,
-                                  as_pitch);
+        }
+    } else {
+        /* MT >= 8: the verbatim pre-Q18 walk (see the gate note above). */
+        for (int wbase = 0; wbase < nd; wbase += W) {
+            const int rem = (nd - wbase < W) ? (nd - wbase) : W;
+            if constexpr (C4) {
+                uint32_t pwin[W];
+                if constexpr (W > 1) {
+#pragma unroll
+                    for (int d = 0; d < W; ++d)
+                        pwin[d] = (d < rem)
+                            ? *(const uint32_t*)(crow + (((int64_t)(wbase + d)) << 7)
+                                                 + (lane << 2))
+                            : 0u;
+                }
+                for (int d = 0; d < rem; ++d) {
+                    const uint4 b4 = (W > 1)
+                        ? w2_expand16(pwin[d])
+                        : w2_expand16(*(const uint32_t*)(
+                              crow + (((int64_t)wbase + d) << 7) + (lane << 2)));
+                    q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2, b4, live, rr, SC, ZP,
+                                      SUM, AS, u4zp, a_pitch, sc_pitch, zp_pitch, mpad,
+                                      as_pitch);
+                }
+            } else {
+                uint4 bwin[W];
+                if constexpr (W > 1) {
+#pragma unroll
+                    for (int d = 0; d < W; ++d)
+                        bwin[d] = (d < rem)
+                            ? *(const uint4*)(crow + (((int64_t)(wbase + d)) << 9) + (lane << 4))
+                            : make_uint4(0u, 0u, 0u, 0u);
+                }
+                for (int d = 0; d < rem; ++d) {
+                    const uint4 b4  = (W > 1) ? bwin[d]
+                        : *(const uint4*)(crow + (((int64_t)wbase + d) << 9) + (lane << 4));
+                    q8_dword_iter<MT>(A, xs, acc, (wbase + d) << 2, b4, live, rr, SC, ZP,
+                                      SUM, AS, u4zp, a_pitch, sc_pitch, zp_pitch, mpad,
+                                      as_pitch);
+                }
             }
         }
     }
@@ -522,7 +584,11 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
             xs[(m << 9) + kk] = A[(int64_t)m * a_pitch + kbase + w2_step_pos(kk)];
         }
         __syncthreads();
-        const uint32_t bb = *(const uint32_t*)(crow + kbase + (lane << 2));
+        /* Q12: C4 reads ONE packed byte per lane (four codes) and expands it with the
+         * same helper; kbase is a whole multiple of 128 so the >>2 is exact. */
+        const uint32_t bb = C4
+            ? w2_expand4((uint32_t)crow[(kbase >> 2) + lane])
+            : *(const uint32_t*)(crow + kbase + (lane << 2));
         int32_t isub[MT];
 #pragma unroll
         for (int m = 0; m < MT; ++m)
@@ -572,9 +638,11 @@ template <int MT, int W>
 __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_kernel(
     const int8_t*, const uint8_t*, uint16_t*, const float*, const __half*, const uint8_t*,
     const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) {}
-/* the q8 arm mirrors too (same rule): the repack kernel and the q8 GEMV. */
+/* the q8 arm mirrors too (same rule): the repack kernel and the q8 GEMV. Q12 added
+ * the C4 template parameter -- mirrored here or every q8c instantiation launches as
+ * invalid device function on any non-gfx11 build of the plugin. */
 __global__ void gemm_nt_w2a8_repack_kernel(const uint8_t*, uint8_t*, int64_t, int64_t) {}
-template <int MT, int W>
+template <int MT, int W, int C4>
 __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     const int8_t*, const uint8_t*, uint16_t*, const float*, const __half*, const uint8_t*,
     const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) {}
@@ -697,6 +765,9 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
     static const bool no_pf = getenv("R3D_NO_GEMV_PF") != nullptr;
     static const int  pf_w  = getenv("R3D_GEMV_PF_W") ? atoi(getenv("R3D_GEMV_PF_W")) : 8;
     static const bool no_q8 = getenv("R3D_NO_W2A8_Q8X") != nullptr;
+    /* Q12: compressed-input dot4 -- the GEMV walks the engine's packed u2 plane and
+     * expands inline; the repack cache is never consulted and never filled. */
+    static const bool c4 = getenv("R3D_W2_C4") != nullptr;
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
     /* MT rounds UP to cover M: the tile computes min(M, MT) rows and there is no
      * m-loop, so MT < M silently drops rows (serve 2026-10-24: the drafter's block
@@ -720,7 +791,7 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
     static int   ncache = 0;
     static bool  q8_dead = no_q8;
     uint8_t* B8 = nullptr;
-    if (!q8_dead) {
+    if (!c4 && !q8_dead) {
         for (int i = 0; i < ncache; ++i)
             if (cache[i].src == P.B && cache[i].N == P.N && cache[i].K == P.K &&
                 cache[i].bp4 == 4 * P.b_pitch) { B8 = cache[i].dst; break; }
@@ -776,10 +847,17 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
         default: R3D_W2_GEMV(16, W_); break;          \
     }
 #define R3D_W2_Q8(MT_, W_)                                                       \
-    hipLaunchKernelGGL((gemm_nt_w2a8_gemv_q8_kernel<MT_, W_>), grid,             \
+    hipLaunchKernelGGL((gemm_nt_w2a8_gemv_q8_kernel<MT_, W_, 0>), grid,          \
                        dim3(kThreads), 0, stream, P.A, B8, (uint16_t*)ydata,     \
                        P.AS, P.SC, P.ZP, P.SUM, (int)P.M, (int)P.N, (int)P.K,    \
                        P.mpad, P.u4zp, P.a_pitch, 4 * P.b_pitch, y_pitch,        \
+                       P.as_pitch, P.sc_pitch, P.zp_pitch)
+/* Q12: same launch shape on the packed plane (b_pitch, not 4*b_pitch). */
+#define R3D_W2_Q8C(MT_, W_)                                                      \
+    hipLaunchKernelGGL((gemm_nt_w2a8_gemv_q8_kernel<MT_, W_, 1>), grid,          \
+                       dim3(kThreads), 0, stream, P.A, P.B, (uint16_t*)ydata,    \
+                       P.AS, P.SC, P.ZP, P.SUM, (int)P.M, (int)P.N, (int)P.K,    \
+                       P.mpad, P.u4zp, P.a_pitch, P.b_pitch, y_pitch,            \
                        P.as_pitch, P.sc_pitch, P.zp_pitch)
 #define R3D_W2_Q8_SW(W_)                            \
     switch (mt) {                                   \
@@ -789,7 +867,20 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
         case 8: R3D_W2_Q8(8, W_); break;            \
         default: R3D_W2_Q8(16, W_); break;          \
     }
-    if (B8) {
+#define R3D_W2_Q8C_SW(W_)                           \
+    switch (mt) {                                   \
+        case 1: R3D_W2_Q8C(1, W_); break;           \
+        case 2: R3D_W2_Q8C(2, W_); break;           \
+        case 4: R3D_W2_Q8C(4, W_); break;           \
+        case 8: R3D_W2_Q8C(8, W_); break;           \
+        default: R3D_W2_Q8C(16, W_); break;         \
+    }
+    if (c4) {
+        if (no_pf)          { R3D_W2_Q8C_SW(1) }
+        else if (pf_w == 16){ R3D_W2_Q8C_SW(16) }
+        else                { R3D_W2_Q8C_SW(8) }
+    }
+    else if (B8) {
         if (no_pf)          { R3D_W2_Q8_SW(1) }
         else if (pf_w == 16){ R3D_W2_Q8_SW(16) }
         else                { R3D_W2_Q8_SW(8) }
@@ -797,6 +888,8 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
     else if (no_pf)      { R3D_W2_GEMV_SW(1) }
     else if (pf_w == 16) { R3D_W2_GEMV_SW(16) }
     else                 { R3D_W2_GEMV_SW(8) }
+#undef R3D_W2_Q8C_SW
+#undef R3D_W2_Q8C
 #undef R3D_W2_Q8_SW
 #undef R3D_W2_Q8
 #undef R3D_W2_GEMV_SW
@@ -808,7 +901,7 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
     else if (getenv("R3D_DEBUG_GEMM")) {
         static bool once = false;
         if (!once) { once = true; fprintf(stderr, "libr3d: w2a8 decode gemv launched (mt=%d, %s)\n",
-                                          mt, B8 ? "q8" : "u2"); }
+                                          mt, c4 ? "q8c" : (B8 ? "q8" : "u2")); }
     }
 }
 
