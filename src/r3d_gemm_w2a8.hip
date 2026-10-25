@@ -765,15 +765,25 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
     static const bool no_pf = getenv("R3D_NO_GEMV_PF") != nullptr;
     static const int  pf_w  = getenv("R3D_GEMV_PF_W") ? atoi(getenv("R3D_GEMV_PF_W")) : 8;
     static const bool no_q8 = getenv("R3D_NO_W2A8_Q8X") != nullptr;
-    /* Q12: compressed-input dot4 -- the GEMV walks the engine's packed u2 plane and
-     * expands inline; the repack cache is never consulted and never filled. */
-    static const bool c4 = getenv("R3D_W2_C4") != nullptr;
+    /* Q12 SHIPPED default-ON for the MT<=4 register-window ladder and the MT=8 arm
+     * (A/B, same binary 6 paired samples per shape, EVERY spread non-overlapping --
+     * log ~/scratch/r3d/q12_ab2.txt): cold-vs-cold (both plane sets past the card
+     * cache) M=1 +24..30%, M=4 +7..14%, M=7 +12..16%; the cache-fit regime (packed
+     * set resident, repacked set streaming) M=1 +15%. MT=16 LOSES -1..-3% non-overlapping
+     * -- the expansion VALU prices the wide tile past the 4x traffic cut, the same
+     * per-geometry law that gates the Q18 register window, so MT>=16 keeps the repack
+     * walk and its cache verbatim. Opt-out: R3D_W2_C4=0 (withdrawal arm, gated byte-
+     * equal); the packed walk expands with the repack kernel's own helper, so outputs
+     * are bit-identical to the repack walk at every M (repro 13/13 exact both arms). */
+    static const bool no_c4 = getenv("R3D_W2_C4") && atoi(getenv("R3D_W2_C4")) == 0;
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
     /* MT rounds UP to cover M: the tile computes min(M, MT) rows and there is no
      * m-loop, so MT < M silently drops rows (serve 2026-10-24: the drafter's block
      * pass collapses the draft rows to 7 -- the old down-round picked MT=4 and
      * lost 3). The band's M<=16 bound makes the 16 tile the ceiling. */
     const int mt = P.M >= 9 ? 16 : P.M >= 5 ? 8 : P.M >= 3 ? 4 : P.M >= 2 ? 2 : 1;
+    /* the family kill-switch withdraws BOTH q8 fast arms (sibling-row law): C4 too. */
+    const bool c4 = (mt <= 8) && !no_c4 && !no_q8;   /* Q12 gate: MT=16 keeps the repack walk */
     const dim3 grid((unsigned)((P.N + 7) / 8));
 
     /* ---- the q8 repack cache (the a16 rule from r3d_gemm_mxfp4.hip: the plugin's OWN
