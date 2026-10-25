@@ -1847,3 +1847,67 @@ coherence checks.
 Unrelated-but-noted: `radiance-flashnext` was RECREATED on cat at 14:10 AWST
 with a different model (qwen4exp, 262k ctx) -- operator action, predates this
 window's A/B, untouched by it.
+
+
+## Q9 probed, folded, measured NULL: the bf16 donor instruction does not exist on this card (2026-10-25)
+
+Q9 asked for `v_dot2c_f32_bf16` in the decode GEMVs "probe the 3-operand form first".
+The probe is the whole story of the first half, so the record keeps all of it:
+
+**bf16 is hardware-present, assembler-absent, and the ISA explains both.** ROCm 10.1's
+gfx1100 inline-asm table rejects `v_dot2c_f32_bf16` ("instruction not supported on this
+GPU"), `v_dot2acc_f32_bf16` ("invalid instruction, did you mean: v_dot2acc_f32_f16?"),
+and the `_e32` suffix. Cross-checked against the ISA corpus: RDNA3 has NO VOP2 bf16 dot
+form (VOP2 dot family is f16-only); VOP3P `V_DOT2_F32_BF16` (opcode 26) exists but the
+16-bit VOP3P encoding places src3 in the literal pool only -- it cannot accumulate into
+a register; bf16 accumulate exists ONLY as the VOPD dual instruction
+`V_DUAL_DOT2ACC_F32_BF16` (ISA p.370/372, "initial value in D is used as S2"), which is
+not inline-asm reachable. Donors writing bf16 dot2 proposals for "gfx11" are writing
+them for RDNA3.5+, where the VOP2 form exists. (Hand-encoded VOPD stays a theoretical
+door; closed as not worth the hazard surface for a fold this size.)
+
+**The fold survives on f16, exactly as the shipped mxfp4 dot2 leg (issue #6) does.**
+e4m3 embeds EXACTLY in f16 (<=4 significant bits, |v| in {0} U [2^-9, 448], every value
+an f16 normal), products exact in f32. Probe v2/v3 (XTX-asserted): the tie discriminator
+says the pair is summed with the adder's guard bits BEFORE the fused add to acc
+(1+2^-23, not 1.0); the narrow-exact-band random battery matches none of ascending-fma,
+pair-rounded, or exact-pair-single-round models -- the in-lane order is opaque at
+maxrel 6.5e-4..1.1e-3 per 128-chain. Carve-objdump lowering proof: the 3-op asm resolves
+to VOP2 `v_dot2acc_f32_f16` (16-bit encoding, no clamp bit). This is the same
+tol-graded class issue #6 shipped on.
+
+**The arm.** `gemm_nt_fp8a8_gemv_kernel<MT, W, D2>`: LDS 256-entry e4m3->f16 weight LUT
+(4 gathers + 2 packs REPLACE the 4x ~10-VALU decode chain, hoisted out of the m loop),
+activations stage as packed f16 pairs (xs16, half the LDS), inner = 1 LDS.64 + 2 dot2c
+per row per group. Lever `R3D_FP8A8_D2` (literal "0" withdraws; default OFF, this item
+never earned promotion). build_v125 (md5 8ebf6f4797296fb13becc08457acfb10), battery
+10/10: six default arms byte-identical vs v124 fingerprints (34+36+1+1+1+2 ops zero
+diff); four lever-ON arms pass, with the fp8a8 decode ops moving from exactly
+0.00e+00 to 1.35e-08 (M=4) / 2.93e-06 (M=1) / 1.89e-05 (M=8) against tol 5e-03 --
+order-only drift, three decades under budget, and per-op POSITIVE proof the arm ran
+(the per_op_cmp zero-column masked it: its regex compares the tol column, the reports
+themselves diff).
+
+**Serve A/B (qwen3.5-9b-fp8, port 9008, spec9g stopped, same binary one env apart,
+d2=0/d2=1 boot-proof every arm, refusal lines equal):** off 19.99 / 21.77 / 21.61
+vs on 20.41 / 20.19 / 18.49 tok/s ctx-512. One round positive, two negative, r3_on
+outside the entire off range; on-mean -6.7%. No positive structure to promote on.
+CLOSED NULL, arm stays dark. Issue #8's law re-proven from the other side: the mxfp4
+plateau fell to GEOMETRY (dot4 repack), not instruction count -- and the fp8a8 row,
+whose dword-per-lane walk was already aligned one-wavefront-per-group geometry, was
+never instruction-count-bound, so removing ~30 VALU/lane/group bought nothing while
+the LUT gathers added LDS pressure.
+
+**Harness notes this window (now laws):** containers on cat need
+`--device=/dev/kfd --device=/dev/dri --group-add video` (hipGetDevice -> count=0
+without them, and the failure looks like a card problem); ROCm 10.1 fatbin carve goes
+through `--save-temps` + the `*.hipfb.amdgcn.gfx1100.img.lto.o` ELF (clang-offload-bundler
+segfaults on the new bundle format); f16 host decoders want the sign/exponent fields of
+the RAW 16-bit word, not a shifted-to-f32 pattern (two probe arms burned on that off-by-one);
+`pkill -f <script>` on cat self-matches the driving ssh command -- use the [b]racket pattern.
+If an fp8 serve model returns to the hot seat, the retry knob is LIBR35D_TRIAGE item 3's
+3-instruction arithmetic e4m3->f16 widening in place of the LDS LUT.
+
+Unrelated-but-noted: operator merged PR #14 (docs/LIBR35D_TRIAGE.md + tools/spill_census.py,
+the gfx1151 radiance-strix-halo triage). Its "queue deltas" section is intake-logged as
+Q17, parked on the operator's "to be looked at later" instruction.
