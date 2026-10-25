@@ -2346,3 +2346,74 @@ survives ssh-teardown kills -- the "container restarted itself" scare was
 cmake's 3-min HIP configure eating the wall clock. (3) The donor's fence
 transfers iff the kernel HAS a schedulable load window: recurrent rows yes,
 chunk_scan no (resident-state pressure) -- pressure triage before cures.
+
+## Window 15 (2026-10-25, late night) -- Q23: the attention pressure pass; the fence does NOT transfer (NULL, lever dark)
+
+Triage first, per the window-14 law, and it paid before any card time. The v2
+spill census over build_v136 splits the attention family into three stories:
+(1) the h256 MT=3 DBUF arms -- the donor cliff rows (88/138 vsp, 324/268 priv,
+256-pinned) -- still spill at HEAD, scratch traffic 100% in-loop; (2) the
+kernel2<128,MT> staging arms sit pinned at 256 with 2-5 vsp and 192-224 B
+private; (3) the h256 MT=3 NON-DBUF arms at 249/242, zero spill, near-cliff.
+Placement analysis (`scratch_loc.py`, in-loop by decoded backedges, context by
+neighborhood): the h256 DBUF spills cluster around global staging traffic
+(32-43 of 84-96 near global loads, 9-12 near WMMA) -- the window signature the
+GDN cure rode; the kernel2 spills ride the WMMA chains with ZERO global context
+-- resident accumulator pressure, chunk_scan class, no cure built (law, not
+measurement debt).
+
+Dispatch audit before promising anything: the h256 row is issued only behind
+R3D_HD256 (the operator's open drawer item); spec9g serves head_dim 128 (the
+64 KiB/layer/block page arithmetic pins it). So the fenceable arms are a
+not-yet-live row -- the fence lands as PREPARED evidence for the hd256
+acceptance decision, lever R3D_HD256_SB with UNSET = the historical unfenced
+arm (no silent codegen change anywhere), and the fenceable arms are a
+dead-today row.
+
+The build: SB template dimension on kernel1 (stub list mirrored per the fold
+postmortem -- the mangled-name trap is written in the source itself), three
+fence sites after each in-flight `ld_kv_regs`, `r3d_attn_sched_stop` helper,
+DBG launch-proof extended with the `sb=` field.
+
+THE NULL, measured two independent ways: the fenced PAD=1 arm carries metadata
+identical to stock (138 vsp / 256 vgpr -- not one register freed), and its
+instruction stream is identical to stock modulo register renaming (11,174
+instructions both, zero mnemonic deltas). No `s_sched_barrier` exists anywhere
+in the object -- `__builtin_amdgcn_sched_barrier(0)` is a scheduling
+CONSTRAINT consumed before register allocation, never an emitted instruction
+(GDN's fenced arm: also zero barrier insns, yet its allocation moved). The
+root cause is structural: the DBUF in-flight windows in this kernel are fenced
+ALREADY by their designed `__syncthreads`/s_barriers -- the scheduler has no
+freedom across them to take away -- and the real pressure is the resident
+`oa[D/16]` accumulators (128 VGPR at h256) plus fragment staging, 138 spilled
+registers against a 16-register in-flight window. A live-range cap cannot
+touch spills larger than the window it caps.
+
+Laws earned: (1) a fence transfers iff the window is UNFENCED -- census the
+EXISTING barriers inside the candidate window before building; (2) the cheap
+pre-screen: spilled-register count vs in-flight window size (138 vs 16 here)
+-- window caps are bounded by the window; (3) the window-7 heuristic
+"spill-traffic context names the pressure kind" MISLED on h256 (global-ctx
+spills, resident cause): context placement is a hypothesis, only a built arm
+or the window arithmetic adjudicates. (4) Retracted mid-window: a hipcc-flag
+quick-compile object diffed against cmake-built objects measures the FLAGS,
+not the edit (the dual-issue deltas were -mllvm-pipeline noise) -- object
+identity gates compare like toolchains with like.
+
+Gates on build_v137 (cmake-like toolchain, the only comparison that counts --
+see law 4): stream identity `tools/sym_stream_diff.py` (kept in-tree: it
+normalizes the mangled-name drift the 8th template arg adds, asserts parse
+coverage, compares operands not just mnemonics) says 31/31 common symbols
+BYTE-IDENTICAL streams, zero differing, one addition (the fenced
+<256,3,0,1,0,1,0,1> arm). Census: 240 kernels = 239 + fenced; fenced arm's
+metadata is stock's 138 vsp / 256 vgpr exactly -- the fence freed nothing,
+confirming the resident-cause attribution at the allocator. Card battery
+(q23_gates.sh, 11 legs vs the v136 reports): B1-B6 + attn bf16 + four f8st
+legs all green, every pack difflines=0 including st1/st2/st3-vs-st0 (Q10's
+LUT identity survives the template-dimension surgery); the kernels pack's
+22-line delta is the harness's own skip-note prose (it prints the machine's
+free-VRAM budget, 1.51 vs 1.50 GiB between runs) -- environmental text, zero
+fingerprint lines touched. spec9g was stopped for the card-exclusive battery
+and restarted (health 200, still build_v136 -- v137 changes nothing a live
+serve issues: unset lever = historical arms, and the arms it does issue are
+stream-identical).

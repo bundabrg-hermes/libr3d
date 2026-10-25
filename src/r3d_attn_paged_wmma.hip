@@ -130,7 +130,7 @@ namespace {
  * stubs, and a missing default arg mangles the host launch's symbol differently from
  * the device image's kernel -- the loader then fails with "Cannot find Symbol" at the
  * first real launch (see COVERAGE fold postmortem). */
-template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0>
+template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0, int SB = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams) {}
 template <int D, int KVDT, int SPLITK>
 __global__ __launch_bounds__(kT) void attn_paged_wmma_kernel2(R3dAttnParams) {}
@@ -152,23 +152,23 @@ namespace { __global__ void r3d_dbg_null(int* p) { if (p) *p = 1; } }
  * driver limit, never cost the engine one. `dbg` is the caller's R3D_DEBUG_DECODE
  * read: the launch-proof line names the tile and its arms once per (arm, process) --
  * host printf, never device (the printf+big-LDS 401 trap lives in the kernel body). */
-template <int DB, int PAD>
+template <int DB, int PAD, int SB = 0>
 static int r3d_launch256(const R3dAttnParams& P, dim3 grid, hipStream_t stream, int dbg) {
     static int attr = -1;
     if (attr < 0)
         attr = hipFuncSetAttribute(
-                   (const void*)&attn_paged_wmma_kernel<256, RAD_BF16, 0, DB, 0, PAD>,
+                   (const void*)&attn_paged_wmma_kernel<256, RAD_BF16, 0, DB, 0, PAD, 0, SB>,
                    hipFuncAttributeMaxDynamicSharedMemorySize,
                    r3d_attn256_smem(PAD)) == hipSuccess ? 1 : 0;
     if (!attr) return RAD_E_DEVICE;
     static int once = 0;
     if (dbg && !once) {
         once = 1;
-        printf("DBG attn-wmma hd256 tile launch pad=%d dbuf=%d smem=%d rows=%lld "
-               "grid(%u,%u,%u)\n", PAD, DB, r3d_attn256_smem(PAD), (long long)P.rows,
+        printf("DBG attn-wmma hd256 tile launch pad=%d dbuf=%d sb=%d smem=%d rows=%lld "
+               "grid(%u,%u,%u)\n", PAD, DB, SB, r3d_attn256_smem(PAD), (long long)P.rows,
                grid.x, grid.y, grid.z);
     }
-    hipLaunchKernelGGL((attn_paged_wmma_kernel<256, RAD_BF16, 0, DB, 0, PAD>),
+    hipLaunchKernelGGL((attn_paged_wmma_kernel<256, RAD_BF16, 0, DB, 0, PAD, 0, SB>),
                        grid, dim3(kThreads), r3d_attn256_smem(PAD), stream, P);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
@@ -312,9 +312,16 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
          * reachable for postmortem. */
         static int pad = -1;
         if (pad < 0) pad = getenv("R3D_HD256_PAD") ? atoi(getenv("R3D_HD256_PAD")) : 1;
+        /* Q23 (R3D_HD256_SB): fence the DBUF in-flight staging windows (Q20 lever).
+         * UNSET: historical unfenced arm stays the default -- this row is only
+         * issued behind R3D_HD256, so the fence ships as prepared evidence for the
+         * hd256 acceptance decision, never as a silent codegen change. */
+        static int sb256 = -1;
+        if (sb256 < 0) sb256 = getenv("R3D_HD256_SB") ? 1 : 0;
         const int dbg256 = getenv("R3D_DEBUG_DECODE") ? 1 : 0;
         if (dbuf_ok) {
-            if (pad) return r3d_launch256<1, 1>(P, grid, stream, dbg256);
+            if (pad) return sb256 ? r3d_launch256<1, 1, 1>(P, grid, stream, dbg256)
+                                  : r3d_launch256<1, 1>(P, grid, stream, dbg256);
             return r3d_launch256<1, 0>(P, grid, stream, dbg256);
         }
         if (pad) return r3d_launch256<0, 1>(P, grid, stream, dbg256);

@@ -261,7 +261,12 @@ __device__ __forceinline__ void st_kv_regs(const uint4* src, bf16* KVp) {
  * every helper below to the original expressions at compile time -- the prefill
  * instantiation is unchanged by construction (a prefill fold would stream the same
  * bytes: its tiles already carry 64 tokens of ONE head and skip dead KV heads). */
-template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0>
+/* Q23 (R3D_HD256_SB): sched_barrier fence for the DBUF in-flight windows, the Q20
+ * lever ported to attention. __builtin_amdgcn_sched_barrier(0) forbids memory ops
+ * crossing it both ways, capping the live range of the staged in-flight batch. */
+__device__ __forceinline__ void r3d_attn_sched_stop() { __builtin_amdgcn_sched_barrier(0); }
+
+template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0, int SB = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams P) {
     constexpr int DSH = r3d_dlog2(D), DM1 = D - 1;
     typedef Carve<D, PAD> C;
@@ -500,6 +505,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
         for (int t = et0; t < et1; ++t) {
             const int64_t jb = (int64_t)t * kBN;
             ld_kv_regs<D, KVDT>(kx, RBn, P, 0, kvvec);       /* K(t+1) in flight */
+            if (SB) r3d_attn_sched_stop();                   /* Q23: cap the in-flight window */
             roCW::fill_fragment(a0, 0.0f);
             roCW::fill_fragment(a1, 0.0f);
             for (int k0 = 0; k0 < D; k0 += 16) {
@@ -552,6 +558,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
         for (int t = et0; t < et1; ++t) {
             const int64_t jb = (int64_t)t * kBN;
             ld_kv_regs<D, KVDT>(kx, RBn, P, 0, kvvec);         /* K(t+1) in flight */
+            if (SB) r3d_attn_sched_stop();                     /* Q23: cap the in-flight window */
             roCW::fill_fragment(a0, 0.0f);
             roCW::fill_fragment(a1, 0.0f);
             for (int k0 = 0; k0 < D; k0 += 16) {
@@ -575,6 +582,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             }
             st_kv_regs<D, PAD>(vc, KVp);                            /* V(t) -> LDS (K(t) dead per b1) */
             ld_kv_regs<D, KVDT>(vc, RBn, P, D, kvvec);         /* V(t+1) in flight */
+            if (SB) r3d_attn_sched_stop();                     /* Q23: cap the in-flight window */
             __syncthreads();                                   /* b2: Psp + V(t) visible */
             for (int jk = 0; jk < kBN / 16; ++jk) {
                 roCW::fragment<roCW::matrix_a, 16, 16, 16, bf16, roCW::row_major> fap;
