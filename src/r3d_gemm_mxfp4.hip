@@ -1274,10 +1274,18 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
         struct Q8xEnt { const void* b; const void* bs; int64_t n, k; uint8_t* plane; };
         static std::vector<Q8xEnt> q8x_cache, q8x_failed;
         static hipStream_t q8x_side = nullptr;
-        static int8_t* q8x_x8 = nullptr;
-        static float*  q8x_sg  = nullptr;
-        static int64_t q8x_cap_k = 0;
-        static bool    q8x_scratch_dead = false;
+        /* Per-dispatch i8 activation scratch. The pointers MUST be stable across
+         * every record/replay of an engine recorded pass: the single growing
+         * buffer this file shipped with swapped pointers when a later band's
+         * larger K grew it mid-request, so the next replay of an earlier pass
+         * issued m4_act_i8_kernel with a fresh args[1] -- "issued differently
+         * from its recording" poison, engine stop (2026-10-25 serve A/B, the
+         * opt-in era never hit this pass-recording order). Law: one buffer per
+         * K, allocated once, never moved, never freed (a few hundred KB per K
+         * class; the planes beside it are far bigger and likewise immortal). */
+        struct Q8xScr { int64_t K; int8_t* x8; float* sg; };
+        static std::vector<Q8xScr> q8x_scr;
+        static bool q8x_scratch_dead = false;
 
         uint8_t* plane = nullptr;
         bool known_dead = false;
@@ -1322,21 +1330,24 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
             }
         }
 
-        if (plane && !q8x_scratch_dead && P.K > q8x_cap_k) {
-            int8_t* nx = nullptr; float* ns = nullptr;
-            if (hipMalloc(&nx, (size_t)(8 * P.K)) == hipSuccess &&
-                hipMalloc(&ns, (size_t)(8 * (P.K >> 5) * 4)) == hipSuccess) {
-                /* the old scratch is LEAKED on grow, never freed: the engine stream
-                 * may hold in-flight reads of it and a hipFree is a device sync --
-                 * ~9 MB leaks per K-growth step, invisible beside the planes */
-                q8x_x8 = nx; q8x_sg = ns; q8x_cap_k = P.K;
-            } else {
-                if (nx) (void)hipFree(nx);
-                q8x_scratch_dead = true;
+        int8_t* q8x_x8 = nullptr; float* q8x_sg = nullptr;
+        if (plane && !q8x_scratch_dead) {
+            for (const auto& s : q8x_scr)
+                if (s.K == P.K) { q8x_x8 = s.x8; q8x_sg = s.sg; break; }
+            if (!q8x_x8) {
+                int8_t* nx = nullptr; float* ns = nullptr;
+                if (hipMalloc(&nx, (size_t)(8 * P.K)) == hipSuccess &&
+                    hipMalloc(&ns, (size_t)(8 * (P.K >> 5) * 4)) == hipSuccess) {
+                    q8x_scr.push_back(Q8xScr{P.K, nx, ns});
+                    q8x_x8 = nx; q8x_sg = ns;
+                } else {
+                    if (nx) (void)hipFree(nx);
+                    q8x_scratch_dead = true;
+                }
             }
         }
 
-        if (plane && !q8x_scratch_dead && q8x_cap_k >= P.K) {
+        if (plane && q8x_x8) {
             const unsigned pgrid = (unsigned)((P.M * (P.K >> 5) + 7) / 8);
             hipLaunchKernelGGL(m4_act_i8_kernel, dim3(pgrid), dim3(256), 0, stream,
                                P.A, q8x_x8, q8x_sg, (int)P.M, (int)P.K, P.a_pitch);
