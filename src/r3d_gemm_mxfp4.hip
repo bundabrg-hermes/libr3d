@@ -922,7 +922,7 @@ template <int MT>
 __global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_kernel(
     const uint8_t* __restrict__ S, const int8_t* __restrict__ X, const float* __restrict__ SG,
     const float* __restrict__ AS, uint16_t* __restrict__ Y,
-    int M, int N, int K, int64_t y_pitch, int64_t as_pitch, int nt)
+    int M, int N, int K, int64_t y_pitch, int64_t as_pitch, int nt, int pf)
 {
     const int r = blockIdx.x;
     const int t = threadIdx.x;
@@ -938,6 +938,56 @@ __global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_kernel(
     const int hi8 = (t >> 4) * 136;                /* second 136B group of the span */
     const int lo8 = (t & 15) << 3;
 
+    /* Q7 (REVIEW_QUEUE): pf>=2 pipelines the cold weight stream — register-staged
+     * depth-2 prefetch of the 136B-group code + scale byte for iteration it+2,
+     * issued BEFORE iteration it's dot chain consumes its operands. At full wave
+     * occupancy the walk otherwise issues one load, waits one load (LLVM places the
+     * vmcnt at first use; issue #8's schedule-transfer law says only a real A/B on
+     * THIS arm decides, not the legacy arm's #7 falsification). Parity ping-pong on
+     * explicit locals keeps every staged value in a VGPR pair — an array indexed by
+     * it&1 would sink to private memory. The activation rows stay inline: X is a few
+     * KiB, L2-hot, and not the stream that misses. MATH ORDER IS VERBATIM IN BOTH
+     * ARMS (same dot4 chain, same folds, same rescale sequence): pf changes which
+     * cycle a load issues, never which bytes reach which instruction, so the arms
+     * are bit-identical by construction -- no numeric class, no differential KLD. */
+    if (pf >= 2) {
+        uint2 wa, wb;
+        uint8_t sa, sb;
+        auto ldw = [&](int it, uint2& w, uint8_t& sc_b) {
+            const uint8_t* sp = crow + ((int64_t)it << 1) * 136;
+            if (nt) { const uint64_t raw = __builtin_nontemporal_load(
+                                (const uint64_t*)(sp + hi8 + 8 + lo8));
+                      __builtin_memcpy(&w, &raw, 8); }
+            else      w = *(const uint2*)(sp + hi8 + 8 + lo8);
+            sc_b = sp[((q >> 2) * 136) + (q & 3)];
+        };
+        if (nstep > 0) { ldw(0, wa, sa); if (nstep > 1) ldw(1, wb, sb); }
+        for (int it = 0; it < nstep; ++it) {
+            uint2 wc;
+            uint8_t sbyte;
+            if (it & 1) { wc = wb; sbyte = sb;
+                          if (it + 2 < nstep) ldw(it + 2, wb, sb); }
+            else        { wc = wa; sbyte = sa;
+                          if (it + 2 < nstep) ldw(it + 2, wa, sa); }
+            const int g = (it << 3) + q;               /* the quad owns the 32-group */
+            const float sc = r3d_e8m0_sc(sbyte);
+#pragma unroll
+            for (int m = 0; m < MT; ++m) {
+                if (m >= live) break;                  /* block-uniform: every lane skips */
+                const uint2 xv = *(const uint2*)(X + (int64_t)m * K + (it << 8) + (t << 3));
+                int32_t p = __builtin_amdgcn_sudot4(1, (int)xv.x, 1, (int)wc.x, 0, 0);
+                p = __builtin_amdgcn_sudot4(1, (int)xv.y, 1, (int)wc.y, p, 0);
+                p += __shfl_xor(p, 1);
+                p += __shfl_xor(p, 2);
+                float c = (float)p * SG[(int64_t)m * (K >> 5) + g]
+                                * AS[(int64_t)m * as_pitch + (g >> 2)] * sc * 0.5f;
+                c += __shfl_xor(c, 4);
+                c += __shfl_xor(c, 8);
+                c += __shfl_xor(c, 16);
+                acc[m] += c;
+            }
+        }
+    } else {
     for (int it = 0; it < nstep; ++it) {
         const uint8_t* sp = crow + ((int64_t)it << 1) * 136;
         /* Q5 (REVIEW_QUEUE): nt=1 streams the weight plane non-temporally (the plane is
@@ -967,6 +1017,7 @@ __global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_kernel(
             c += __shfl_xor(c, 16);
             acc[m] += c;
         }
+    }
     }
     if (t == 0) {
 #pragma unroll
@@ -1000,7 +1051,7 @@ __global__ void m4_act_i8_kernel(const uint8_t*, int8_t*, float*, int, int, int6
 template <int MT>
 __global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_kernel(
     const uint8_t*, const int8_t*, const float*, const float*, uint16_t*,
-    int, int, int, int64_t, int64_t, int) {}
+    int, int, int, int64_t, int64_t, int, int) {}
 } /* anonymous namespace */
 
 #endif
@@ -1365,6 +1416,12 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
             static const int q8x_nt = []{
                 const char* e = getenv("R3D_Q8X_NT");
                 return e && !std::strcmp(e, "0") ? 0 : 1; }();
+            /* Q7 (REVIEW_QUEUE): R3D_Q8X_PF=2 opts into the depth-2 register-staged
+             * weight prefetch; anything else (including unset) is the shipped walk,
+             * default-off until the serve A/B speaks. Bit-identical math both arms. */
+            static const int q8x_pf = []{
+                const char* e = getenv("R3D_Q8X_PF");
+                return (e && e[0] == '2') ? 2 : 1; }();
             const unsigned pgrid = (unsigned)((P.M * (P.K >> 5) + 7) / 8);
             hipLaunchKernelGGL(m4_act_i8_kernel, dim3(pgrid), dim3(256), 0, stream,
                                P.A, q8x_x8, q8x_sg, (int)P.M, (int)P.K, P.a_pitch);
@@ -1373,7 +1430,7 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
                                    dim3((unsigned)P.N), dim3(32), 0, stream, plane,    \
                                    q8x_x8, q8x_sg, P.AS, (uint16_t*)Y->data,           \
                                    (int)P.M, (int)P.N, (int)P.K, P.y_pitch, P.as_pitch,\
-                                   q8x_nt)
+                                   q8x_nt, q8x_pf)
             switch (mt) {
                 case 1: R3D_M4_Q8X(1); break;
                 case 2: R3D_M4_Q8X(2); break;
@@ -1386,7 +1443,8 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
                 if (getenv("R3D_DEBUG_GEMM")) {
                     static bool once = false;
                     if (!once) { once = true;
-                        fprintf(stderr, "libr3d: mxfp4 q8x dot4 arm launched (mt=%d)\n", mt); }
+                        fprintf(stderr, "libr3d: mxfp4 q8x dot4 arm launched (mt=%d pf=%d)\n",
+                                mt, q8x_pf); }
                 }
                 return RAD_OK;
             }
