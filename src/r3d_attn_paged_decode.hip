@@ -48,6 +48,13 @@
  * reference port; splits resolving to 1, or an arena smaller than the law needs -> the
  * SPLITK=0 tile; both of those never launch the split kernel, so an untouched partial
  * buffer is not a correctness question. Same scalars every way: one r3d_attn_fill call.
+ *
+ * head_dim 256 (issue #11 milestone 3, behind R3D_HD256 like the prefill tile): the
+ * fitted 256 body at SPLITK=1 joins as the dynamic-LDS slice arm (attribute raised per
+ * instantiation, r3d_attn256_smem(PAD) bytes passed; PAD defaults to 1, same bench law
+ * as the tile). bf16 KV and the v1 body only; splits=1 or a short arena falls back to
+ * the m2 tile through the same tile_or_v1 path. The arena hook claims the 256 partials
+ * only while the lever is set.
  */
 
 #include <hip/hip_runtime.h>
@@ -245,7 +252,13 @@ extern "C" int64_t r3d_rad_attn_decode_scratch(const RadArgs* a) {
     const int64_t max_seqs = rad_args_geti_or(a, "max_seqs", 0);
     const int64_t D        = rad_args_geti_or(a, "head_dim", 0);
     if (n_head > 0 && max_seqs > 0) {
-        if (D != 64 && D != 128) return 0;
+        if (D != 64 && D != 128) {
+            /* 256 claims an arena ONLY behind the R3D_HD256 lever: unset, the
+             * decode row never launches a 256 split, and asking the engine to
+             * carve an arena the model class cannot use would cost real KV
+             * budget for nothing (issue #11 m3). */
+            if (D != 256 || !getenv("R3D_HD256")) return 0;
+        }
         int64_t mc = rad_args_geti_or(a, "max_ctx", 0);
         if (mc <= 0) return 0;
         const int64_t gqa  = rad_args_geti_or(a, "gqa", 1) > 0 ? rad_args_geti_or(a, "gqa", 1) : 1;
@@ -308,9 +321,21 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
     /* The tile arm: SPLITK=0 through the prefill row's launcher -- the exact kernel the
      * old row ran. Used when splits resolves to 1, when the arena is short, and as the
      * WMMA-chip fallback of last resort; v1 under a foreign chip or R3D_NO_WMMA. */
+    static int v2 = -1;
+    if (v2 < 0) v2 = getenv("R3D_ATTN_V2") ? 1 : 0;      /* v1 default: see wmma launcher */
+    /* R3D_HD256 (issue #11 milestone 3): head_dim 256 joins the decode row's split-KV
+     * family -- the same fitted body at SPLITK=1 (partial store and slice cut are
+     * D-generic, see the body's m3 note), merged by the same D-generic merge kernel.
+     * v2/v3 and fp8 KV at 256 have no instantiation (the prefill launcher's law,
+     * mirrored here): those shapes keep d256=0, take tile_or_v1, and land on the m2
+     * tile or v1 exactly as before this row changed. Lever unset: every stock shape
+     * sees the identical gate it saw at v148. */
+    static int hd256 = -1;
+    if (hd256 < 0) hd256 = getenv("R3D_HD256") ? 1 : 0;
+    const int d256 = hd256 && P.head_dim == 256 && !v2 && P.kvdt == RAD_BF16;
     const int wmma_ok = allowed && P.qdt == RAD_BF16
                      && (P.kvdt == RAD_BF16 || P.kvdt == RAD_F8E4M3)
-                     && (P.head_dim == 64 || P.head_dim == 128);
+                     && (P.head_dim == 64 || P.head_dim == 128 || d256);
     const auto tile_or_v1 = [&]() -> int {
         if (wmma_ok && r3d_attn_paged_wmma_launch(P, stream) == RAD_OK) return RAD_OK;
         return r3d_attn_v1_launch(P, stream);
@@ -325,8 +350,6 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
     if (getenv("R3D_NO_SPLITK")) forced = 1;             /* A/B kill: the tile, same row */
     static int fold = -1;
     if (fold < 0) fold = getenv("R3D_NO_GQA") ? 0 : 1;   /* A/B kill: the GQA fold arm */
-    static int v2 = -1;
-    if (v2 < 0) v2 = getenv("R3D_ATTN_V2") ? 1 : 0;      /* v1 default: see wmma launcher */
     int64_t mc = rad_args_geti_or(a, "max_ctx", 0);
     if (mc <= 0) mc = P.jcap;
     const int64_t tkv = (mc + kBN - 1) / kBN;
@@ -471,6 +494,62 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
             hipError_t e1 = hipGetLastError();                                                             \
             return e1 == hipSuccess ? RAD_OK : RAD_E_DEVICE;                                               \
         } while (0)
+    /* Milestone 3 (issue #11): the 256 slice arm. Same fitted body as the m2 tile at
+     * SPLITK=1, so it inherits the dynamic-LDS law: the attribute is raised once per
+     * instantiation and the launch passes the launcher-side byte count (the kernel's
+     * static_assert pins r3d_attn256_smem(PAD) to its own C::total). PAD/DBUF/FOLD are
+     * literal template slots selected by the same env/default law as the tile arm
+     * (R3D_HD256_PAD default 1, DBUF behind the vec gate, fold behind the row's
+     * existing fold gate). A failed attribute falls back to tile_or_v1 -- the tile can
+     * lose a step to a driver limit, never cost the engine one. No FS slot: fragment-
+     * side softmax is not yet instantiated for 256 (same law as the m2 tile). The
+     * merge kernel needs no dynamic LDS, so it launches with 0 as always. */
+    #define R3D_DK_L256(DB, PAD, FD)                                                                     \
+        do {                                                                                             \
+            static int attr = -1;                                                                        \
+            if (attr < 0)                                                                                \
+                attr = hipFuncSetAttribute(                                                              \
+                           (const void*)&(attn_paged_wmma_kernel<256, RAD_BF16, 1, DB, FD, PAD, 0, 0, 0>),\
+                           hipFuncAttributeMaxDynamicSharedMemorySize,                                   \
+                           r3d_attn256_smem(PAD)) == hipSuccess ? 1 : 0;                                 \
+            if (!attr) return tile_or_v1();                                                              \
+            static int once = 0;                                                                         \
+            if (dbg && !once) {                                                                          \
+                once = 1;                                                                                \
+                printf("DBG attn-decode hd256 slice launch pad=%d dbuf=%d fold=%d smem=%d spl=%d "       \
+                       "grid(%lld,%lld,%lld) merge(%lld,%lld) need=%lld\n",                              \
+                       PAD, DB, FD, r3d_attn256_smem(PAD), spl,                                         \
+                       (long long)gx, (long long)P.n_seq, (long long)gz,                                 \
+                       (long long)P.q_heads, (long long)P.rows, (long long)need);                        \
+            }                                                                                            \
+            hipLaunchKernelGGL((attn_paged_wmma_kernel<256, RAD_BF16, 1, DB, FD, PAD, 0, 0, 0>),         \
+                               dim3((unsigned)gx, (unsigned)P.n_seq, (unsigned)gz),                      \
+                               dim3(kThreads), r3d_attn256_smem(PAD), stream, P);                        \
+            hipError_t e0 = hipGetLastError();                                                           \
+            if (e0 != hipSuccess) return RAD_E_DEVICE;   /* partial state: fail the step */              \
+            hipLaunchKernelGGL((attn_splitk_merge_kernel<256>),                                          \
+                               dim3((unsigned)P.q_heads, (unsigned)P.rows), dim3(256), 0, stream, P, spl);\
+            hipError_t e1 = hipGetLastError();                                                           \
+            return e1 == hipSuccess ? RAD_OK : RAD_E_DEVICE;                                             \
+        } while (0)
+    if (d256) {
+        static int pad256 = -1;
+        if (pad256 < 0) pad256 = getenv("R3D_HD256_PAD") ? atoi(getenv("R3D_HD256_PAD")) : 1;
+        /* FD/DB/PAD reach the template as literals (two-level dispatch: the runtime
+         * gates pick which of the eight instantiations to emit). */
+        if (use_fold) {
+            if      (dbuf_ok && pad256) R3D_DK_L256(1, 1, 1);
+            else if (dbuf_ok)           R3D_DK_L256(1, 0, 1);
+            else if (pad256)            R3D_DK_L256(0, 1, 1);
+            else                        R3D_DK_L256(0, 0, 1);
+        }
+        else {
+            if      (dbuf_ok && pad256) R3D_DK_L256(1, 1, 0);
+            else if (dbuf_ok)           R3D_DK_L256(1, 0, 0);
+            else if (pad256)            R3D_DK_L256(0, 1, 0);
+            else                        R3D_DK_L256(0, 0, 0);
+        }
+    }
     if (v2)           { R3D_DK_ARMS(attn_paged_wmma_kernel2) }
     else if (use_fold) {
         /* GQA fold: one block per kv head (grid x = gx = kv_heads), rows = the group's

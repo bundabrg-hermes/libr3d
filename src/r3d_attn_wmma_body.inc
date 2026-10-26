@@ -297,8 +297,15 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
     constexpr int DSH = r3d_dlog2(D), DM1 = D - 1;
     typedef Carve<D, PAD> C;
     static_assert(D == 64 || D == 128 || D == 256, "WMMA tile: head_dim outside {64,128,256}");
-    static_assert(D != 256 || (SPLITK == 0 && FOLD == 0),
-                  "256 tile: split-K and fold are desk-sized only (issue #11 m2)");
+    /* Issue #11 milestone 3: the split arm at 256 opened. Everything the SPLITK=1
+     * paths touch is D-generic by construction -- the slice cut is pure integer
+     * arithmetic on (t1-t0, sp, spl), the partial store reuses the proven 32-row
+     * O staging through the Q+S alias (32*(D+8)*4 = 33792 B fits the 42240 B
+     * Q+S span at D=256), and the merge/arena hooks recompute the same cut.
+     * FOLD rides the split arm only (fold+direct-out is never launched: the
+     * prefill launcher keeps FOLD=0 on its 256 tile). */
+    static_assert(D != 256 || FOLD == 0 || SPLITK == 1,
+                  "256 tile: the fold arm rides the split-KV row only (issue #11 m3)");
     /* The launcher (outside the chip gate) sizes the 256 launch from the mirrored
      * host-side formula; pin the two together so a Carve edit that moves total
      * breaks the build, not the serve. */
