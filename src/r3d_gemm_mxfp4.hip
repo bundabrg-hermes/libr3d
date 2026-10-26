@@ -1467,8 +1467,12 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
              * by the q6probe2 lane-exact probe + v123 battery zero-diff (no numeric
              * class -- the gates carry the proof). R3D_Q8X_DPP=0 withdraws the
              * folds to the verbatim shfl chain (literal "0", the q8x law). Q24
-             * adds the third state: "2" also rides v_permlanex16_b32 for the
-             * xor-16 tail (see the fold comment); "1"/unset stays the Q6 arm. */
+             * adds the third state "2" (v_permlanex16_b32 xor-16 tail): MEASURED
+             * FLAT ON SERVE (v143 A/B, lever the only axis, boot-liveness every
+             * round: d2 {22.01,22.85,20.04} vs base {22.10,21.84,22.04} medians
+             * t/s at ctx 3072, spreads fully overlapping) -- by the Q6 non-
+             * overlap law the lever STAYS DARK: default 1 = the shipped Q6 arm.
+             * "2" opt-in. */
             static const int q8x_dpp = []{
                 const char* e = getenv("R3D_Q8X_DPP");
                 if (e && !std::strcmp(e, "0")) return 0;

@@ -1077,12 +1077,17 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
      * the same binary adjudicates the speed. R3D_W2_DPP=0 withdraws to the
      * verbatim shfl chain (literal "0", the lever law). Q24 adds the third state:
      * "2" also rides v_permlanex16_b32 for the xor-16 tail (ISA p.432 identity
-     * laneSel, q24 card probe gate); "1"/unset stays the Q22 arm verbatim. */
+     * laneSel, q24 card probe PROBE-BITEXACT 268M lane-ops). SHIPPED DEFAULT 2
+     * (2026-10-26, build_v144): same-binary kernel A/B, liveness-gated to the
+     * walks the lever actually drives -- M=2 DISJOINT +9.9% median, M=4 +6.4%
+     * (trimmed), M=1 +3.1%; battery 11/11 legs zero-diff (bit-identical).
+     * MT>=8 shapes ride the sk arm (no folds at all): their A/B rows are no-ops
+     * and adjudicate nothing (zero-diff-visibility law). */
     static const int w2_dpp = []{
         const char* e = getenv("R3D_W2_DPP");
         if (e && !std::strcmp(e, "0")) return 0;
-        if (e && !std::strcmp(e, "2")) return 2;
-        return 1; }();
+        if (e && !std::strcmp(e, "1")) return 1;
+        return 2; }();
     /* Q21b (REVIEW_QUEUE delta5): the WMMA skinny decode arm -- i8 fragment tiles,
      * NO cross-lane flush (lane registers ARE outputs). Bench A/B same-operands:
      * M=14 +208%/+211% (cold/cache-fit), M=7 +46.6%, M=4 tie, M=1 -47% -- so the
