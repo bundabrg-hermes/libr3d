@@ -1292,11 +1292,11 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
         const int wci = wc == 0 ? 0 : wc > 0 ? 1 : 2;
         const unsigned long long bit = sk ? (1ull << (56 + mti))  /* sk has no wc/dpp
                                         * axis: top range */
-                                          : (1ull << (mti * 9 + wci * 3 + dpp));
+                                          : (1ull << (mti * 9 + wci * 3 + w2_dpp));
         if (!(seen & bit)) {
             seen |= bit;
             fprintf(stderr, "libr3d: w2a8 decode gemv launched (mt=%d, %s, wc=%d, dpp=%d)\n",
-                    mt, sk ? "sk" : (c4 ? "q8c" : (B8 ? "q8" : "u2")), wc, dpp);
+                    mt, sk ? "sk" : (c4 ? "q8c" : (B8 ? "q8" : "u2")), wc, w2_dpp);
         }
     }
 }
