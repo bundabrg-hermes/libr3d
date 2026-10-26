@@ -484,7 +484,21 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
  * staging -- at ragged N it would leave holes. Alive-guard everything wave-local,
  * keep every wave in the loop. Tol-graded family: Y is not bit-identical to the
  * incumbents; it sits in the ulp class the shipped tile already carries
- * (rel_l2 3.3e-05 vs the tile's 3.4e-05, oracle-graded -- issue #6 discipline). */
+ * (rel_l2 3.3e-05 vs the tile's 3.4e-05, oracle-graded -- issue #6 discipline).
+ *
+ * Q26c (window 26 bench, window 27 port): SLABS extends the row to M 17..64 with an
+ * IN-BLOCK token-slab loop inside the K-group loop -- ws stages once per group, slabs
+ * stream through xs, weight traffic stays ONE pass (a grid.y slab dimension would
+ * re-walk weights ceil(M/16) times; rejected at design). Accumulators y[slab][8];
+ * flush order g-asc, slab-asc = the bench's oracle order; LDS footprint unchanged.
+ * The launcher passes M, never nslab (no ABI change). SLABS=1 keeps the Q26b shape
+ * exactly (y[1][8] is the same 8 registers, R3D_SKY reads them flat, the slab loops
+ * run their single trip), so the M<=16 arm can be stream-diffed byte-identical
+ * against the shipped build instead of merely fingerprinted (additive-port law);
+ * the ONE admitted delta is the runtime-trip init loop, dead-provable at nslab==1 —
+ * the stream diff adjudicates that claim too, and a surviving loop is a veto. */
+#define R3D_SKY(si, k) (SLABS == 1 ? y[0][k] : y[si][k])
+template <int SLABS>
 __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_sk_kernel(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, uint16_t* __restrict__ Y,
     const float* __restrict__ AS, const uint16_t* __restrict__ BS,
@@ -493,6 +507,7 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_sk_kernel(
     int64_t y_pitch, int64_t as_pitch, int64_t bs_pitch,
     int rblk) {
     const int ngrp = K >> 7;                           /* plan gates K % 128 == 0 */
+    const int nslab = (M + 15) >> 4;                   /* 16-token slabs; SLABS bounds them */
     __shared__ uint16_t Lut[256];                      /* e4m3 byte -> exact bf16 */
     __shared__ __align__(16) uint16_t xs[16 * kSkLdm];        /* tokens x slots */
     __shared__ __align__(16) uint16_t ws[8][16 * kSkLdm];     /* per-wave rows x slots */
@@ -501,22 +516,21 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_sk_kernel(
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int tile = (blockIdx.x * 8 + w) * 16;        /* first weight row of the tile */
     const bool alive = tile < N;                       /* barrier-participating guard */
-    const int live = M < 16 ? M : 16;                  /* the launcher gates M <= 16 */
     const int tok = lane & 15;                         /* pinned f32-acc map: col l&15 */
     rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, bf16, rocwmma::row_major> fa;
     rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, bf16, rocwmma::col_major> fb;
     rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> fc;
-    float y[8];
+    /* One shape for all SLABS: y[1][8] at SLABS==1 (same 8 floats, same layout as
+     * Q26b's y[8]); the R3D_SKY macro reads them as bare y[k] there. Init loops over
+     * the runtime nslab -- ==1 at SLABS==1 (launcher gates M<=16), a provably-dead
+     * trip the optimiser deletes; the SLABS==1 stream diff adjudicates the claim. */
+    float y[(SLABS == 1 ? 1 : SLABS)][8];
+    for (int s = 0; s < nslab; ++s)
 #pragma unroll
-    for (int k = 0; k < 8; ++k) y[k] = 0.0f;
+        for (int k = 0; k < 8; ++k) y[s][k] = 0.0f;
 
     for (int g = 0; g < ngrp; ++g) {
         const int64_t k0 = (int64_t)g * 128;
-        for (int i = threadIdx.x; i < 16 * 128; i += kThreads) {   /* block-shared */
-            const int m = i >> 7, s = i & 127;
-            xs[m * kSkLdm + s] = (m < live) ? Lut[A[(int64_t)m * a_pitch + k0 + s]]
-                                            : (uint16_t)0;
-        }
         if (alive) {
             /* EVERY wave stages its OWN tile (window-17 dead-row law). 16 rows x
              * 32 dwords of e4m3 = 512 dwords per wave, 16 per lane; each dword
@@ -537,37 +551,63 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_sk_kernel(
                 *(uint2*)&ws[w][r * kSkLdm + d * 4] = *(uint2*)o;
             }
         }
-        __syncthreads();                               /* one barrier per K-group */
-        if (alive) {
-            rocwmma::fill_fragment(fc, 0.0f);
-#pragma unroll
-            for (int kk = 0; kk < 128; kk += 16) {
-                rocwmma::load_matrix_sync(fa, (const bf16*)&ws[w][kk], kSkLdm);
-                rocwmma::load_matrix_sync(fb, (const bf16*)&xs[kk], kSkLdm);
-                rocwmma::mma_sync(fc, fa, fb, fc);
+        for (int slab = 0; slab < nslab; ++slab) {
+            const int live_s = (M - slab * 16) < 16 ? (M - slab * 16) : 16;
+            for (int i = threadIdx.x; i < 16 * 128; i += kThreads) {   /* block-shared */
+                const int m = i >> 7, s = i & 127;
+                const int mm = slab * 16 + m;
+                xs[m * kSkLdm + s] = (mm < M) ? Lut[A[(int64_t)mm * a_pitch + k0 + s]]
+                                              : (uint16_t)0;
             }
-            /* Per-group flush in the m64's oracle order: (partial * sa) * sb,
-             * ascending g, with the m64's scale-grid fold (rblk 1 per-row grid,
-             * rblk 128 checkpoint block grid). */
-            if (tok < live) {
+            __syncthreads();   /* slab's xs (+ ws on slab 0) visible; Q26b shape at nslab==1 */
+            if (alive) {
+                rocwmma::fill_fragment(fc, 0.0f);
 #pragma unroll
-                for (int k = 0; k < 8; ++k) {
-                    const int rr = tile + 2 * k + (lane >> 4);  /* pinned map: row 2k+(l>>4) */
-                    if (rr >= N) continue;
-                    const int srow = (rblk > 1) ? (rr / rblk) : rr;   /* same fold as the tile */
-                    const float sb = __uint_as_float((uint32_t)BS[(int64_t)srow * bs_pitch + g] << 16);
-                    y[k] += (fc.x[k] * AS[(int64_t)tok * as_pitch + g]) * sb;
+                for (int kk = 0; kk < 128; kk += 16) {
+                    rocwmma::load_matrix_sync(fa, (const bf16*)&ws[w][kk], kSkLdm);
+                    rocwmma::load_matrix_sync(fb, (const bf16*)&xs[kk], kSkLdm);
+                    rocwmma::mma_sync(fc, fa, fb, fc);
+                }
+                /* Per-group flush in the m64's oracle order: (partial * sa) * sb,
+                 * ascending g, ascending slab (bench order), with the m64's
+                 * scale-grid fold (rblk 1 per-row grid, rblk 128 checkpoint block
+                 * grid -- both grids gated before ship, Q26b law). */
+                if (tok < live_s) {
+                    const int mm = slab * 16 + tok;
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        const int rr = tile + 2 * k + (lane >> 4);  /* pinned map: row 2k+(l>>4) */
+                        if (rr >= N) continue;
+                        const int srow = (rblk > 1) ? (rr / rblk) : rr;   /* same fold as the tile */
+                        const float sb = __uint_as_float((uint32_t)BS[(int64_t)srow * bs_pitch + g] << 16);
+                        R3D_SKY(slab, k) += (fc.x[k] * AS[(int64_t)mm * as_pitch + g]) * sb;
+                    }
                 }
             }
+            __syncthreads();
         }
-        __syncthreads();
     }
     if (alive) {
+        if constexpr (SLABS == 1) {
+            /* tok < live (Q26b) with live=min(M,16): SLABS==1 is launcher-gated to
+             * M<=16, where tok<live and tok<16 are the same predicate for every
+             * legal launch (the launcher refuses M<4). */
 #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            const int rr = tile + 2 * k + (lane >> 4);
-            if (tok < live && rr < N)
-                Y[(int64_t)tok * y_pitch + rr] = f32_to_bf16_f8(y[k]);
+            for (int k = 0; k < 8; ++k) {
+                const int rr = tile + 2 * k + (lane >> 4);
+                if (tok < 16 && rr < N)
+                    Y[(int64_t)tok * y_pitch + rr] = f32_to_bf16_f8(R3D_SKY(0, k));
+            }
+        } else {
+            for (int slab = 0; slab < nslab; ++slab) {
+                const int live_s = (M - slab * 16) < 16 ? (M - slab * 16) : 16;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    const int rr = tile + 2 * k + (lane >> 4);
+                    if (tok < live_s && rr < N)
+                        Y[(int64_t)(slab * 16 + tok) * y_pitch + rr] = f32_to_bf16_f8(y[slab][k]);
+                }
+            }
         }
     }
 }
@@ -585,6 +625,7 @@ template <int MT, int W, bool D2>
 __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint16_t*,
     int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int) {}
+template <int SLABS>
 __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_sk_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint16_t*,
     int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int) {}
@@ -836,17 +877,31 @@ void f8_launch_tile(const F8Plan& P, void* ydata, int64_t y_pitch, RadStream s,
     /* Q26b: the skinny row owns M 4..16. No dword-alignment gate -- it reads B
      * byte-wise, so ragged-pitch shapes that the GEMV band must refuse now ride the
      * fast path instead of the tile (withdrawal restores the old routing for them).
-     * M > 16 stays on the tile until the M 17..64 measurement lands (handover). */
-    if (!no_dec && sk && P.M >= 4 && P.M <= 16) {
+     * Q26c extends it to M 64 (window-26 bench: skinny beats the tile across the
+     * whole 17..64 band, +14..47%, every spread disjoint, both cache regimes --
+     * no crossover inside the band; the tile keeps M>64). SLABS picks the template
+     * instantiation by CEILING, not M: at M 17..32 a dynamic nslab==1 must route to
+     * the SLABS==1 stream (the Q26b arm) or the band would carry its own discontinuity.
+     * M > 64 stays on the tile (bench did not measure past 64; no claim beyond). */
+    if (!no_dec && sk && P.M >= 4 && P.M <= 64) {
         dim3 grid((unsigned)((P.N + 127) / 128));
-        hipLaunchKernelGGL(gemm_nt_fp8a8_sk_kernel, grid, dim3(kThreads), 0, stream,
-                           P.A, P.B, (uint16_t*)ydata, P.AS, P.BS,
-                           (int)P.M, (int)P.N, (int)P.K, P.as_cols, P.bs_cols,
-                           P.a_pitch, P.b_pitch, y_pitch, P.as_pitch, P.bs_pitch, P.rblk);
+        #define R3D_F8_SK_LAUNCH(S_) hipLaunchKernelGGL(gemm_nt_fp8a8_sk_kernel<S_>, \
+            grid, dim3(kThreads), 0, stream,                                          \
+            P.A, P.B, (uint16_t*)ydata, P.AS, P.BS,                                   \
+            (int)P.M, (int)P.N, (int)P.K, P.as_cols, P.bs_cols,                       \
+            P.a_pitch, P.b_pitch, y_pitch, P.as_pitch, P.bs_pitch, P.rblk)
+        const int slabs = P.M <= 16 ? 1 : P.M <= 32 ? 2 : P.M <= 48 ? 3 : 4;
+        switch (slabs) {
+            case 1: R3D_F8_SK_LAUNCH(1); break;
+            case 2: R3D_F8_SK_LAUNCH(2); break;
+            case 3: R3D_F8_SK_LAUNCH(3); break;
+            default: R3D_F8_SK_LAUNCH(4); break;
+        }
+        #undef R3D_F8_SK_LAUNCH
         if (getenv("R3D_DEBUG_GEMM")) {
             static bool once = false;
-            if (!once) { once = true; fprintf(stderr, "libr3d: fp8a8 skinny wmma launched (m=%d rblk=%d)\n",
-                                               (int)P.M, P.rblk); }
+            if (!once) { once = true; fprintf(stderr, "libr3d: fp8a8 skinny wmma launched (m=%d rblk=%d slabs=%d)\n",
+                                               (int)P.M, P.rblk, slabs); }
         }
         return;
     }
