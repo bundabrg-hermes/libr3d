@@ -393,6 +393,9 @@ int main(int argc, char** argv) {
 
     // ---- correctness at plane 0 vs the oracle (tol-graded family: rel_l2 bar) ----
     std::vector<uint16_t> yNv((size_t)M * N), yRo((size_t)M * N), yGv((size_t)M * N), ySk((size_t)M * N);
+    const bool trc = getenv("F8SK_TRACE") != nullptr;   // crash-site bisect trace
+    #define TRC(s) do { if (trc) { printf("TRC %s\n", s); fflush(stdout); } } while (0)
+    TRC("allocs done");
     if (unit) {
         // analytic: every group dot = 128 * wclass(rr); scales 1.0; y = ngrp*128*wclass
         float* ddbg; CK(hipMalloc(&ddbg, 128 * 4));
@@ -426,13 +429,19 @@ int main(int argc, char** argv) {
     naive_kernel<<<(unsigned)((N + 255) / 256), 256>>>(
         (const uint8_t*)dA[0], (const uint8_t*)dB[0], (uint16_t*)dY,
         (const float*)dAS, (const uint16_t*)dBS, M, (int)N, (int)K, ngrp, rblk);
+    TRC("naive launched");
     CK(hipDeviceSynchronize());
+    TRC("naive synced");
     CK(hipMemcpy(yNv.data(), dY, (size_t)M * N * 2, hipMemcpyDeviceToHost));
+    TRC("naive readback");
     long bad = 0; for (auto v : yNv) if (std::isnan(bf16_to_f32_h(v))) ++bad;
     printf("ORACLE NaN outputs %ld/%zu (fixture must hold NaN-free: 0)\n", bad, yNv.size());
+    fflush(stdout);
 
     if (const int rc = launch_tile(0)) { printf("TILE ENTRY REFUSED rc=%d\n", rc); return 3; }
+    TRC("tile launched");
     CK(hipMemcpy(yRo.data(), dY, (size_t)M * N * 2, hipMemcpyDeviceToHost));
+    TRC("tile readback");
     int gemv_rc = -1;
     if (M <= 8) {
         CK(hipMemset(dY, 0, (size_t)64 * N * 2));
@@ -461,7 +470,11 @@ int main(int argc, char** argv) {
                M, bit_eq, yNv.size());
     }
     {   // mismatch anatomy: NaN counts + which weight rows / token cols are wrong
-        long nan = 0; std::vector<long> badrow(64 + 64, 0);
+        long nan = 0;
+        // histogram must cover 64 token-rows + ceil(N/256) weight bins: at
+        // N=24576 the fixed 128 overran the heap (glibc 'corrupted size' abort --
+        // a TOOL bug that masked the library's verdict at battery shapes).
+        std::vector<long> badrow(64 + (size_t)((N + 255) / 256), 0);
         for (size_t i = 0; i < yNv.size(); ++i) {
             if (std::isnan(bf16_to_f32_h(ySk[i]))) ++nan;
             if (ySk[i] == yNv[i]) continue;
@@ -472,7 +485,7 @@ int main(int argc, char** argv) {
         printf("ANAT SKINNY nan=%ld tokhist=", nan);
         for (int t = 0; t < 64; ++t) printf("%d ", (int)badrow[t]);
         printf("| row/256hist=");
-        for (int b = 0; b < 64; ++b) printf("%d ", (int)badrow[64 + b]);
+        for (size_t b = 0; b + 64 < badrow.size(); ++b) printf("%d ", (int)badrow[64 + b]);
         printf("\n");
         long shown = 0;
         for (size_t i = 0; i < yNv.size() && shown < 8; ++i)
