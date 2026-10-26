@@ -1,8 +1,9 @@
 # External Model Review Prompts
 
-Two independent read-only review passes to be run by frontier AI models with no
+Three independent read-only review passes to be run by frontier AI models with no
 access to target hardware. Every pass gates on `docs/COVERAGE.md` (the ledger of
-what has been implemented, tried, or deliberately deferred) and demands a strict
+what has been implemented, tried, or deliberately deferred) and `docs/REVIEW_QUEUE.md`
+(the live adjudicated backlog) and demands a strict
 YAML output so results can be fed back to the maintainer agent for hardware
 validation.
 
@@ -10,6 +11,7 @@ validation.
 |------|------|----------------|
 | 1 | `01-isa-review.md` | Does the RDNA3 ISA offer cheaper instructions than what the hot loops use? |
 | 2 | `02-cross-engine-review.md` | Do proven kernels in other inference engines do the same job with a better structure? |
+| 3 | `03-exhaustive-cross-engine-review.md` | Broadest evidence-grounded backlog: is any family prematurely considered exhausted? (superset of pass 2; budget-capped output) |
 
 Usage:
 
