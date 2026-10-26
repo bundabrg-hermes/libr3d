@@ -3221,3 +3221,76 @@ State: local == GitHub == cat at 6b1127f, trees clean; spec9g restored
 mid-run by the runner itself (health 200 in 20 s). Card session ~10 min
 under the operator grant. No lever moved, no build cut; v145 remains the
 drafter-mount artifact. Drawer unchanged: hd256 accept, RDNA3.5 guard.
+
+## Window 29 (2026-10-26) — Q26c blocker: the tautological store guard — fixed at the desk, v148 gate-green
+
+The v146/v147 battery fp8 leg (14 deterministic FAILs + 62 guard flags) fell
+to desk work with zero card time, once the right discriminators were ordered.
+
+Root cause (b4d2fdb): 9666f99's SLABS==1 store replaced the Q26b predicate
+`tok < live` (live = min(M,16)) with `tok < 16` — a TAUTOLOGY (tok = lane&15).
+The commit's lemma "under the 4<=M<=16 launcher gate, tok<16 == tok<live"
+holds only at M==16. At M 4..15 the kernel zero-wrote rows M..15 past the
+M-row Y: the flush guard (tok < live_s) kept those accumulators 0.0f and xs
+is zero-staged, so every stray byte was a ZERO. The sk band precedes the gemv
+band, so decode-shape M 4..8 rode sk<1> too (v145 was safe only because its
+guard was the real predicate).
+
+Why every probe missed it (LAW): a zero-fill OOB into zero-filled probe
+padding is invisible to pad-region checks — probing for zeros with zeros. The
+w28 arena sweeps (32 decode cells, gated-mode hits identical across builds)
+were blind by construction. kbench's GUARDED allocator saw it immediately and
+named the exact shape: 48 decode 'y'-past-end + 12 'b_scale'-adjacent + 2 'a'
+= the 62 flags; the stomped neighbours were other cases' inputs, which is why
+14 FAILs cascaded on arms untouched since v145. The fused gated row hid it
+twice: the 64-row scratch arena absorbs rows 4..15 and the epilogue reads only
+rows < M (gated-only passed 56/56; M<=16 fused dumps were byte-equal).
+
+Booked discriminator outcome: paired battery dumps (dv145 vs dumps2, diff via
+dumpdiff.py, card-free) exonerated the fused path — all fused pre.bins EQ, all
+M<=16 post EQ, M=32/64 post differ on codes+product only within the tol-graded
+family. That redirected from y_pitch suspicion to the kbench OOB table, and one
+line of desk arithmetic on the guard closed it.
+
+## Window 30 (2026-10-26) — v148 PROMOTION CEREMONY: v148 replaces v145 as the drafter-mount artifact
+
+All five booked gates green on build_v148 (fresh, radiance-dev:v1.11.0),
+runner cat:~/scratch/r3d/q26c_v148_promote.sh (log v148_promote.log), card
+exclusive (spec9g stopped by the runner, restored at close).
+
+1. Full 7-pack battery, canonical leg defs: 7/7 OK. fp8 536/536 with 0 wrote
+   outside guarded allocations (v147: 14 FAIL / 62 outside); stock 2011/2011
+   (24 budget skips), full 4737/4737, both 0-outside.
+2. Stream gate (q26c_stream.py): 264 non-sk symbols BYTE-IDENTICAL vs v145;
+   sk<1..4> present. sk<1> is NOT asm-identical to v145: +16 instructions,
+   mnemonic-histogram-immune check shows all of it is control-flow skeleton
+   (the SLABS==1 arm keeps the slab-loop skeleton) and the v146→v148 delta is
+   EXACTLY the guard encoding (cmpx+exec-restore → cmp_e64+s_and_saveexec, +2
+   for the live computation). RETRACTED expectation "restored guard returns
+   the Q26b stream exactly": semantic restoration is proven by the battery and
+   bench CHECKs, not by asm identity.
+3. Fingerprint rows vs v145: attr/df2/df3/full/attn_bf zero drift; kernels 48
+   and fp8 36 difflines are 100% fp8a8 rows at M 18/32/36/64 (the newly
+   skinny-routed band), verdicts ok, rel_l2 <= 2.35e-05 vs bars 5e-03/3e-02.
+   Every M<=16 row byte-stable.
+4. Liveness A/B (v146 datum re-adjudicated at one geometry): M=32, 3 rounds x
+   {rot4,rot1}, 6/6 spreads disjoint, t_med 1.947..1.987 (sk) vs 2.776..2.806
+   (tile), +39.7..+43.1%; slabs=2 liveness line every sk leg, withdrawal live
+   shape identical to the v146 window's.
+5. Census from the shipped fatbin (q26c_notes.py; self-verified — v145 re-reads
+   exactly 159/0/0 VGPR/spill/priv, LDS 39680 = the Q26b authoritative table):
+   sk<1..4> = 152/162/178/178 VGPR, ALL zero spills, priv 0/0/128/0, LDS 39680
+   uniform. sk<3> carries 128 B private segment already in v146 (SLABS>=2
+   streams untouched by the fix) — flagged for the next allocator change.
+
+Correctness legs at the fix band: M=8/15 slabs=1, M=32 slabs=2 — ROW==oracle
+== SKINNY rel_l2 4.5e-05..5.4e-05, cross-slab bitwise probe 524288/524288.
+
+VERDICT: v148 = the drafter-mount build; v145 superseded (v146/v147 never
+promoted). spec9g rides v142-era unchanged and never issues fp8a8. Serve
+restored and verified: tokenize 200, gfx1100 boot-asserted (PCI 17:00.0),
+RestartCount 0, chat probe finish=stop.
+
+State: local == GitHub == cat, trees clean. Drawer unchanged: hd256 accept,
+RDNA3.5 guard.
+
