@@ -447,6 +447,27 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < yNv.size(); ++i) { sk_eq += (ySk[i] == yNv[i]); ro_eq += (yRo[i] == yNv[i]); }
     printf("CHECK rblk=%d M=%d K=%lld N=%lld: ROW==oracle %ld/%zu rel_l2=%.2e | SKINNY==oracle %ld/%zu rel_l2=%.2e\n",
            rblk, M, K, N, ro_eq, yNv.size(), rel_l2_h(yRo, yNv), sk_eq, yNv.size(), rel_l2_h(ySk, yNv));
+    if (getenv("F8SK_CROSS")) {
+        /* Q26c cross-slab probe (M=16 launch reads back 2 slabs' worth of the 64-row
+         * buffer; fixture A is [64,K] and identical across runs, so rows 16..31 of
+         * the M=32 launch must be BITWISE rows 0..15 -- the same oracle-graded
+         * formula reindexed by slab. This is tol-graded-family evidence at its
+         * strongest: not a tolerance, an equality, and it fires inside one process. */
+        CK(hipMemset(dY, 0, (size_t)64 * N * 2));
+        if (M >= 16) {
+            std::vector<uint16_t> yX(2 * (size_t)M * N);
+            if (M == 16) { if (launch_tile(0)) { printf("CROSS tile16 REFUSED\n"); } }
+            else if (M == 32) { if (launch_tile(0)) { printf("CROSS tile32 REFUSED\n"); } }
+            CK(hipMemcpy(yX.data(), dY, (size_t)2 * (size_t)M * N * 2, hipMemcpyDeviceToHost));
+            long eqA = 0, eqB = 0;
+            for (size_t i = 0; i < (size_t)16 * N; ++i) {
+                eqA += (yX[i] == yNv[i]);                        /* rows0..15 vs oracle rows0..15 */
+                eqB += (yX[(size_t)16 * N + i] == yNv[i]);       /* rows16..31 vs same oracle rows */
+            }
+            printf("CROSS M=%d rows0-15==oracle-eq %ld/%zu | rows16-31==rows0-15 BITWISE %ld/%zu\n",
+                   M, eqA, (size_t)16 * N, eqB, (size_t)16 * N);
+        }
+    }
     {   // mismatch anatomy: NaN counts + which weight rows / token cols are wrong
         long nan = 0; std::vector<long> badrow(64 + 64, 0);
         for (size_t i = 0; i < yNv.size(); ++i) {
