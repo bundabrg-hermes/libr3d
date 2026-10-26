@@ -3014,3 +3014,104 @@ is never a fact about kernels and always a fact about parsers.
 Recipe kept: tools/spill_census.py runs against any build_vNNN tree directly
 (it wants CMakeFiles objects, not the .so); carve_dis.py + a per-symbol slice
 gives per-kernel disassembly from the shipped .so.
+
+---
+
+## 2026-10-26 — window 24: Q26 CLOSED measured (skinny owns fp8a8 M>=4); issue #18 filed (MT-ladder row truncation)
+
+Q26 asked whether Q21's WMMA skinny win transfers across the dtype boundary to
+fp8a8 (e4m3 x e4m3, 128-of-K block scales). It transfers, the crossover sits
+LOWER than w2a8, and measuring it honestly surfaced a shipped-contract bug.
+
+**The bench** (`tools/bench_fp8_skinny.cpp`, window-17/18 harness laws baked
+in: project `-ffp-contract=off`, regime labels, same-process alternating A/B):
+arms are the two dlopen'd shipped entries (plain tile, decode GEMV), an
+ascending-f32 independent oracle, and the skinny prototype — 16-row weight
+tiles per wave as matrix_a, tokens as matrix_b, bf16 fragments filled from a
+per-block e4m3->bf16 LUT (the exact-embedding property Q9 pinned: e4m3 needs
+<=4 significant bits, every code is an exact bf16), f32 accumulators, per-
+128-K-group flush applying `(ps * sa[m]) * sb[n]` in the oracle's order — the
+m64 tile's own flush semantics moved into registers. Because this family is
+tol-graded (3e-02, order-opaque dot legs — issue #6 law), bitwise equality is
+NOT the bar: rel_l2-vs-oracle is, applied symmetrically to the shipped arms.
+
+**Verdict table** (K=N=16384; rot=4 cold / rot=1 cache-fit; medians of 25;
+all deltas same-process alternating):
+
+    M      GEMV(ms)  TILE(ms)  SKINNY(ms)  SKINNY vs incumbent
+    1      0.654     (alias)   1.267       GEMV owns (-48%)
+    2      1.048     (alias)   1.277       GEMV owns (-18%)
+    3      1.038     (alias)   1.319       GEMV owns (-21%)
+    4..7   1.87(MT4) (alias)   1.33        +41..45% BOTH regimes
+    8      4.04(MT8) (alias)   1.326       +205%
+    9..16  --        2.45-2.5  1.33-1.41   +75..87%
+    (alias = f8_launch_tile routes M<=8 to the GEMV for BOTH entries — see
+     the label-liveness finding below; real tile data exists only for M>=9)
+
+No interior crossover: SKINNY is FLAT ~1.33 ms across 4..16 (B-stream bound
+~200 GB/s, matching the attention row's rebaselined 216), GEMV grows per-MT
+ladder step (MT4 1.87, MT8 4.04 — the xs[MT][128] f32 re-stage is the
+per-token tax Q21 predicted, doubled here by the per-element decode), and the
+64-row tile is flat 2.45 because it stages B for rows it never uses more of.
+Correctness: SKINNY vs oracle rel_l2 3.3e-05 (the shipped tile itself shows
+3.4e-05 on the same fixture); SKINNY-vs-TILE 1-ulp agreement 229323/229376;
+the deterministic UNIT mode (row-class codes 1.0/2.0/3.0, scales 1.0) passes
+229376/229376 ANALYTIC — every output element at its hand-computed value.
+
+**Issue #18 (shipped contract bug, evidence-backed).** The decode band picks
+`mt = M>=8?8 : M>=4?4 : M>=2?2 : 1` — rounding DOWN — while the kernel
+computes `live = min(M, MT)` rows and the entries accept every M <= 8. M in
+{3,5,6,7} therefore silently never writes Y rows past the ladder: M=7 wrote
+4/7 rows (rel_l2 0.655, exact sqrt(dropped/M) signature), M=3 2/3, M=5 4/5,
+M=6 4/6; M=1,2,4,8 clean. The flip side matters for every future reading of
+GEMV timings: any M=5..7 measurement is MT=4-work timing, not service time —
+mine included, and the bench found it because GEMV@M=7 timed equal to GEMV@M=4.
+Suggested fix in the issue: round the ladder UP (kernel guards make MT > M
+safe by construction) + battery rows at odd M. Q26b must land the same fix.
+
+**Laws earned this window**
+
+- **A vector-store idiom transfers only after re-deriving COVERAGE, not
+  width.** The first skinny build copied the w2a8 bench's per-lane uint4 LDS
+  store — in w2a8 a packed dword EXPANDS to 16 codes so a uint4 fills 16 LDS
+  slots; in fp8a8 a dword DECODES to 4 codes, so the same store covered 4
+  slots while claiming 16: every tile row staged only its first 32 of 128
+  slots AND each store wrote 8 bytes of adjacent stack garbage over the next
+  chunk. Unit mode localized it exactly (LDS row clean to index 31, garbage
+  after, untouched beyond). This is the dead-row family's fifth costume.
+- **A tol-graded family needs a deterministic unit mode before any timing
+  claim.** Random fixtures cannot separate "slightly wrong" from
+  "tolerance-class different"; row-class codes through a LUT give an analytic
+  expected value for EVERY element, and it was the only tool that could prove
+  staging exactly. Keep it in the bench (F8SK_UNIT=1).
+- **Liveness applies to bench labels, not just zero-diff packs.** The bench
+  arm named TILE was the GEMV for every M<=8 — the band routing lives inside
+  the shared launcher, below both entries. The claim "+215% vs TILE at M=8"
+  was really "vs GEMV-MT8" and would have shipped as a tile verdict if M=8's
+  4.18 ms had not sat absurdly above M=14's 2.45. Benches with band dispatch
+  behind an entry must print what dispatched (R3D_DEBUG_GEMM) or assert the
+  monotonicity their labels imply.
+- **f32 debug channels carry values, never bits.** Packing two 16-bit LDS
+  halves into one float slot (low | high<<16) exceeds float's 24-bit exact
+  integer range AND the multiply-shift loses the second half: the first
+  rowdump "found" ws[0][0]=0x0000 while the slot next to it read 1.0. Count
+  and first-bad-index as small ints instead.
+- **Debug slot maps collide unless centrally allocated** (second sighting,
+  window 19's costume): lane16's fc dump at dbg[16..23] silently overwrote
+  the row-check results at dbg[20..23]; the "garbage" row-check output was
+  the fc dump. Allocate a slot table before writing any of it.
+
+Errors on the record: the uint4 staging (above); `__shfl_down(0, v, off)`
+argument order (width is not the first arg — the wave-reduce checks read
+garbage until fixed, and the one "28/32" it printed after fixing is an
+unresolved SCAFFOLD oddity, kept on the record: the analytic per-element gate
+that supersedes it passed 229376/229376 and no shipped artifact is affected);
+`std::span` under -std=c++17; the dbg-slot collision; the lossy bit-packing;
+and reading my own mislabeled A-rows as tile data for one full sweep before
+the non-monotonicity caught me.
+
+State: no kernel touched, no build cut, no lever moved; v144 remains the
+drafter-mount artifact; spec9g never touched (card used ~55 min under the
+operator's card grant, XTX never left idle-duty state — spec9g container
+untouched, GPU1 shared per grant). tools/bench_fp8_skinny.cpp committed.
+Q26 closed measured -> Q26b ready (port with issue-18 fix); drawer unchanged.
