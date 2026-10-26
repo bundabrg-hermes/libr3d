@@ -3115,3 +3115,59 @@ drafter-mount artifact; spec9g never touched (card used ~55 min under the
 operator's card grant, XTX never left idle-duty state — spec9g container
 untouched, GPU1 shared per grant). tools/bench_fp8_skinny.cpp committed.
 Q26 closed measured -> Q26b ready (port with issue-18 fix); drawer unchanged.
+
+## Window 25 — Q26b shipped (fp8a8 skinny band) + issue #18 fixed
+
+Ported the bench's skinny row into `r3d_gemm_fp8a8.hip` behind `R3D_F8_SK`
+(default-ON 4<=M<=16 && K%128==0; literal 0 withdraws to pre-Q26 routing;
+`R3D_NO_FP8_DEC` family kill withdraws too). Three deliberate deviations from
+the bench: the m64 pitch/rblk contract (BOTH scale grids — `F8SK_RBLK=128`
+added to the bench so the checkpoint grid is gated, not assumed), no dbg
+scaffolding, and dead waves participate in the barriers (`alive` guard) —
+the bench's early `return` at tile>=N never fired on its all-alive grid,
+but the threads it kills own slices of the block-shared xs staging; at
+ragged N it would have left holes. Issue #18 (ladder rounds DOWN, rows past
+the ladder silently never written) fixed unconditionally in the same commit:
+withdrawal returns the old routing, never the old bug.
+
+Honest cost on record: the corrected withdrawal GEMV at M=5..7 is slower
+than v144 ever measured there (M=7 2.9->4.1 ms) because it now computes the
+rows it used to drop — every historical GEMV timing at odd M in this row was
+broken-work timing. The skinny band replaces it (+207% at M=7 vs the
+CORRECT incumbent).
+
+Gates. Unit: 229376/229376 analytic at M=14; the M=16 leg's 229376/262144
+is the bench's EXPECTS formula not honoring the fixture's zeroed rows 14/15
+(the real-fixture M=16 legs pass) — second scaffold oddity beside the
+persistent wavemma_ok=28 suspect; artifact gates are the analytic + oracle
+arms. Correctness: 16 legs, both grids, both arms, worst rel_l2 4.7e-05,
+all verdicts ok, NaN-free. Battery 14/14: withdrawal 7/7 zero-diff vs v143
+(reachability stated: pack fp8a8 rows are M=4/8/16 only); default 5/7
+zero-diff, kernels+fp8 drift ONLY in-band rows (incl. gated composition),
+verdicts hold, 536/536 + 2011/2011. Census: sk arm 159 VGPR / 0 spill /
+0 priv / LDS 39680 exactly equal to the hand-computed LUT+xs+ws — a free
+source-layout audit (my head-math had halved ws; the compiler disagreed and
+the compiler is the artifact). A/B cold, same binary, liveness every leg:
++46.2/+207.2/+207.1/+79.7/+75.2% at M=4/7/8/14/16, 5/5 DISJOINT spreads.
+
+Runner post-mortem (both dead sections were harness, not card): (1) `$r_$1`
+inside a script running `set -u` expands variable `r_` — bash errors, SKIPS
+the docker+grep pipeline segments, and the empty-input pipeline TAIL still
+echoes liveness-shaped lines: the A/B section "ran" 30 times in zero seconds
+and looked superficially alive until the timestamps collided on one second.
+LAW: assert each harness section's expected ROW COUNT against its
+expected-leg count before adjudicating; a section that ran empty is
+indistinguishable from a section whose legs died, unless you count. (2) the
+rebuilt script silently dropped its body (`+ body` missing from a header
+concat) and both background runs "completed" exit-0 having done only the
+header — same law, same guard: count, or diff the script against intent.
+(3) battery report stems ARE filenames: passing one stem to all seven legs
+collides them onto one file (q18_batt's per-leg suffixes existed for a
+reason).
+
+State: build_v145 shipped default-ON; v144 superseded as the drafter-mount
+build. spec9g never issues fp8a8 (zero log lines, re-verified), restored
+after the card session: health 200, gfx1100 boot-asserted, 6.65 GiB,
+restarts=0, Perth-coherent. Residual booked: M 17..64 tile-band crossover —
+the skinny row needs a grid.y token-slab dimension before it can even serve
+M>16 (xs is 16 rows), so the tile band is untouched by design this window.
