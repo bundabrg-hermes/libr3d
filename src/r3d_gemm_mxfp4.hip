@@ -924,8 +924,20 @@ __global__ __launch_bounds__(256) void m4_act_i8_kernel(
  * competes with LDS reads). Bit-identical to the shfl chain by construction
  * (partner value + same add order; probe q6probe2 verified lane-exact on
  * gfx1100). row_xmask covers xor 1/2/4/8; xor16 crosses the row and stays
- * shfl. Lever dpp=0 keeps the verbatim shfl arms. */
-__device__ __forceinline__ int32_t q8x_fold_i32(int32_t p, const bool dpp) {
+ * shfl. Lever dpp=0 keeps the verbatim shfl arms. Q24 adds the third state:
+ * dpp=2 rides v_permlanex16_b32 for the xor-16 tail -- the DPP row control
+ * crosses only the 16-lane row, and the ISA p.432 pseudocode (pinned PDF) makes
+ * laneSel (16 shared 4-bit entries, entry i == i) read
+ * tmp[altrow*16 + i]: the xor-16 partner as ONE VALU instruction. The entry
+ * field is read from the SGPR pair with the THIRD builtin arg in the LOW word
+ * (observed lane-exact by the q24 card probe: the rotated pairing silently
+ * gathers entry i = nibble i of the swapped pair). FI/
+ * BOUND_CTRL 0 (EXEC-full butterfly). Partner value + same add order, the Q6
+ * bit-identity law; adjudicated by the q24 card probe before any gate. */
+__device__ __forceinline__ uint32_t q8x_perm_x16(uint32_t v) {
+    return __builtin_amdgcn_permlanex16(v, v, 0x76543210u, 0xFEDCBA98u, false, false);
+}
+__device__ __forceinline__ int32_t q8x_fold_i32(int32_t p, const int dpp) {
     if (dpp) {
         p += __builtin_amdgcn_update_dpp(p, p, 0x161, 0xf, 0xf, 0);
         p += __builtin_amdgcn_update_dpp(p, p, 0x162, 0xf, 0xf, 0);
@@ -935,13 +947,14 @@ __device__ __forceinline__ int32_t q8x_fold_i32(int32_t p, const bool dpp) {
     p += __shfl_xor(p, 2);
     return p;
 }
-__device__ __forceinline__ float q8x_fold_f32(float c, const bool dpp) {
+__device__ __forceinline__ float q8x_fold_f32(float c, const int dpp) {
     if (dpp) {
         c += __uint_as_float(__builtin_amdgcn_update_dpp(
             __float_as_uint(c), __float_as_uint(c), 0x164, 0xf, 0xf, 0));
         c += __uint_as_float(__builtin_amdgcn_update_dpp(
             __float_as_uint(c), __float_as_uint(c), 0x168, 0xf, 0xf, 0));
-        c += __shfl_xor(c, 16);
+        c += dpp >= 2 ? __uint_as_float(q8x_perm_x16(__float_as_uint(c)))
+                      : __shfl_xor(c, 16);
         return c;
     }
     c += __shfl_xor(c, 4);
@@ -1009,10 +1022,10 @@ __global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_kernel(
                 const uint2 xv = *(const uint2*)(X + (int64_t)m * K + (it << 8) + (t << 3));
                 int32_t p = __builtin_amdgcn_sudot4(1, (int)xv.x, 1, (int)wc.x, 0, 0);
                 p = __builtin_amdgcn_sudot4(1, (int)xv.y, 1, (int)wc.y, p, 0);
-                p = q8x_fold_i32(p, dpp != 0);
+                p = q8x_fold_i32(p, dpp);
                 float c = (float)p * SG[(int64_t)m * (K >> 5) + g]
                                 * AS[(int64_t)m * as_pitch + (g >> 2)] * sc * 0.5f;
-                c = q8x_fold_f32(c, dpp != 0);
+                c = q8x_fold_f32(c, dpp);
                 acc[m] += c;
             }
         }
@@ -1037,10 +1050,10 @@ __global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_kernel(
             const uint2 xv = *(const uint2*)(X + (int64_t)m * K + (it << 8) + (t << 3));
             int32_t p = __builtin_amdgcn_sudot4(1, (int)xv.x, 1, (int)wc.x, 0, 0);
             p = __builtin_amdgcn_sudot4(1, (int)xv.y, 1, (int)wc.y, p, 0);
-            p = q8x_fold_i32(p, dpp != 0);
+            p = q8x_fold_i32(p, dpp);
             float c = (float)p * SG[(int64_t)m * (K >> 5) + g]
                             * AS[(int64_t)m * as_pitch + (g >> 2)] * sc * 0.5f;
-            c = q8x_fold_f32(c, dpp != 0);
+            c = q8x_fold_f32(c, dpp);
             acc[m] += c;
         }
     }
@@ -1453,10 +1466,14 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
              * medians, non-overlapping, lever-ON boot-proven live), bit-identical
              * by the q6probe2 lane-exact probe + v123 battery zero-diff (no numeric
              * class -- the gates carry the proof). R3D_Q8X_DPP=0 withdraws the
-             * folds to the verbatim shfl chain (literal "0", the q8x law). */
+             * folds to the verbatim shfl chain (literal "0", the q8x law). Q24
+             * adds the third state: "2" also rides v_permlanex16_b32 for the
+             * xor-16 tail (see the fold comment); "1"/unset stays the Q6 arm. */
             static const int q8x_dpp = []{
                 const char* e = getenv("R3D_Q8X_DPP");
-                return e && !std::strcmp(e, "0") ? 0 : 1; }();
+                if (e && !std::strcmp(e, "0")) return 0;
+                if (e && !std::strcmp(e, "2")) return 2;
+                return 1; }();
             const unsigned pgrid = (unsigned)((P.M * (P.K >> 5) + 7) / 8);
             hipLaunchKernelGGL(m4_act_i8_kernel, dim3(pgrid), dim3(256), 0, stream,
                                P.A, q8x_x8, q8x_sg, (int)P.M, (int)P.K, P.a_pitch);

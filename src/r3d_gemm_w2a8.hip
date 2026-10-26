@@ -186,7 +186,23 @@ template <int MASK>
 __device__ __forceinline__ uint32_t w2_dpp_x(uint32_t p) {
     return __builtin_amdgcn_update_dpp(p, p, 0x160u | MASK, 0xf, 0xf, 0);
 }
-__device__ __forceinline__ void w2_fold_octet_f32(float* s, const bool dpp) {
+/* Q24 (REVIEW_QUEUE): the xor-16 tail as ONE v_permlanex16_b32. The DPP row
+ * control crosses only the 16-lane row, so Q6/Q22 left __shfl_xor(16) as one
+ * ds_bpermute_b32 on the DS pipe per fold. ISA p.432 pseudocode (pinned PDF):
+ * x16 gathers from the ALTERNATE row using 16 shared 4-bit laneSel entries --
+ * the identity select (entry i == i) makes every lane read tmp[altrow*16 + i],
+ * exactly the xor-16 partner. The entry field reads the SGPR pair with the
+ * builtin's THIRD arg in the LOW word (q24 card probe, lane-exact: the swapped
+ * pairing silently gathers the wrong nibble stream -- a wrong-arm class with
+ * NO crash and NO build error). FI/BOUND_CTRL 0 (the butterfly is EXEC-full);
+ * bit-identical by construction: partner value + same add order (the Q6 law),
+ * adjudicated by the q24 card probe before any gate. Lever is three-state
+ * (the R3D_GDN_SB precedent): R3D_W2_DPP=2 rides it, the shipped default 1
+ * keeps the Q22 arm verbatim, 0 withdraws the whole fold to the shfl chain. */
+__device__ __forceinline__ uint32_t w2_perm_x16(uint32_t v) {
+    return __builtin_amdgcn_permlanex16(v, v, 0x76543210u, 0xFEDCBA98u, false, false);
+}
+__device__ __forceinline__ void w2_fold_octet_f32(float* s, const int dpp) {
     if (dpp) {
         *s += __uint_as_float(w2_dpp_x<1>(__float_as_uint(*s)));
         *s += __uint_as_float(w2_dpp_x<2>(__float_as_uint(*s)));
@@ -197,8 +213,9 @@ __device__ __forceinline__ void w2_fold_octet_f32(float* s, const bool dpp) {
         *s += __shfl_xor(*s, 4);
     }
 }
-__device__ __forceinline__ void w2_fold_tail_f32(float* s, const bool dpp) {
-    *s += __shfl_xor(*s, 16);                     /* crosses the row: shfl both arms */
+__device__ __forceinline__ void w2_fold_tail_f32(float* s, const int dpp) {
+    *s += dpp >= 2 ? __uint_as_float(w2_perm_x16(__float_as_uint(*s)))
+                   : __shfl_xor(*s, 16);          /* Q24: x16 at lever 2, else shfl */
     if (dpp) {
         *s += __uint_as_float(w2_dpp_x<8>(__float_as_uint(*s)));
         *s += __uint_as_float(w2_dpp_x<4>(__float_as_uint(*s)));
@@ -211,7 +228,7 @@ __device__ __forceinline__ void w2_fold_tail_f32(float* s, const bool dpp) {
         *s += __shfl_xor(*s, 1);
     }
 }
-__device__ __forceinline__ void w2_fold_octet_i32(int32_t* s, const bool dpp) {
+__device__ __forceinline__ void w2_fold_octet_i32(int32_t* s, const int dpp) {
     if (dpp) {
         *s += (int32_t)w2_dpp_x<1>((uint32_t)*s);
         *s += (int32_t)w2_dpp_x<2>((uint32_t)*s);
@@ -222,8 +239,8 @@ __device__ __forceinline__ void w2_fold_octet_i32(int32_t* s, const bool dpp) {
         *s += __shfl_xor(*s, 4);
     }
 }
-__device__ __forceinline__ void w2_fold_tail_i32(int32_t* s, const bool dpp) {
-    *s += __shfl_xor(*s, 16);
+__device__ __forceinline__ void w2_fold_tail_i32(int32_t* s, const int dpp) {
+    *s += dpp >= 2 ? (int32_t)w2_perm_x16((uint32_t)*s) : __shfl_xor(*s, 16);
     if (dpp) {
         *s += (int32_t)w2_dpp_x<8>((uint32_t)*s);
         *s += (int32_t)w2_dpp_x<4>((uint32_t)*s);
@@ -248,7 +265,7 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_kernel(
     const float* __restrict__ SUM,      /* SUM[g * mpad + m] f32, group-major */
     int M, int N, int K, int mpad, int u4zp,
     int64_t a_pitch, int64_t b_pitch, int64_t y_pitch, int64_t as_pitch,
-    int64_t sc_pitch, int64_t zp_pitch, const bool dpp)
+    int64_t sc_pitch, int64_t zp_pitch, const int dpp)
 {
     __shared__ __align__(16) float xs[MT * 512];
 
@@ -451,7 +468,7 @@ __device__ __forceinline__ void q8_dword_iter(
     int live, int rr, const __half* __restrict__ SC, const uint8_t* __restrict__ ZP,
     const float* __restrict__ SUM, const float* __restrict__ AS, int u4zp,
     int64_t a_pitch, int64_t sc_pitch, int64_t zp_pitch, int mpad, int64_t as_pitch,
-    const bool dpp)
+    const int dpp)
 {
     const int kbase = g0 << 7;
     for (int i = threadIdx.x; i < live * 512; i += kThreads) {
@@ -536,7 +553,7 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     const float* __restrict__ SUM,
     int M, int N, int K, int mpad, int u4zp,
     int64_t a_pitch, int64_t bc_pitch, int64_t y_pitch, int64_t as_pitch,
-    int64_t sc_pitch, int64_t zp_pitch, const bool dpp)
+    int64_t sc_pitch, int64_t zp_pitch, const int dpp)
 {
     __shared__ __align__(16) int8_t xs[MT * 512];
 
@@ -900,8 +917,8 @@ namespace {
 template <int MT, int W>
 __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_kernel(
     const int8_t*, const uint8_t*, uint16_t*, const float*, const __half*, const uint8_t*,
-    const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-    bool) {}
+    const float*, int, int, int, int, int,    int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int) {}
 /* the q8 arm mirrors too (same rule): the repack kernel and the q8 GEMV. Q12 added
  * the C4 template parameter -- mirrored here or every q8c instantiation launches as
  * invalid device function on any non-gfx11 build of the plugin. Q18b added the WC
@@ -912,8 +929,8 @@ __global__ void gemm_nt_w2a8_repack_kernel(const uint8_t*, uint8_t*, int64_t, in
 template <int MT, int W, int C4, int WC = 0>
 __global__ __launch_bounds__(kThreads, 2) void gemm_nt_w2a8_gemv_q8_kernel(
     const int8_t*, const uint8_t*, uint16_t*, const float*, const __half*, const uint8_t*,
-    const float*, int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-    bool) {}
+    const float*, int, int, int, int, int,    int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int) {}
 /* Q21b added the WMMA skinny arm -- mirrored with the SAME 16-argument signature (no
  * dpp bool, no template parameters: the mangled-name rule above applies to it too). */
 __global__ __launch_bounds__(kThreads) void gemm_nt_w2a8_gemv_sk_kernel(
@@ -1058,9 +1075,14 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
      * ops zero mismatches, and the battery fingerprints are baseline-exact both
      * arms (no numeric class; the gates carry the proof). Default ON; the A/B on
      * the same binary adjudicates the speed. R3D_W2_DPP=0 withdraws to the
-     * verbatim shfl chain (literal "0", the lever law). */
-    static const bool w2_dpp = !(getenv("R3D_W2_DPP") &&
-                                 !std::strcmp(getenv("R3D_W2_DPP"), "0"));
+     * verbatim shfl chain (literal "0", the lever law). Q24 adds the third state:
+     * "2" also rides v_permlanex16_b32 for the xor-16 tail (ISA p.432 identity
+     * laneSel, q24 card probe gate); "1"/unset stays the Q22 arm verbatim. */
+    static const int w2_dpp = []{
+        const char* e = getenv("R3D_W2_DPP");
+        if (e && !std::strcmp(e, "0")) return 0;
+        if (e && !std::strcmp(e, "2")) return 2;
+        return 1; }();
     /* Q21b (REVIEW_QUEUE delta5): the WMMA skinny decode arm -- i8 fragment tiles,
      * NO cross-lane flush (lane registers ARE outputs). Bench A/B same-operands:
      * M=14 +208%/+211% (cold/cache-fit), M=7 +46.6%, M=4 tie, M=1 -47% -- so the
@@ -1262,16 +1284,19 @@ void w2_launch(const W2Plan& P, void* ydata, int64_t y_pitch, RadStream s) {
         /* Once per DISTINCT (mt, walk, window) triple, not once per process: a harness
          * that sweeps M (repro_w2a8) otherwise prints the narrow tile's arm and leaves
          * the wide-tile lever unproven -- an arm that silently never dispatched would
-         * still look bit-exact. Host-side only, debug-env only: never a codegen effect. */
-        static unsigned seen = 0;
+         * still look bit-exact. Host-side only, debug-env only: never a codegen effect.
+         * Q24: the fold lever (dpp) joins the identity -- an env leg that silently left
+         * the dpp level at its default must be visible as a never-printed level. */
+        static unsigned long long seen = 0;
         const int mti = mt == 1 ? 0 : mt == 2 ? 1 : mt == 4 ? 2 : mt == 8 ? 3 : 4;
         const int wci = wc == 0 ? 0 : wc > 0 ? 1 : 2;
-        const unsigned bit = sk ? (1u << (16 + mti))     /* sk has no wc axis: own range */
-                                : (1u << (mti * 3 + wci));
+        const unsigned long long bit = sk ? (1ull << (56 + mti))  /* sk has no wc/dpp
+                                        * axis: top range */
+                                          : (1ull << (mti * 9 + wci * 3 + dpp));
         if (!(seen & bit)) {
             seen |= bit;
-            fprintf(stderr, "libr3d: w2a8 decode gemv launched (mt=%d, %s, wc=%d)\n",
-                    mt, sk ? "sk" : (c4 ? "q8c" : (B8 ? "q8" : "u2")), wc);
+            fprintf(stderr, "libr3d: w2a8 decode gemv launched (mt=%d, %s, wc=%d, dpp=%d)\n",
+                    mt, sk ? "sk" : (c4 ? "q8c" : (B8 ? "q8" : "u2")), wc, dpp);
         }
     }
 }
