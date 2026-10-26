@@ -2795,3 +2795,105 @@ addresses live in the trailing COMMENT — the window-18 trap recurred in the
 body-count regex (`^\t[a-z_]`, never the address prefix). The zero-parse
 coverage asserts fired loudly on attempts 1-3 instead of shipping tables of
 zeros — the pattern the ledger has now saved four times.
+
+## 2026-10-26 — window 21: Q24 CLOSED split: w2a8 permlanex16 tail ships default-ON (v144), mxfp4 lever DARK on serve data
+
+Resume item #1 (Q24 desk step 0) resolved the same day it was booked, and the
+window became a full split-verdict promotion cycle on build_v143/v144.
+
+**Desk step 0.** `__builtin_amdgcn_permlanex16` exists in ROCm 10.1 — with SIX
+args (the fork carries FI and BOUND_CTRL as explicit bools; upstream has four,
+the signature error text told me). Compile probe carved to gfx1100 ISA: ONE
+`v_permlanex16_b32`, no DS round trip, and the donor's hazard law ("do not
+trust LLVM to fix a V_CMPX adjacency") is OBSOLETE for intrinsics — LLVM's
+SIInstrInfo models the permlane hazard itself. The encoding pinned from the
+pinned PDF's p.432 pseudocode (fitz-extracted, `docs/isa/.venv`): the x16
+reads the ALTERNATE row through 16 shared 4-bit laneSel entries; xor-16
+identity = entry i == i.
+
+**THE SILENT-WRONG-ARM FIND.** My first helper passed the identity pair with
+the words swapped (0x33221100/0x77665544 — a nibble pattern I'd pattern-matched
+from the ISA's rotate example instead of deriving). No build error. No crash.
+No fault. 15/16 lanes silently gathered the wrong partner. The q24 card probe
+caught it because it adjudicates THREE-WAY — `__shfl_xor(16)` vs an independent
+LDS oracle vs permlanex16 — so the dump showed `ref==ora` everywhere and `got`
+permuting by the nibble stream of the swapped pair. The entry field reads the
+SGPR pair with the builtin's THIRD arg in the LOW word: identity is
+{lo=0x76543210, hi=0xFEDCBA98}. LAW: for a permute whose sources are both
+"obvious", the probe must carry a source-independent oracle — shfl-vs-permlane
+alone would have compared two wrong things and passed. After the fix:
+PROBE-BITEXACT at 2.68e8 lane-ops, fold-chain shapes (octet+tail) for f32 and
+i32 at lever 0/1/2, 8 seeds.
+
+**Levers (three-state, the R3D_GDN_SB precedent).** w2a8 `R3D_W2_DPP`: 0 =
+verbatim shfl chain (the lever law's literal), 1 = the Q22 arm, 2 = +x16 tail.
+SHIPPED DEFAULT 2. mxfp4 `R3D_Q8X_DPP`: same states, default stays 1 (see
+serve data below), "2" opt-in. w2a8 kernel params went bool→int dpp; stub list
+mirrored (the mangled-name law); the debug-liveness tuple grew the dpp axis
+into a 64-bit bitmap (mt × walk × wc × dpp) so a leg that silently left the
+lever at its default shows up as a never-printed level.
+
+**w2a8 adjudication (same binary, lever the only axis).** M=2 DISJOINT +9.9%
+median, M=4 +6.4% trimmed (one outlier round kept and labelled, not pruned),
+M=1 +3.1% medians with overlapping spreads (softest — the dominant decode
+shape is the honest soft win). The MT>=8 shapes I also benched (M=7/14/16)
+DISPATCH THE sk ARM — which has no folds at all: their dpp=1-vs-2 rows were
+no-ops, and the liveness line made that visible in the harness output before I
+adjudicated them as noise. The zero-diff-visibility law in its A/B costume:
+an A/B row can only adjudicate the arm the lever actually reaches.
+
+**mxfp4 adjudication (serve, same binary, env the only axis).** Seven rounds
+on spec9g's card, boot-liveness `q8x dot4 arm launched (mt=1 pf=1 dpp=2)`
+proven per d2 round post-probe (the arm dispatches at FIRST DECODE, not at
+boot — my first runner grepped liveness at readiness and reported NONE, a
+false alarm of placement, not of code): base {22.10, 21.84, 22.04} + confirm
+{21.28} vs d2 {22.01, 22.85, 20.04} medians t/s at ctx 3072, full overlap —
+FLAT, and by Q6's non-overlap law the lever stays DARK. A one-instruction
+swap per fold is below the serve noise floor where the fold is one bperm; the
+w2a8 kernel-level effect (~3-10%) does not survive into serve decode share.
+
+**Gates.** v143 (armed dark): repro 13/13 exact on dpp arms 0/1/2, per-arm
+liveness printed every level; battery 11/11 zero-diff vs v141 (both lever-2
+legs included — after catching that gate.sh never forwarded R3D_Q8X_DPP: the
+mxfp4 half of my kernels_d2 leg would have been a vacuous pass; caught PRE-run
+by re-reading the forwarder list, fixed in-tree). v144 (host-only default
+flip): FATBIN-IDENTICAL (16,044,752-byte .hip_fatbin cmp v143 vs v144), repro
+13/13 exact with DEFAULT-dispatch liveness dpp=2, census 423 permlanex16 sites
+in the w2a8 q8 TU / 30 in mxfp4 q8x (bperm counts unchanged by design — the
+withdrawal arms live in the same binary). spec9g never issues w2a8: no swap,
+v144 is the drafter-mount build (Q18 precedent); serve restored on its v142
+home, health 200, zero restarts, chat coherent.
+
+**The 48/58 difflines that were nothing.** The first v144 default battery
+looked dirty vs v141 (48/58 difflines, checked counts down 12/45) on a build
+whose device image is byte-identical to a zero-diff build. A same-build control
+run reproduced the SAME 4725/4-skipped twice, and the "Not covered" section
+named it: dflash_select needs 727.51 MiB vs the harness 512 MiB free-VRAM
+budget — deterministic per RUN (card state), not per build; the surviving diff
+lines were the skipped cases' result rows + their derived not-reached entries.
+Zero numeric diffs. LAW (sharpens window 9's budget-noise note): budget skips
+are deterministic per card-state, so "deterministic" does not discriminate
+code from state — re-run the same build as a control before believing a
+coverage-count delta.
+
+**Errors I made, on the record.** The swapped-selector constants (above) — the
+near-miss of the window; a host/device variable-name slip (`dpp` vs `w2_dpp`
+in the liveness block — the four-minute TU compile caught it before the full
+build wasted 15 minutes… actually the full build caught it, because I launched
+it without the TU gate; 6 minutes of compile to find a two-character error);
+a vacuous `grep -o 'md5='` on repro outputs where the md5 law belongs to the
+battery packs — the non-emptiness assert caught it, `exact=YES rel_l2=0.000e+00`
+is the repro's real identity gate; an amend-push that diverged cat (fixed by
+`git reset --hard origin/main`, cat keeps no local commits by law); `docker
+rm -f` racing the daemon's cleanup into a create conflict — the runner failed
+closed, the second template retries create; the serve A/B runner's liveness
+grep at readiness instead of post-probe; and two ssh-quote/awk path slips that
+garbled the census `total` field (the non-zero permlane/bperm asserts held).
+
+**State.** main == GitHub == local == cat @ 6f1be03 (promotion) — all trees
+clean. spec9g: v142 home (its own rollback slot chain: v136/v129/v124/v121),
+health 200, gfx1100 rank 0, zero restarts. build_v143 = the fully gated
+measurement build; build_v144 = the drafter-mount shipping artifact (permlanex16
+tail default-ON for w2a8; nothing changes for spec9g's issued rows). Runners:
+q24_gates.sh, q24_serve_ab.sh + q24_serve_ab2.sh (create-retry template),
+q24_probe.hip (three-way probe).
