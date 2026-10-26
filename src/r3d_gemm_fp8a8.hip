@@ -589,13 +589,21 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_sk_kernel(
     }
     if (alive) {
         if constexpr (SLABS == 1) {
-            /* tok < live (Q26b) with live=min(M,16): SLABS==1 is launcher-gated to
-             * M<=16, where tok<live and tok<16 are the same predicate for every
-             * legal launch (the launcher refuses M<4). */
+            /* tok < live with live = min(M,16): the exact Q26b predicate, RESTORED.
+             * The window-27 claim that tok<16 coincides with tok<live under the
+             * launcher's 4<=M<=16 gate was FALSE -- it holds only at M==16. At M
+             * 4..15 the tautology zero-wrote rows M..15 past the M-row Y: the flush
+             * guard kept those accumulators at 0.0f, so every victim byte was a
+             * ZERO write -- invisible to zero-filled probe padding, loud to kbench's
+             * guarded allocator (v147 battery: 48 decode 'y'-past-end, 12 plain
+             * b_scale-adjacent, 2 'a' = 62 flags, 14 cascade FAILs). The fused row
+             * hid it behind the 64-row scratch arena and the live-guarded epilogue.
+             * tok<16 at SLABS==1 must NEVER be called a tautology-safe guard. */
+            const int live = M < 16 ? M : 16;
 #pragma unroll
             for (int k = 0; k < 8; ++k) {
                 const int rr = tile + 2 * k + (lane >> 4);
-                if (tok < 16 && rr < N)
+                if (tok < live && rr < N)
                     Y[(int64_t)tok * y_pitch + rr] = f32_to_bf16_f8(R3D_SKY(0, k));
             }
         } else {
