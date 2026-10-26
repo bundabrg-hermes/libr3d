@@ -3171,3 +3171,53 @@ after the card session: health 200, gfx1100 boot-asserted, 6.65 GiB,
 restarts=0, Perth-coherent. Residual booked: M 17..64 tile-band crossover —
 the skinny row needs a grid.y token-slab dimension before it can even serve
 M>16 (xs is 16 rows), so the tile band is untouched by design this window.
+
+## Window 26 — Q26c measured: skinny wins the whole M 17..64 band (port justified, booked)
+
+The booked job was the Q26b residual: does the skinny row beat the m64 tile
+past M=16, and is the port worth a token-slab dimension. It is — measured,
+bench-only, nothing shipped this window.
+
+Design choice over the handover's sketch: the handover asked about a grid.y
+slab dimension; that re-walks the weight plane ceil(M/16) times — the tile's
+own staging law, inverted against us. The committed extension (6b1127f) puts
+the slab loop INSIDE the K-group loop instead: ws stages once per group,
+16-token slabs stream through xs, accumulators become y[4][8]. One weight
+pass (same as the tile), LDS unchanged, and M<=16 reduces to the exact v145
+arm — same order, same barriers, so window 25's numbers stay comparable.
+
+Gates, all green (q26c_run.log):
+- Unit regression M=14 IDENTICAL to the v145 baseline — wavemma_ok=28 is not
+  a regression: it is the fixture's deliberately-zeroed padding rows 14/15
+  making lanes 14/15/30/31 fail a nonzero expectation, and it reads 28 in
+  every v145 log too. The probe itself is now gated (zero-fill only when
+  M<=14, where those rows are actually dead), which also fixes the old
+  u16-formula artifact for good. New slab path at M=32/64: wavemma_ok=32,
+  ROWCHECK clean, ANALYTIC exact 524288/524288 and 1048576/1048576.
+- Correctness vs oracle, both scale grids, real fixtures: rel_l2
+  3.6e-05..4.4e-05 — the shipped tile's own class on the same fixtures
+  (it reads 4.1e-05), the tol-graded family bar is 3e-02.
+- Timing (spec9g stopped per the exclusivity protocol, restored after:
+  health 200, RestartCount 0): 10 legs, M 17/24/32/48/64 x rot 4/1, 30
+  reps, tile-dispatch liveness per leg. EVERY spread disjoint, both
+  regimes: +45.9/+47.1 (17), +44.8/+44.8 (24), +43.3/+43.9 (32),
+  +33.5/+34.0 (48), +14.1/+14.1 (64).
+
+Datum retired: the "tile flat 2.45 ms" extrapolation only held in the M<=16
+padding regime. Past 16 the tile climbs 2.62->3.49 ms while skinny walks
+1.76->3.06; the win shrinks monotonically (slabs add token staging; the
+tile's padding waste shrinks with M) but stays disjoint at M=64, where the
+tile pays zero padding at all — so skinny's edge is instruction path and
+staging width, not padding avoidance alone. That is the stronger claim and
+the reason M>16 is worth the port instead of a skinny/tile crossover.
+
+Booked next (Q26c port): same slab loop into the shipped sk kernel, band
+4<=M<=16 -> 4<=M<=64 (tile keeps M>64), stub mirror, full ceremony — and
+one new battery expectation to state up front: standing packs at M<=16 must
+stay ZERO-diff (the M<=16 arm is unchanged by construction), while any
+battery rows past 16 drift in-band like window 25's did.
+
+State: local == GitHub == cat at 6b1127f, trees clean; spec9g restored
+mid-run by the runner itself (health 200 in 20 s). Card session ~10 min
+under the operator grant. No lever moved, no build cut; v145 remains the
+drafter-mount artifact. Drawer unchanged: hd256 accept, RDNA3.5 guard.
