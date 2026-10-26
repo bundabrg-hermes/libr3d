@@ -3337,3 +3337,57 @@ tautology/zero-fill chronicle); header date 2026-10-26.
 
 State: local == GitHub == cat, trees clean. Q30 (card session) is now the ONLY
 ready item in the queue.
+
+## Window 35 (2026-10-27) — issue #11 milestone 3: hd256 split-KV decode arm (R3D_HD256, code + gates + bench)
+
+The two booked items the operator greenlit together: build milestone 3, then the
+teacher-forced KLD pair as the hd256 accept-evidence. This window closes the build;
+the KLD pair rides at the end.
+
+Code (commit 4ea299e, local == GitHub == cat). The decode row's split-KV family
+gains head_dim 256 behind the SAME lever the m2 tile uses:
+- body.inc: the m2 placeholder assert (`D != 256 || SPLITK==0`) becomes
+  `D != 256 || FOLD==0 || SPLITK==1` -- the SPLITK=1 paths were already D-generic
+  by construction (integer slice cut; partial store reuses the proven 32-row O
+  staging through the Q+S alias, 33792 B fits the 42240 B span at 256).
+- decode entry: gate `d256 = lever && hd==256 && !v2 && bf16-KV`; arena hook claims
+  256 partials ONLY while the lever is set (an unset lever must not cost KV budget);
+  the slice arm is a new R3D_DK_L256 macro carrying the m2 dynamic-LDS law into the
+  decode row (attribute raised per instantiation, r3d_attn256_smem(PAD) passed).
+  Eight literal instantiations (DBUF x PAD x FOLD); FS stays un-instantiated (m2
+  law). splits=1 or short arena fall back to the m2 tile through the existing path.
+- tools/bench_attn_decode.hip: the Phase C decode bench forked with BENCH_HD env
+  (default 128 -- every v148-era command reproduces verbatim).
+
+Gates (cat, build_v149 fresh): lever-OFF 7-pack OK with fingerprint difflines=0 on
+ALL SEVEN packs vs v148; lever-ON stock+attn replay OK; repro_attn256 tile arm
+byte-stable (in-run hash diff vs v148 = 0). Split probe (repro_attn_splitk,
+REPRO_HD=256): 28/28 arms bad_cells=0, nan_slots=0; device-vs-oracle band is flat
+across SPL=1..64 (max 2.688e-3 vs the SPL=1 tile arm's own 2.656e-3 -- the band IS
+the bf16 fragment class, splitting adds no error class); host re-merge is always
+LOWER than the device arm (partials obey the contract exactly); SPL=64@ctx300 is
+bit-identical to SPL=13 (inert-slice skip = exactly the same live-slice sum), and
+fold/plain arms agree to the last digit. My adjudicator's first pass printed 14
+FAILs -- both halves of that were the adjudicator, not the card: a noise-token
+regex that matched the substring inside `bad_cells`, and a 2.5e-3 threshold
+imported from the kbench prefill-tile gate that the known-good SPL=1 tile arm
+itself exceeds on this double-precision oracle. Adjudicated on raw (a)/(b) values.
+Spill census (card-free, build_v149 local): slice arms 167-179 vsp / 268-284 B priv
+(same h256 resident-accumulator family as the m2 tile's 88-138, slightly heavier
+for the partial store); the merge kernel is spill-free; v148 rows unchanged.
+
+Bench (exclusive, pinned, 3 interleaved rounds, 243/243 arms clean, tile column
+lands on the m2 recorded data -- 3364 vs 3363.7 us):
+  M ctx | tile us | law us | speedup
+  1 512 | 576 | 133 | 4.33    1 2048 | 1007 | 318 | 4.25    1 8192 | 3364 | 722 | 5.66
+  4 512 | 571 | 143 | 4.01    4 2048 | 1011 | 340 | 4.05    4 8192 | 3380 | 758 | 5.40
+  8 512 | 585 | 154 | 3.79    8 2048 | 1013 | 366 | 3.80    8 8192 | 3404 | 808 | 5.12
+Effective KV bandwidth M1/8192: 9.9 -> 46.5 GB/s. The law default is within 20% of
+the swept best everywhere (p48 wins only at 8192 -- a 256 wave-target retune is a
+follow-up candidate, same shape as the 128-era finding, does not gate the merge).
+Runner law honored again the hard way: the first sweep "completed" in 90 seconds --
+`bash -c "$script" "$R"` binds $R to $0, every arm died on an unbound $1, and only
+the row-count assertion (81/round) caught the empty run. Fixed with SWEEP_ROUND env.
+
+KLD accept-evidence pair (teacher-forced, differential law, v149 serve on
+qwen35-9b-mxfp4 = the hd256 serve geometry 16Q/4KV): see next entry.

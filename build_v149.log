@@ -1,0 +1,92 @@
+-- The CXX compiler identification is GNU 13.3.0
+-- The HIP compiler identification is Clang 24.0.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting HIP compiler ABI info
+-- Detecting HIP compiler ABI info - done
+-- Check for working HIP compiler: /opt/rocm/core-10.1/lib/llvm/bin/clang++ - skipped
+-- Detecting HIP compile features
+-- Detecting HIP compile features - done
+-- Configuring done (5.6s)
+-- Generating done (0.0s)
+-- Build files have been written to: /work/build_v149
+[  3%] Building CXX object CMakeFiles/libr3d.dir/src/r3d_rows.cpp.o
+[  7%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_rmsnorm.hip.o
+[ 11%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_embed.hip.o
+[ 14%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_kvstore.hip.o
+[ 18%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_actmul.hip.o
+[ 22%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_cast.hip.o
+[ 25%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_rope.hip.o
+[ 29%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_gemm_bf16.hip.o
+[ 33%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_gemm_bf16_m64.hip.o
+[ 37%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_gemm_mxfp4.hip.o
+[ 40%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_gemm_fp8a8.hip.o
+[ 44%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_gemm_logits.hip.o
+[ 48%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_attn_paged.hip.o
+[ 51%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_attn_paged_wmma.hip.o
+[ 55%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_attn_paged_decode.hip.o
+[ 59%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_sample.hip.o
+[ 62%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_band.hip.o
+/work/src/r3d_band.hip:309:1: warning: non-void function does not return a value in all control paths [-Wreturn-type]
+  309 | }
+      | ^
+1 warning generated when compiling for gfx11-generic.
+/work/src/r3d_band.hip:309:1: warning: non-void function does not return a value in all control paths [-Wreturn-type]
+  309 | }
+      | ^
+1 warning generated when compiling for gfx1100.
+/work/src/r3d_band.hip:309:1: warning: non-void function does not return a value in all control paths [-Wreturn-type]
+  309 | }
+      | ^
+1 warning generated when compiling for gfx1101.
+/work/src/r3d_band.hip:309:1: warning: non-void function does not return a value in all control paths [-Wreturn-type]
+  309 | }
+      | ^
+1 warning generated when compiling for host.
+[ 66%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_more.hip.o
+/work/src/r3d_more.hip:356:1: warning: non-void function does not return a value in all control paths [-Wreturn-type]
+  356 | }
+      | ^
+1 warning generated when compiling for gfx11-generic.
+/work/src/r3d_more.hip:356:1: warning: non-void function does not return a value in all control paths [-Wreturn-type]
+  356 | }
+      | ^
+1 warning generated when compiling for gfx1100.
+/work/src/r3d_more.hip:356:1: warning: non-void function does not return a value in all control paths [-Wreturn-type]
+  356 | }
+      | ^
+1 warning generated when compiling for gfx1101.
+/work/src/r3d_more.hip:356:1: warning: non-void function does not return a value in all control paths [-Wreturn-type]
+  356 | }
+      | ^
+1 warning generated when compiling for host.
+[ 70%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_gdn.hip.o
+[ 74%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_dump.hip.o
+/work/src/r3d_dump.hip:94:18: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   94 |         if (buf) hipFree(buf);
+      |                  ^~~~~~~~~~~~
+1 warning generated when compiling for gfx11-generic.
+/work/src/r3d_dump.hip:94:18: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   94 |         if (buf) hipFree(buf);
+      |                  ^~~~~~~~~~~~
+1 warning generated when compiling for gfx1100.
+/work/src/r3d_dump.hip:94:18: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   94 |         if (buf) hipFree(buf);
+      |                  ^~~~~~~~~~~~
+1 warning generated when compiling for gfx1101.
+/work/src/r3d_dump.hip:94:18: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   94 |         if (buf) hipFree(buf);
+      |                  ^~~~~~~~~~~~
+1 warning generated when compiling for host.
+[ 77%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_dflash_conv.hip.o
+[ 81%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_dflash_select.hip.o
+[ 85%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_logit_rerank.hip.o
+[ 88%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_sample_ngram.hip.o
+[ 92%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_gemm_w2a8.hip.o
+[ 96%] Building HIP object CMakeFiles/libr3d.dir/src/r3d_logit_rerank_e4m3.hip.o
+[100%] Linking HIP shared module radiance_home/kernels/libr3d.so
+[100%] Built target libr3d
+EXIT=0
