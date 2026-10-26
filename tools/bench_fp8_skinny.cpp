@@ -77,7 +77,7 @@ constexpr int kLdm = 136;   // bf16-element LDS stride, pad 8 (the w2a8 sk's row
 __global__ __launch_bounds__(256) void skinny_kernel(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ Bp,
     uint16_t* __restrict__ Y, const float* __restrict__ AS,
-    const uint16_t* __restrict__ BS, int M, int N, int K, long ngrp,
+    const uint16_t* __restrict__ BS, int M, int N, int K, long ngrp, int rblk,
     float* __restrict__ dbg = nullptr)
 {
     __shared__ uint16_t Lut[256];                            // e4m3 byte -> exact bf16
@@ -206,7 +206,7 @@ __global__ __launch_bounds__(256) void skinny_kernel(
             for (int k = 0; k < 8; ++k) {
                 const int rr = tile + 2 * k + (lane >> 4);   // pinned f32 map: row 2k+(l>>4)
                 if (rr >= N) continue;
-                const float sb = bf16_to_f32_f8(BS[(int64_t)rr * ngrp + g]);
+                const float sb = bf16_to_f32_f8(BS[(int64_t)(rblk > 1 ? rr / rblk : rr) * ngrp + g]);
                 y[k] += (fc.x[k] * AS[(int64_t)tok * ngrp + g]) * sb;
             }
         }
@@ -223,10 +223,11 @@ __global__ __launch_bounds__(256) void skinny_kernel(
 __global__ void naive_kernel(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ Bp,
     uint16_t* __restrict__ Y, const float* __restrict__ AS,
-    const uint16_t* __restrict__ BS, int M, int N, int K, long ngrp)
+    const uint16_t* __restrict__ BS, int M, int N, int K, long ngrp, int rblk)
 {
     const int r = blockIdx.x * 256 + threadIdx.x;
     if (r >= N) return;
+    const long sr = (rblk > 1) ? (long)(r / rblk) : (long)r;   // the plan's grid fold
     for (int t = 0; t < M; ++t) {
         float acc = 0.0f;
         for (long g = 0; g < ngrp; ++g) {
@@ -235,7 +236,7 @@ __global__ void naive_kernel(
                 const long k = g * 128 + s;
                 part += fp8e4m3_f8(A[(int64_t)t * K + k]) * fp8e4m3_f8(Bp[(int64_t)r * K + k]);
             }
-            acc += (part * AS[(int64_t)t * ngrp + g]) * bf16_to_f32_f8(BS[(int64_t)r * ngrp + g]);
+            acc += (part * AS[(int64_t)t * ngrp + g]) * bf16_to_f32_f8(BS[sr * ngrp + g]);
         }
         Y[(int64_t)t * N + r] = f32_to_bf16_f8(acc);
     }
@@ -272,6 +273,9 @@ int main(int argc, char** argv) {
     const long long N   = argc > 3 ? atoll(argv[3]) : 16384;
     const int      reps = argc > 4 ? atoi(argv[4]) : 30;
     const int      rot  = argc > 5 ? atoi(argv[5]) : 4;
+    // F8SK_RBLK=128 builds the checkpoint block grid (BS rows = ceil(N/128));
+    // default is the per-row grid (rblk 1).
+    const int      rblk = (getenv("F8SK_RBLK") && atoi(getenv("F8SK_RBLK")) == 128) ? 128 : 1;
     if (M < 1 || M > 16 || K <= 0 || N <= 0 || K % 128 || rot < 1 || rot > 4) {
         printf("usage: bench_fp8_skinny M(1..16) K(%%128) N REPS ROT(<=4)\n"); return 2; }
 
@@ -298,10 +302,11 @@ int main(int argc, char** argv) {
         for (auto& v : hA) { v = (uint8_t)rnd(); if ((v & 0x7f) == 0x7f) v &= 0x7e; }
     }
     std::vector<uint8_t> hBrot[4];
-    // Scales: AS f32 [16, ngrp]; BS bf16 [N, ngrp] per-row grid (rblk 1).
+    // Scales: AS f32 [16, ngrp]; BS bf16 [N, ngrp] per-row grid (rblk 1) or
+    // [ceil(N/128), ngrp] checkpoint block grid (rblk 128).
     std::vector<float> hAS(16 * ngrp);
     for (auto& v : hAS) v = unit ? 1.0f : 0.01f + 0.001f * (float)(rnd() % 16);
-    std::vector<uint16_t> hBS((size_t)N * ngrp);
+    std::vector<uint16_t> hBS((size_t)(rblk == 128 ? (N + 127) / 128 : N) * ngrp);
     for (auto& v : hBS) v = unit ? (uint16_t)0x3f80u
                                  : f32_to_bf16_h(0.0030f + 0.000125f * (float)(rnd() % 32));
 
@@ -341,7 +346,7 @@ int main(int argc, char** argv) {
         mk(nullptr, RAD_F8E4M3, 2, {16, K}, {K, 1}),
         mk(dAS, RAD_F32, 2, {16, ngrp}, {ngrp, 1}),
         mk(nullptr, RAD_F8E4M3, 2, {N, K}, {K, 1}),
-        mk(dBS, RAD_BF16, 2, {N, ngrp}, {ngrp, 1}),
+        mk(dBS, RAD_BF16, 2, {rblk == 128 ? (N + 127) / 128 : N, ngrp}, {ngrp, 1}),
         mk(dY, RAD_BF16, 2, {M, N}, {N, 1}),
     };
     RadTensor* t = nullptr;
@@ -367,7 +372,7 @@ int main(int argc, char** argv) {
     auto launch_skinny = [&](int p, float* dbg = nullptr) {
         skinny_kernel<<<(unsigned)((N + 127) / 128), 256>>>(
             (const uint8_t*)dA[p], (const uint8_t*)dB[p], (uint16_t*)dY,
-            (const float*)dAS, (const uint16_t*)dBS, M, (int)N, (int)K, ngrp, dbg);
+            (const float*)dAS, (const uint16_t*)dBS, M, (int)N, (int)K, ngrp, rblk, dbg);
         CK(hipDeviceSynchronize()); };
 
     // ---- correctness at plane 0 vs the oracle (tol-graded family: rel_l2 bar) ----
@@ -404,7 +409,7 @@ int main(int argc, char** argv) {
     }
     naive_kernel<<<(unsigned)((N + 255) / 256), 256>>>(
         (const uint8_t*)dA[0], (const uint8_t*)dB[0], (uint16_t*)dY,
-        (const float*)dAS, (const uint16_t*)dBS, M, (int)N, (int)K, ngrp);
+        (const float*)dAS, (const uint16_t*)dBS, M, (int)N, (int)K, ngrp, rblk);
     CK(hipDeviceSynchronize());
     CK(hipMemcpy(yNv.data(), dY, (size_t)M * N * 2, hipMemcpyDeviceToHost));
     long bad = 0; for (auto v : yNv) if (std::isnan(bf16_to_f32_h(v))) ++bad;
@@ -424,8 +429,8 @@ int main(int argc, char** argv) {
 
     long sk_eq = 0, ro_eq = 0;
     for (size_t i = 0; i < yNv.size(); ++i) { sk_eq += (ySk[i] == yNv[i]); ro_eq += (yRo[i] == yNv[i]); }
-    printf("CHECK M=%d K=%lld N=%lld: TILE==oracle %ld/%zu rel_l2=%.2e | SKINNY==oracle %ld/%zu rel_l2=%.2e\n",
-           M, K, N, ro_eq, yNv.size(), rel_l2_h(yRo, yNv), sk_eq, yNv.size(), rel_l2_h(ySk, yNv));
+    printf("CHECK rblk=%d M=%d K=%lld N=%lld: ROW==oracle %ld/%zu rel_l2=%.2e | SKINNY==oracle %ld/%zu rel_l2=%.2e\n",
+           rblk, M, K, N, ro_eq, yNv.size(), rel_l2_h(yRo, yNv), sk_eq, yNv.size(), rel_l2_h(ySk, yNv));
     {   // mismatch anatomy: NaN counts + which weight rows / token cols are wrong
         long nan = 0; std::vector<long> badrow(16 + 64, 0);
         for (size_t i = 0; i < yNv.size(); ++i) {
