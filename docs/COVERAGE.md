@@ -3294,3 +3294,46 @@ RestartCount 0, chat probe finish=stop.
 State: local == GitHub == cat, trees clean. Drawer unchanged: hd256 accept,
 RDNA3.5 guard.
 
+
+## Window 31 (Q31 CLOSED desk — WGP store-law census of the shipped artifact + toolchain compliance check; queue hygiene)
+
+Desk-only, zero card time. Two booked items from the operator's queue review:
+the Q31 census and the stale Q26c queue row.
+
+Q31 part 1 (census): the shipped v148 gfx1100 code objects are not on disk as
+images — they ride inside libr3d.so's `.hip_fatbin` (75 embedded ELFs = 25 TUs
+x 3 ISA targets; roc-obj-extract is deprecated and refuses the .so). Repo tool
+`tools/q31_barrier_census.py` carves the section, filters per-kernel
+`.target`, disassembles with llvm-objdump, and scans per function for pending
+GLOBAL stores at every `s_barrier` (full drain = `s_waitcnt_vscnt null,0x0`).
+Result on the live build_v148 artifact: 223 functions with barriers, 1945
+barriers, ZERO outstanding global stores at any barrier. Two traps earned on
+the way: (1) scratch_store must NOT count — the first pass flagged 17
+functions and all of them were per-thread spill storms (sk<3>'s 32
+`scratch_store` preamble from its 128 B private segment; thread-private,
+lgkmcnt-counted, invisible to the law); (2) a census loop that appends its
+row only at EOF reports one function per object — the co_28 barrier-count
+mismatch (80 vs 96 raw) is what caught it. The sk kernel's real global stores
+(Y epilogue) all sit AFTER the last barrier: kernel-exit stores, drained by
+kernel-completion + stream order, no in-kernel consumer.
+
+Q31 part 2 (toolchain law): src/ carries NO hand-written barrier asm — every
+shipped barrier is LLVM output from `__syncthreads()`. The ROCm-6.x wait
+generator complies with the WGP store law: 118 sites of
+`s_waitcnt lgkmcnt(0); s_waitcnt_vscnt null, 0x0; s_barrier; buffer_gl0_inv`,
+with the drain emitted exactly where a global store is pending (canonical:
+quant_act_fp8 `global_store_b32; ...; vscnt null,0; s_barrier; gl0_inv`) and
+omitted where none is — i.e. it is a real dataflow decision, not unconditional
+padding. The barrier lowering itself (dscnt/lgkmcnt + s_barrier + gl0_inv)
+carries NO vscnt wait: a hand-written or intrinsic-level publish MUST carry
+the explicit triple; the compiler cannot see through it. The C++ reference's
+inheritance assumption (Q31's open question) HOLDS for this toolchain.
+Gate implication: nothing standing blocks Q27/Q28/Q14-class fusion on this
+law.
+
+Queue hygiene: Q26c row brought forward (was "port booked" while v148 was
+already promoted windows 27-30 — status now CLOSED shipped with the
+tautology/zero-fill chronicle); header date 2026-10-26.
+
+State: local == GitHub == cat, trees clean. Q30 (card session) is now the ONLY
+ready item in the queue.
