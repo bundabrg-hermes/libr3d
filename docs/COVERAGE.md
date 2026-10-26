@@ -2783,6 +2783,9 @@ correctly; the fresh save-temps IR declares [42064 x i8] for the FS=1 h128
 instantiation, so the divergence is backend/link-stage. Runtime correctness
 is proven at scale, so this is metadata semantics, not a live bug — but it
 bit this census mid-flight and the mechanism is now owed to the ledger.
+[WINDOW 22 CORRECTION: every swap claim in this paragraph is a PARSE
+artifact, not an artifact property — see the window-22 chronicle at the end
+of this file; the vgpr/vsp/ssp numbers from this census stand.]
 
 Tool/pitfall chronicle (all four fired before any number was trusted):
 (1) `hipcc -S --save-temps` writes the DEVICE `.s` as LLVM IR, not GCN asm —
@@ -2897,3 +2900,74 @@ measurement build; build_v144 = the drafter-mount shipping artifact (permlanex16
 tail default-ON for w2a8; nothing changes for spec9g's issued rows). Runners:
 q24_gates.sh, q24_serve_ab.sh + q24_serve_ab2.sh (create-retry template),
 q24_probe.hip (three-way probe).
+
+---
+
+## Window 22 (Q29 closed: the metadata "swap" was our parse — shipped artifact cleared)
+
+Desk-only window, zero card time. The question owed to the ledger: do the
+shipped FS=1 attention arms really report each other's static-LDS totals?
+Answer: no — they never did. The window-20 census table was lying, and the
+window now belongs to the parse-collision class.
+
+**Native decode (association by structure).** The ROCm 10.1 notes are
+MessagePack, not YAML: an `AMDGPU`/tp32 note per code object whose per-kernel
+map contains `.name` and `.group_segment_fixed_size` together, so a correct
+decode cannot mis-associate. Native read of the shipped v142 fatbin:
+k1FS1(128,...)=42064, k1FS1(64,...)=29776 — both correct per the source's
+Carve mirror; every h256 arm reads 0 (dynamic `extern __shared__`, exactly as
+designed; the source's own static_assert keeps the launcher formula pinned).
+
+**Second association (kernel descriptors).** Each kernel's `.kd` symbol blob
+begins with the group-segment size (u32) and stores the kernel-code pointer as
+the fn_va minus kd_va delta — verified present per kernel. First-u32 vs
+msgpack gsf: 61/61 across both gfx1100 attn objects (29+32 kernels), and
+h256's zeros match too. Two independent paths, zero disagreements: the
+artifact is internally coherent.
+
+**The culprit, reproduced.** Re-running the actual window-20 scratch script
+(q11b_carve.py) on the same libr3d.so still prints the swap — so nothing
+about the artifact changed or drifted. Mechanism: llvm-readelf renders the
+metadata with `.group_segment_fixed_size` BEFORE `.name` in each kernel block
+(legacy AMDHSA YAML field order), and the script attributes every field to
+the last-seen `.name` anchor. Each kernel therefore inherits the NEXT
+kernel's gsf. The collision is invisible exactly where adjacent kernels
+share a value — which is precisely why the FS=0 pairs looked fine, why the
+FS=1 h128/h64 adjacency was the only attn pair with differing neighbours,
+and why the whole ldsB column is gsf-shifted (last h256 arm printed 42064
+where truth is 0; k2(128,*,0) rows shifted). Post-`.name` fields
+(vgpr/vsp/ssp/priv) were always anchored correctly: the occupancy ruling and
+the donor-cliff spill numbers all stand, and the serving-arm re-read from
+msgpack matches the census exactly (225 VGPR, zero spills). The two
+"agreeing" parses shared the same anchor defect; agreement between parses
+that read the SAME rendered dump is not independence.
+
+**Repo audit.** spill_census.py splits per-kernel blocks delimited at
+`.args:` so its gsf read is within-block (its window-7 numbers stand);
+wc_census.py reads only post-`.name` fields from pre-assembly IR (safe); the
+anchor pattern existed only in the scratch script, never in a committed tool.
+The "FS-arm LDS numbers unreliable" hold is retracted — the numbers were
+always the good ones.
+
+**Retraction before truth (mine, on the record, twice this window).** My
+first KD read applied the HSA ABI offsets (source_size u16 @0, gsf @4,
+kernel_code @0x30) and printed 61 DISAGREEs with srcsz==gsf — garbage: this
+ROCm's `.kd` blob is not the legacy 64-byte descriptor layout at the symbol
+VA. Had I trusted the first table, I'd have "found" a second artifact bug.
+The fix was to read the bytes before the ABI: dump the blob, see 0xa450
+(=42064) as its first word, and see the fn delta inside it.
+
+**Fatbin forensics recipe (now in the ledger body):** carve = raw scan for
+`\x7fELF` with EM=224 in the objcopy'd `.hip_fatbin`; TRIM by max(PT_LOAD +
+PT_NOTE filesz, e_shoff + shstrtab end) or the section table/note segments
+get sliced; each TU ships as gfx1100 + gfx1101 + gfx11-generic triplets
+(filter on `amdhsa.target`; the generic stubs report all-zero resource
+fields); notes are msgpack with 4-padded owner names — walk nameships, decode
+with a STREAMING unpacker (the padded blob ends in alignment zeros, which a
+strict unpackb() rejects as ExtraData — the failure that initially swallowed
+every big object, including the attn ones, and made a 12-object fatbin look
+like an 11-object one without them).
+
+**State.** main == GitHub == local == cat @ (this commit), docs-only. spec9g
+untouched on its v142 home, health 200. No lever moved, no build cut. The
+Q29 line in the queue carries the full closure text and the three new laws.
