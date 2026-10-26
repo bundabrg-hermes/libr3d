@@ -83,6 +83,9 @@ int64_t f8_row_stride(const RadTensor* t, int64_t cols) {
 
 constexpr int kMB = 64, kNB = 64, kKB = 16;   /* same tile as the bf16 m64 */
 constexpr int kLdsPad = 4;
+/* Q26b skinny row: bf16 LDS stride, pad 8 -- the w2a8 sk's row-conflict law, NOT
+ * this file's kLdsPad. Padded strides are per-kernel geometry; never inherit. */
+constexpr int kSkLdm = 136;
 constexpr int kThreads = 256;
 constexpr int kWave = 32;
 constexpr int kItems = (kMB * kKB) / kThreads;      /* 4 per thread per slice */
@@ -469,9 +472,109 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
     }
 }
 
+/* ---- the Q26b skinny row: one 16-token slab x 128 weight rows per block -------------
+ * Bench lineage: tools/bench_fp8_skinny.cpp. Q26 crossover (K=N=16384, both cache
+ * regimes): GEMV owns M<=3 (skinny loses 18..48% there), skinny owns M 4..16
+ * (+41..45% vs GEMV-MT4, +205% vs MT8 at M=8, +75..87% vs the flat 2.45 ms tile at
+ * M 9..16 -- the tile stages B for all 64 rows; this walks the weights once per
+ * 16-token slab at ~200 GB/s). Ported adaptations: the m64 pitch/rblk contract,
+ * no dbg scaffolding (unit mode stays in the bench), and DEAD WAVES STAY AT THE
+ * BARRIER: the bench's early `return` at tile >= N never fired on its all-alive
+ * N=16384 grid, but the threads it kills own slices of the block-shared xs
+ * staging -- at ragged N it would leave holes. Alive-guard everything wave-local,
+ * keep every wave in the loop. Tol-graded family: Y is not bit-identical to the
+ * incumbents; it sits in the ulp class the shipped tile already carries
+ * (rel_l2 3.3e-05 vs the tile's 3.4e-05, oracle-graded -- issue #6 discipline). */
+__global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_sk_kernel(
+    const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, uint16_t* __restrict__ Y,
+    const float* __restrict__ AS, const uint16_t* __restrict__ BS,
+    int M, int N, int K, int as_cols, int bs_cols,
+    int64_t a_pitch, int64_t b_pitch,
+    int64_t y_pitch, int64_t as_pitch, int64_t bs_pitch,
+    int rblk) {
+    const int ngrp = K >> 7;                           /* plan gates K % 128 == 0 */
+    __shared__ uint16_t Lut[256];                      /* e4m3 byte -> exact bf16 */
+    __shared__ __align__(16) uint16_t xs[16 * kSkLdm];        /* tokens x slots */
+    __shared__ __align__(16) uint16_t ws[8][16 * kSkLdm];     /* per-wave rows x slots */
+    if (threadIdx.x < 256)
+        Lut[threadIdx.x] = f32_to_bf16_f8(fp8e4m3_f8((uint8_t)threadIdx.x));
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int tile = (blockIdx.x * 8 + w) * 16;        /* first weight row of the tile */
+    const bool alive = tile < N;                       /* barrier-participating guard */
+    const int live = M < 16 ? M : 16;                  /* the launcher gates M <= 16 */
+    const int tok = lane & 15;                         /* pinned f32-acc map: col l&15 */
+    rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, bf16, rocwmma::row_major> fa;
+    rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, bf16, rocwmma::col_major> fb;
+    rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> fc;
+    float y[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) y[k] = 0.0f;
+
+    for (int g = 0; g < ngrp; ++g) {
+        const int64_t k0 = (int64_t)g * 128;
+        for (int i = threadIdx.x; i < 16 * 128; i += kThreads) {   /* block-shared */
+            const int m = i >> 7, s = i & 127;
+            xs[m * kSkLdm + s] = (m < live) ? Lut[A[(int64_t)m * a_pitch + k0 + s]]
+                                            : (uint16_t)0;
+        }
+        if (alive) {
+            /* EVERY wave stages its OWN tile (window-17 dead-row law). 16 rows x
+             * 32 dwords of e4m3 = 512 dwords per wave, 16 per lane; each dword
+             * decodes to 4 bf16 -- a uint2 store, NEVER the w2a8 uint4 idiom
+             * (there one dword EXPANDS to 16 codes; coverage, not width,
+             * transfers -- the bench's first build learned this on a
+             * quarter-filled tile). */
+#pragma unroll
+            for (int q = 0; q < 16; ++q) {
+                const int idx = q * 32 + lane;               /* 0..511 within the wave */
+                const int r = idx >> 5, d = idx & 31, rr = tile + r;
+                uint16_t o[4] = {0, 0, 0, 0};
+                if (rr < N) {
+                    const uint8_t* b = &B[(int64_t)rr * b_pitch + k0 + d * 4];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) o[j] = Lut[b[j]];
+                }
+                *(uint2*)&ws[w][r * kSkLdm + d * 4] = *(uint2*)o;
+            }
+        }
+        __syncthreads();                               /* one barrier per K-group */
+        if (alive) {
+            rocwmma::fill_fragment(fc, 0.0f);
+#pragma unroll
+            for (int kk = 0; kk < 128; kk += 16) {
+                rocwmma::load_matrix_sync(fa, (const bf16*)&ws[w][kk], kSkLdm);
+                rocwmma::load_matrix_sync(fb, (const bf16*)&xs[kk], kSkLdm);
+                rocwmma::mma_sync(fc, fa, fb, fc);
+            }
+            /* Per-group flush in the m64's oracle order: (partial * sa) * sb,
+             * ascending g, with the m64's scale-grid fold (rblk 1 per-row grid,
+             * rblk 128 checkpoint block grid). */
+            if (tok < live) {
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    const int rr = tile + 2 * k + (lane >> 4);  /* pinned map: row 2k+(l>>4) */
+                    if (rr >= N) continue;
+                    const int srow = (rblk > 1) ? (rr / rblk) : rr;   /* same fold as the tile */
+                    const float sb = __uint_as_float((uint32_t)BS[(int64_t)srow * bs_pitch + g] << 16);
+                    y[k] += (fc.x[k] * AS[(int64_t)tok * as_pitch + g]) * sb;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (alive) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int rr = tile + 2 * k + (lane >> 4);
+            if (tok < live && rr < N)
+                Y[(int64_t)tok * y_pitch + rr] = f32_to_bf16_f8(y[k]);
+        }
+    }
+}
+
 } /* anonymous namespace */
 
-#else  /* non-RDNA3: host-visible no-op, the launcher never dispatches it */
+#else  /* non-RDMA3: host-visible no-op, the launcher never dispatches it */
 
 namespace {
 template <bool DBUF>
@@ -480,6 +583,9 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_m64_kernel(
     int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int) {}
 template <int MT, int W, bool D2>
 __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
+    const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint16_t*,
+    int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int) {}
+__global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_sk_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint16_t*,
     int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int) {}
 } /* anonymous namespace */
@@ -721,14 +827,41 @@ void f8_launch_tile(const F8Plan& P, void* ydata, int64_t y_pitch, RadStream s,
     /* Q9 dot2 arm: R3D_FP8A8_D2 selects the f16-pair dot2c inner; the literal "0"
      * withdraws (house lever law). Default OFF -- tol-graded arm, gates+bench first. */
     static const bool d2      = getenv("R3D_FP8A8_D2") && strcmp(getenv("R3D_FP8A8_D2"), "0") != 0;
+    /* Q26b skinny WMMA row: default ON for M in [4,16] (Q26 crossover); the literal
+     * "0" withdraws to the pre-Q26 dispatch. The family kill switch R3D_NO_FP8_DEC
+     * withdraws it too (band law: one env kills the whole decode family). */
+    static const bool sk      = !(getenv("R3D_F8_SK") && strcmp(getenv("R3D_F8_SK"), "0") == 0);
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
+
+    /* Q26b: the skinny row owns M 4..16. No dword-alignment gate -- it reads B
+     * byte-wise, so ragged-pitch shapes that the GEMV band must refuse now ride the
+     * fast path instead of the tile (withdrawal restores the old routing for them).
+     * M > 16 stays on the tile until the M 17..64 measurement lands (handover). */
+    if (!no_dec && sk && P.M >= 4 && P.M <= 16) {
+        dim3 grid((unsigned)((P.N + 127) / 128));
+        hipLaunchKernelGGL(gemm_nt_fp8a8_sk_kernel, grid, dim3(kThreads), 0, stream,
+                           P.A, P.B, (uint16_t*)ydata, P.AS, P.BS,
+                           (int)P.M, (int)P.N, (int)P.K, P.as_cols, P.bs_cols,
+                           P.a_pitch, P.b_pitch, y_pitch, P.as_pitch, P.bs_pitch, P.rblk);
+        if (getenv("R3D_DEBUG_GEMM")) {
+            static bool once = false;
+            if (!once) { once = true; fprintf(stderr, "libr3d: fp8a8 skinny wmma launched (m=%d rblk=%d)\n",
+                                               (int)P.M, P.rblk); }
+        }
+        return;
+    }
 
     /* Decode band (issue #4): at M <= 8 the width row reads every weight byte once.
      * The dword-per-lane load pins B's alignment; anything odd rides the tile.
      * R3D_NO_FP8_DEC=1 puts both this dispatch and the plain decode row back to the
      * m64 arm -- the serve A/B kill switch for the band. */
     if (!no_dec && P.M <= 8 && (P.b_pitch % 4) == 0 && (((uintptr_t)P.B & 3) == 0)) {
-        const int mt = P.M >= 8 ? 8 : P.M >= 4 ? 4 : P.M >= 2 ? 2 : 1;
+        /* Issue #18: this ladder rounded DOWN -- at M 5..7 it picked MT=4 while the
+         * kernel computes live=min(M,MT), so rows past the ladder were silently never
+         * written (M=7: 4 of 7). The kernel's own guards make MT>M safe, so round UP.
+         * Correctness fix: unconditional, NOT lever-gated -- the withdrawal path
+         * returns the old ROUTING, never the old bug. */
+        const int mt = P.M <= 1 ? 1 : P.M <= 2 ? 2 : P.M <= 4 ? 4 : 8;
         dim3 grid((unsigned)((P.N + 7) / 8));
         #define R3D_F8_GEMV(MT_, W_, D_)                                               \
             hipLaunchKernelGGL((gemm_nt_fp8a8_gemv_kernel<MT_, W_, D_>), grid,         \
