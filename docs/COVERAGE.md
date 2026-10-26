@@ -2971,3 +2971,46 @@ like an 11-object one without them).
 **State.** main == GitHub == local == cat @ (this commit), docs-only. spec9g
 untouched on its v142 home, health 200. No lever moved, no build cut. The
 Q29 line in the queue carries the full closure text and the three new laws.
+
+## Window 23 (Q25 closed: attention depth-2 prefetch — NO-BUILD on three grounds)
+
+Q25's queue row demanded desk-first work and a v142 rebaseline. Both were done
+for ~3.5 minutes of card time; the build never became interesting.
+
+The premise was written pre-Q11. Rebaseline on the shipped v142 (q11_ab binary
+against build_v142's libr3d.so, card-exclusive spec9g stop, 3 rounds/arm,
+hashes stable per arm): deep-ctx 128/981/8192 = 215.4/216.8/216.0 GB/s on the
+serving DBUF+FS1 arm, 135.2/133.7/134.1 with R3D_ATTN_NO_DBUF=1 (which also
+falls off FS — the static assert pins FS to the DBUF schedule), h64 136.9 vs
+76.6, small 32.0 vs 18.3. The ledger's "141 -> 171, ~2.9x of card left"
+(COVERAGE:690) is what DBUF bought in the build8 era; Q11 branch 1 has since
+carried the same geometry to ~217 (window 19 measured 217.6 — agreement across
+weeks and card states is itself a datum: the metric is stable). Remaining head
+to the ~500 GB/s card ceiling is 2.3x, and it is not prefetch-depth-shaped:
+
+- register wall: the DBUF in-flight buffer is KNU uint4/lane per tensor
+  (kBN*D/8/128; 8 at h128 = 32 VGPR, 4 at h64 = 16). Census: k1FS1(128) = 225
+  of 256 VGPR — a second in-flight K array is 257, architecturally impossible.
+- LDS wall: a second KVp buffer is +17,408 B at h128 / +9,216 at h64 — both
+  cross 64 KiB/2 and drop to 1 WG/CU (the Q1 repad law).
+- dispatch law: h64-FS1 (215 VGPR) WOULD absorb the +16, but no model on this
+  host dispatches h64 — Q11b's no-undispatched-arms rule holds.
+
+The objdump says the design already got the effective depth: the two staging
+windows (K(t+1) at loop top, V(t+1) mid-loop) are 8x global_load_b128 each,
+full-drain gated at the consumption store and in flight ACROSS the mma phase —
+per-tensor depth is 1 but in-flight is 2 tiles/iteration, 256 B/lane. Depth-2
+per tensor would demand 4 tiles and the registers do not exist.
+
+Three self-inflicted disassembly-matcher traps, all silent-zeros caught by
+non-zero-hit asserts (the Q19 census discipline working as designed): the wait
+mnemonic is TWO tokens — `s_waitcnt lgkmcnt(N)` — so matching token 0 alone
+("s_wait") or "lgkmcnt" against the first token both matched nothing; LDS ops
+here are ds_store/ds_load (Q20's rename law, third sighting, mine again); and
+llvm-objdump prints the 16-BIT SIGNED s_cbranch offsets UNSIGNED (65448 is
+-88) — the first script found "zero backward branches" in a loop kernel, which
+is never a fact about kernels and always a fact about parsers.
+
+Recipe kept: tools/spill_census.py runs against any build_vNNN tree directly
+(it wants CMakeFiles objects, not the .so); carve_dis.py + a per-symbol slice
+gives per-kernel disassembly from the shipped .so.
