@@ -74,6 +74,12 @@ __device__ __forceinline__ float bf16_to_f32_f8(uint16_t h) {
 constexpr int kLdm = 136;   // bf16-element LDS stride, pad 8 (the w2a8 sk's row-conflict law)
 
 // ---- SKINNY: 16-weight-row WMMA tile per wave, tokens as matrix_b -------------
+// Window-26 extension (Q26b residual): M up to 64 via an IN-BLOCK token-slab loop.
+// The slab loop sits INSIDE the K-group loop: ws stages once per group, slabs stream
+// through xs -- weight traffic stays ONE pass, like the tile's, unlike a grid.y slab
+// dimension which would re-walk weights ceil(M/16) times. Accumulators y[slab][8]
+// (4 slabs max); LDS footprint unchanged. M<=16 (nslab==1) reduces to the exact
+// window-25 arm: same order, same barriers, comparable numbers.
 __global__ __launch_bounds__(256) void skinny_kernel(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ Bp,
     uint16_t* __restrict__ Y, const float* __restrict__ AS,
@@ -87,23 +93,20 @@ __global__ __launch_bounds__(256) void skinny_kernel(
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int tile = (blockIdx.x * 8 + w) * 16;              // first weight row of tile
     if (tile >= N) return;                                   // dead waves EXIT
-    const int live = M < 16 ? M : 16;
+    const int nslab = (M + 15) >> 4;                         // 16-token slabs (<=4)
     const int tok = lane & 15;                               // pinned f32-acc map: col l&15
     __shared__ roCW::bfloat16_t Id[16 * 16];                 // dbg-mode identity scratch
     roCW::fragment<roCW::matrix_a, 16, 16, 16, roCW::bfloat16_t, roCW::row_major> fa;
     roCW::fragment<roCW::matrix_b, 16, 16, 16, roCW::bfloat16_t, roCW::col_major> fb;
     roCW::fragment<roCW::accumulator, 16, 16, 16, float> fc;
     roCW::fragment<roCW::matrix_a, 16, 16, 16, roCW::bfloat16_t, roCW::row_major> fa0;  // dbg identity
-    float y[8];
+    float y[4][8];                                           // per-slab accumulators
+    for (int s = 0; s < 4; ++s)
 #pragma unroll
-    for (int k = 0; k < 8; ++k) y[k] = 0.0f;
+        for (int k = 0; k < 8; ++k) y[s][k] = 0.0f;
 
     for (long g = 0; g < ngrp; ++g) {
         const long k0 = g * 128;
-        for (int i = threadIdx.x; i < 16 * 128; i += 256) {  // stage tokens (LUT decode)
-            const int m = i >> 7, s = i & 127;
-            xs[m * kLdm + s] = (m < live) ? Lut[A[(int64_t)m * K + k0 + s]] : (uint16_t)0;
-        }
         {   // EVERY wave stages its OWN tile (window-17 law: a tid<128 gate leaves
             // waves 4..7 reading stale LDS -- near-miss values, the dead-row trap).
             // 16 rows x 32 dwords of e4m3 = 512 dwords per wave: 16/lane. Each dword
@@ -125,7 +128,14 @@ __global__ __launch_bounds__(256) void skinny_kernel(
                 *(uint2*)&ws[w][r * kLdm + d * 4] = *(uint2*)o;
             }
         }
-        __syncthreads();                                     // one barrier per 128-K group
+        for (int slab = 0; slab < nslab; ++slab) {           // tokens stream through ws
+        const int live_s = M - slab * 16 < 16 ? M - slab * 16 : 16;
+        for (int i = threadIdx.x; i < 16 * 128; i += 256) {  // stage this slab (LUT decode)
+            const int m = i >> 7, s = i & 127;
+            const int mm = slab * 16 + m;
+            xs[m * kLdm + s] = (m < live_s) ? Lut[A[(int64_t)mm * K + k0 + s]] : (uint16_t)0;
+        }
+        __syncthreads();                                     // xs (and ws on slab 0) visible
         roCW::fill_fragment(fc, 0.0f);
 #pragma unroll
         for (int kk = 0; kk < 128; kk += 16) {
@@ -134,7 +144,7 @@ __global__ __launch_bounds__(256) void skinny_kernel(
             if (kk == 0) fa0 = fa;
             roCW::mma_sync(fc, fa, fb, fc);
         }
-        if (dbg && blockIdx.x == 0 && w == 0) {              // unit-mode fragment dump
+        if (dbg && g == 0 && slab == 0 && blockIdx.x == 0 && w == 0) {              // unit-mode fragment dump
             if (lane == 0) {
                 for (int k = 0; k < 8; ++k) dbg[k] = fc.x[k];
                 dbg[8] = bf16_to_f32_f8(ws[0][0]); dbg[9] = bf16_to_f32_f8(ws[0][136]);
@@ -156,7 +166,7 @@ __global__ __launch_bounds__(256) void skinny_kernel(
                                                                            : (roCW::bfloat16_t)0.0f;
             }
             __syncwarp();                                     // wave 0 sees Id (dbg-only)
-            if (dbg && blockIdx.x == 0 && w == 0) {
+            if (dbg && g == 0 && slab == 0 && blockIdx.x == 0 && w == 0) {
                 // (1) full-wave main-loop check: fc.x[k] == 128 * class(2k + (l>>4)),
                 // weight rows cycle classes 1.0/2.0/3.0 by (row % 3) in unit mode.
                 int ok = 1;
@@ -201,21 +211,26 @@ __global__ __launch_bounds__(256) void skinny_kernel(
             }
         }
         // per-group flush in the m64's oracle order: (sub_g * sa) * sb, ascending g.
-        if (tok < live) {
+        if (tok < live_s) {
 #pragma unroll
             for (int k = 0; k < 8; ++k) {
                 const int rr = tile + 2 * k + (lane >> 4);   // pinned f32 map: row 2k+(l>>4)
                 if (rr >= N) continue;
                 const float sb = bf16_to_f32_f8(BS[(int64_t)(rblk > 1 ? rr / rblk : rr) * ngrp + g]);
-                y[k] += (fc.x[k] * AS[(int64_t)tok * ngrp + g]) * sb;
+                y[slab][k] += (fc.x[k] * AS[(int64_t)(slab * 16 + tok) * ngrp + g]) * sb;
             }
         }
-        __syncthreads();
+        __syncthreads();                                     // next xs (or ws) stage safe
+        }   // slab loop
     }
+    for (int slab = 0; slab < nslab; ++slab) {
+        const int live_s = M - slab * 16 < 16 ? M - slab * 16 : 16;
+        const int mm = slab * 16 + tok;
 #pragma unroll
-    for (int k = 0; k < 8; ++k) {
-        const int rr = tile + 2 * k + (lane >> 4);
-        if (tok < live && rr < N) Y[(int64_t)tok * N + rr] = f32_to_bf16_f8(y[k]);
+        for (int k = 0; k < 8; ++k) {
+            const int rr = tile + 2 * k + (lane >> 4);
+            if (tok < live_s && rr < N) Y[(int64_t)mm * N + rr] = f32_to_bf16_f8(y[slab][k]);
+        }
     }
 }
 
@@ -276,8 +291,8 @@ int main(int argc, char** argv) {
     // F8SK_RBLK=128 builds the checkpoint block grid (BS rows = ceil(N/128));
     // default is the per-row grid (rblk 1).
     const int      rblk = (getenv("F8SK_RBLK") && atoi(getenv("F8SK_RBLK")) == 128) ? 128 : 1;
-    if (M < 1 || M > 16 || K <= 0 || N <= 0 || K % 128 || rot < 1 || rot > 4) {
-        printf("usage: bench_fp8_skinny M(1..16) K(%%128) N REPS ROT(<=4)\n"); return 2; }
+    if (M < 1 || M > 64 || K <= 0 || N <= 0 || K % 128 || rot < 1 || rot > 4) {
+        printf("usage: bench_fp8_skinny M(1..64) K(%%128) N REPS ROT(<=4)\n"); return 2; }
 
     void* dl = dlopen(getenv("LIBR3D_SO") ? getenv("LIBR3D_SO") : "libr3d.so", RTLD_NOW | RTLD_LOCAL);
     if (!dl) { printf("dlopen libr3d: %s\n", dlerror()); return 1; }
@@ -290,21 +305,22 @@ int main(int argc, char** argv) {
     uint32_t st = 0x13579bdfu;
     auto rnd = [&]() { st ^= st << 13; st ^= st >> 17; st ^= st << 5; return st; };
 
-    // A fixture: 16 token rows of e4m3 codes (NaN encodings excluded -- both the
+    // A fixture: up to 64 token rows of e4m3 codes (NaN encodings excluded -- both the
     // kernels and the oracle honor the single NaN code, but a fixture full of NaNs
     // grades nothing).
-    std::vector<uint8_t> hA(16 * K);
+    std::vector<uint8_t> hA(64 * K);
     if (unit) {
         for (auto& v : hA) v = 0x38;                       // e4m3 +1.0
-        for (int m = 14; m < 16; ++m)
-            std::fill_n(hA.begin() + (ptrdiff_t)m * K, (size_t)K, (uint8_t)0x00);
+        if (M <= 14)                                       // padding probe rows: only
+            for (int m = 14; m < 16; ++m)                  // dead (never live) at M<=14
+                std::fill_n(hA.begin() + (ptrdiff_t)m * K, (size_t)K, (uint8_t)0x00);
     } else {
         for (auto& v : hA) { v = (uint8_t)rnd(); if ((v & 0x7f) == 0x7f) v &= 0x7e; }
     }
     std::vector<uint8_t> hBrot[4];
-    // Scales: AS f32 [16, ngrp]; BS bf16 [N, ngrp] per-row grid (rblk 1) or
+    // Scales: AS f32 [64, ngrp]; BS bf16 [N, ngrp] per-row grid (rblk 1) or
     // [ceil(N/128), ngrp] checkpoint block grid (rblk 128).
-    std::vector<float> hAS(16 * ngrp);
+    std::vector<float> hAS(64 * ngrp);
     for (auto& v : hAS) v = unit ? 1.0f : 0.01f + 0.001f * (float)(rnd() % 16);
     std::vector<uint16_t> hBS((size_t)(rblk == 128 ? (N + 127) / 128 : N) * ngrp);
     for (auto& v : hBS) v = unit ? (uint16_t)0x3f80u
@@ -313,7 +329,7 @@ int main(int argc, char** argv) {
     void *dAS, *dBS, *dY;
     CK(hipMalloc(&dAS, hAS.size() * 4));
     CK(hipMalloc(&dBS, hBS.size() * 2));
-    CK(hipMalloc(&dY, (size_t)16 * N * 2));
+    CK(hipMalloc(&dY, (size_t)64 * N * 2));
     CK(hipMemcpy(dAS, hAS.data(), hAS.size() * 4, hipMemcpyHostToDevice));
     CK(hipMemcpy(dBS, hBS.data(), hBS.size() * 2, hipMemcpyHostToDevice));
 
@@ -343,8 +359,8 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < sh.size(); ++i) { x.shape[i] = sh[i]; x.stride[i] = stride[i]; }
         return x; };
     std::vector<RadTensor> base{
-        mk(nullptr, RAD_F8E4M3, 2, {16, K}, {K, 1}),
-        mk(dAS, RAD_F32, 2, {16, ngrp}, {ngrp, 1}),
+        mk(nullptr, RAD_F8E4M3, 2, {64, K}, {K, 1}),
+        mk(dAS, RAD_F32, 2, {64, ngrp}, {ngrp, 1}),
         mk(nullptr, RAD_F8E4M3, 2, {N, K}, {K, 1}),
         mk(dBS, RAD_BF16, 2, {rblk == 128 ? (N + 127) / 128 : N, ngrp}, {ngrp, 1}),
         mk(dY, RAD_BF16, 2, {M, N}, {N, 1}),
@@ -380,7 +396,7 @@ int main(int argc, char** argv) {
     if (unit) {
         // analytic: every group dot = 128 * wclass(rr); scales 1.0; y = ngrp*128*wclass
         float* ddbg; CK(hipMalloc(&ddbg, 128 * 4));
-        CK(hipMemset(dY, 0, (size_t)16 * N * 2));
+        CK(hipMemset(dY, 0, (size_t)64 * N * 2));
         launch_skinny(0, ddbg);
         CK(hipMemcpy(ySk.data(), dY, (size_t)M * N * 2, hipMemcpyDeviceToHost));
         float hd[128]; CK(hipMemcpy(hd, ddbg, 128 * 4, hipMemcpyDeviceToHost));
@@ -419,11 +435,11 @@ int main(int argc, char** argv) {
     CK(hipMemcpy(yRo.data(), dY, (size_t)M * N * 2, hipMemcpyDeviceToHost));
     int gemv_rc = -1;
     if (M <= 8) {
-        CK(hipMemset(dY, 0, (size_t)16 * N * 2));
+        CK(hipMemset(dY, 0, (size_t)64 * N * 2));
         gemv_rc = launch_gemv(0);
         if (gemv_rc == 0) CK(hipMemcpy(yGv.data(), dY, (size_t)M * N * 2, hipMemcpyDeviceToHost));
     }
-    CK(hipMemset(dY, 0, (size_t)16 * N * 2));
+    CK(hipMemset(dY, 0, (size_t)64 * N * 2));
     launch_skinny(0);
     CK(hipMemcpy(ySk.data(), dY, (size_t)M * N * 2, hipMemcpyDeviceToHost));
 
@@ -432,18 +448,18 @@ int main(int argc, char** argv) {
     printf("CHECK rblk=%d M=%d K=%lld N=%lld: ROW==oracle %ld/%zu rel_l2=%.2e | SKINNY==oracle %ld/%zu rel_l2=%.2e\n",
            rblk, M, K, N, ro_eq, yNv.size(), rel_l2_h(yRo, yNv), sk_eq, yNv.size(), rel_l2_h(ySk, yNv));
     {   // mismatch anatomy: NaN counts + which weight rows / token cols are wrong
-        long nan = 0; std::vector<long> badrow(16 + 64, 0);
+        long nan = 0; std::vector<long> badrow(64 + 64, 0);
         for (size_t i = 0; i < yNv.size(); ++i) {
             if (std::isnan(bf16_to_f32_h(ySk[i]))) ++nan;
             if (ySk[i] == yNv[i]) continue;
             const size_t t = i / (size_t)N, r = i % (size_t)N;
-            if (t < 16) ++badrow[t];               // token-row histogram
-            ++badrow[16 + (r >> 8)];               // weight row/256 histogram
+            if (t < 64) ++badrow[t];                // token-row histogram
+            ++badrow[64 + (r >> 8)];                // weight row/256 histogram
         }
         printf("ANAT SKINNY nan=%ld tokhist=", nan);
-        for (int t = 0; t < 16; ++t) printf("%d ", (int)badrow[t]);
+        for (int t = 0; t < 64; ++t) printf("%d ", (int)badrow[t]);
         printf("| row/256hist=");
-        for (int b = 0; b < 64; ++b) printf("%d ", (int)badrow[16 + b]);
+        for (int b = 0; b < 64; ++b) printf("%d ", (int)badrow[64 + b]);
         printf("\n");
         long shown = 0;
         for (size_t i = 0; i < yNv.size() && shown < 8; ++i)
