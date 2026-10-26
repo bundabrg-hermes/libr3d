@@ -1,8 +1,12 @@
 /* r3d_gemm_w2a8.hip -- gemm_nt_q at the `w2a8` encoding on RDNA3: the DFlash2 draft head.
  *
- * DRAFT for libr3d (issue: w2a8 decode band). Do not treat as shipped until the
- * registration snippets at the tail of this file are applied to r3d_rows.cpp /
- * CMakeLists.txt and the kbench gate in tools/gate.sh runs on a w2a8 fixture.
+ * Status: SHIPPED default-ON. The registration snippets at the tail of this
+ * file are applied (r3d_rows.cpp + CMakeLists) and the kbench gate in
+ * tools/gate.sh runs a w2a8 fixture. Current state per docs/REVIEW_QUEUE.md:
+ * Q12 compressed-input dot4 default-ON at MT<=8 (build_v133), Q21b skinny WMMA
+ * arm default-ON at MT>=8 (build_v140), Q22 DPP folds default-ON (build_v134).
+ * This header was stale ("DRAFT ... do not treat as shipped") until the
+ * ChatGPT pass-3 review flagged it on 2026-10-26.
  *
  * The band (v1.11 arch/common/rad_block_dflash2.h, lines ~397-415 and ~838-843):
  * when `dflash.draft_head.weight` carries its 2-bit recipe, the drafter's coarse lm_head
