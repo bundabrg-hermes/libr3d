@@ -29,6 +29,31 @@ __device__ __forceinline__ void bf16_store(bf16* p, uint16_t bits) {
     *reinterpret_cast<uint16_t*>(p) = bits;
 }
 
+/* Q11 (R3D_ATT_FS): fragment-side softmax folds over the pinned accumulator lane
+ * map (COVERAGE window 17): lane l of a 16x16 accumulator holds row 2k+(l>>4),
+ * col l&15 -- so one tile row's 32 score columns live in the 16 lanes of ONE
+ * half-wave (even rows lanes 0..15, odd 16..31): col c in a0.x[k], col 16+c in
+ * a1.x[k], same lane, same register. The row reduction is a 4-step butterfly
+ * whose XORs 1/2/4/8 never cross a 16-lane DPP row, so it rides the exact
+ * row_xmask primitive Q6/Q22 shipped (ISA table 94, 0x160|xor). The DPP control
+ * word must be a compile-time constant (the Q6 probe law): literal masks, no
+ * template. fmaxf matches the shipped sweep's `v > mx` semantics exactly: a NaN
+ * operand is skipped, and the running max is never itself NaN. */
+__device__ __forceinline__ float fs_rowmax(float p) {
+    p = fmaxf(p, __uint_as_float(__builtin_amdgcn_update_dpp(__float_as_uint(p), __float_as_uint(p), 0x161, 0xf, 0xf, 0)));
+    p = fmaxf(p, __uint_as_float(__builtin_amdgcn_update_dpp(__float_as_uint(p), __float_as_uint(p), 0x162, 0xf, 0xf, 0)));
+    p = fmaxf(p, __uint_as_float(__builtin_amdgcn_update_dpp(__float_as_uint(p), __float_as_uint(p), 0x164, 0xf, 0xf, 0)));
+    p = fmaxf(p, __uint_as_float(__builtin_amdgcn_update_dpp(__float_as_uint(p), __float_as_uint(p), 0x168, 0xf, 0xf, 0)));
+    return p;
+}
+__device__ __forceinline__ float fs_rowsum(float s) {
+    s += __uint_as_float(__builtin_amdgcn_update_dpp(__float_as_uint(s), __float_as_uint(s), 0x161, 0xf, 0xf, 0));
+    s += __uint_as_float(__builtin_amdgcn_update_dpp(__float_as_uint(s), __float_as_uint(s), 0x162, 0xf, 0xf, 0));
+    s += __uint_as_float(__builtin_amdgcn_update_dpp(__float_as_uint(s), __float_as_uint(s), 0x164, 0xf, 0xf, 0));
+    s += __uint_as_float(__builtin_amdgcn_update_dpp(__float_as_uint(s), __float_as_uint(s), 0x168, 0xf, 0xf, 0));
+    return s;
+}
+
 /* Q10 (R3D_F8ST=1): branchless e4m3 -> bf16 decode, BIT-FOR-BIT the shipped
  * fp8_to_bf16_w. Both sides of the shipped ternary and the shipped NaN select are
  * pure functions of the byte, so computing both and selecting is the same
@@ -266,8 +291,9 @@ __device__ __forceinline__ void st_kv_regs(const uint4* src, bf16* KVp) {
  * crossing it both ways, capping the live range of the staged in-flight batch. */
 __device__ __forceinline__ void r3d_attn_sched_stop() { __builtin_amdgcn_sched_barrier(0); }
 
-template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0, int SB = 0>
+template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0, int SB = 0, int FS = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams P) {
+    static_assert(FS == 0 || DBUF == 1, "fragment-side softmax rides the DBUF schedule only");
     constexpr int DSH = r3d_dlog2(D), DM1 = D - 1;
     typedef Carve<D, PAD> C;
     static_assert(D == 64 || D == 128 || D == 256, "WMMA tile: head_dim outside {64,128,256}");
@@ -515,6 +541,55 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                 roCW::mma_sync(a0, fa, fb0, a0);
                 roCW::mma_sync(a1, fa, fb1, a1);
             }
+            if (FS) {
+                /* Q11 fragment-side online softmax: the row reductions ride the
+                 * accumulator registers -- no Ssp round trip, no LDS read-back
+                 * sweep. Row r's 32 columns live in half-wave (r&1): lane
+                 * half*16+c holds col c (a0.x[k]) and col 16+c (a1.x[k]) of row
+                 * w*16+2k+half. Per row: pair, butterfly over the 16 lanes, and
+                 * the designated lanes (c==0) own the (m,l) update -- the sweep's
+                 * arithmetic verbatim, only the sum's tree differs.
+                 * NOTE: the lane map's l is the lane WITHIN THE WAVE (tid & 31):
+                 * hf must be masked to the wave, or waves 1-3 misown rows. */
+                __syncthreads();                               /* the mma's KVp reads are done */
+                const int l15 = tid & 15, hf = (tid >> 4) & 1;
+                float rmax[8], rsum[8];
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    const int64_t rp = rowpos_of(w * 16 + 2 * k + hf);
+                    const float v0 = (CBc[l15]      || !visible(rp, jb + l15))      ? -INFINITY : a0.x[k] * scale2;
+                    const float v1 = (CBc[16 + l15] || !visible(rp, jb + 16 + l15)) ? -INFINITY : a1.x[k] * scale2;
+                    rmax[k] = fs_rowmax(fmaxf(v0, v1));
+                }
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    const int rr = w * 16 + 2 * k + hf;
+                    const int64_t rp = rowpos_of(rr);
+                    const float mx = fmaxf(MSP[rr], rmax[k]);  /* the sweep's running max, same bits */
+                    const float s0 = (CBc[l15]      || !visible(rp, jb + l15))      ? 0.0f : exp2f(a0.x[k] * scale2 - mx);
+                    const float s1 = (CBc[16 + l15] || !visible(rp, jb + 16 + l15)) ? 0.0f : exp2f(a1.x[k] * scale2 - mx);
+                    rsum[k] = fs_rowsum(s0 + s1);
+                }
+                if (l15 == 0) {                    /* designated lane per row: two per wave, 8 rows each */
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        const int rr = w * 16 + 2 * k + hf;
+                        if (rr >= valid) continue;
+                        float mx = rmax[k];
+                        const float old = MSP[rr];
+                        if (mx != mx) mx = old;      /* sweep semantics: an all-NaN row keeps the running max */
+                        if (old > mx) mx = old;
+                        if (mx != -INFINITY) {
+                            if (mx > old) {
+                                if (old != -INFINITY) LSP[rr] *= exp2f(old - mx);
+                                MSP[rr] = mx;
+                            }
+                            LSP[rr] += rsum[k];
+                        }
+                    }
+                }
+                __syncthreads();                               /* CBc reads and the m/l updates complete */
+            } else {
             roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP,      a0, C::kSP, roCW::mem_row_major);
             roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP + 16, a1, C::kSP, roCW::mem_row_major);
             __syncthreads();                                   /* K(t)'s fragments have left */
@@ -541,6 +616,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                 }
             }
             __syncthreads();                                   /* CBc reads complete */
+            }
             st_kv_regs<D, PAD>(kx, KVp);                            /* K(t+1) -> LDS */
             address_tile(t + 2, RBc, CBc);                     /* refill the freed slot */
             { int64_t* tmp = RBc; RBc = RBn; RBn = tmp; }
@@ -568,6 +644,28 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                 roCW::mma_sync(a0, fa, fb0, a0);
                 roCW::mma_sync(a1, fa, fb1, a1);
             }
+            if (FS) {
+                /* Q11 pass two: P = exp2(S*scale2 - m) computed on the fragments and
+                 * stored straight to Psp -- Ssp never exists. The exp2 operand bits
+                 * equal the e-loop's (Ssp is a fragment store round trip, S is never
+                 * NaN-perturbed by it), m comes from the same MSP words, so P bits
+                 * match the historical arm exactly; only pass one's l tree differs. */
+                __syncthreads();                               /* b1': the mma's KVp reads are done; K(t) dead */
+                const int l15 = tid & 15, hf = (tid >> 4) & 1;
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    const int rr = w * 16 + 2 * k + hf;
+                    const int64_t rp = rowpos_of(rr);
+                    const float m = MSP[rr];
+                    float p0 = 0.0f, p1 = 0.0f;
+                    if (rr < valid && m != -INFINITY) {
+                        p0 = (CBc[l15]      || !visible(rp, jb + l15))      ? 0.0f : exp2f(a0.x[k] * scale2 - m);
+                        p1 = (CBc[16 + l15] || !visible(rp, jb + 16 + l15)) ? 0.0f : exp2f(a1.x[k] * scale2 - m);
+                    }
+                    bf16_store(Psp + rr * C::kPP + l15,      f32_bf16_w(p0));
+                    bf16_store(Psp + rr * C::kPP + 16 + l15, f32_bf16_w(p1));
+                }
+            } else {
             roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP,      a0, C::kSP, roCW::mem_row_major);
             roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP + 16, a1, C::kSP, roCW::mem_row_major);
             __syncthreads();                                   /* b1: K(t)'s fragments left; S visible */
@@ -579,6 +677,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                     if (m != -INFINITY) pv = exp2f(Ssp[r * C::kSP + jj] * scale2 - m);
                 }
                 bf16_store(Psp + r * C::kPP + jj, f32_bf16_w(pv));
+            }
             }
             st_kv_regs<D, PAD>(vc, KVp);                            /* V(t) -> LDS (K(t) dead per b1) */
             ld_kv_regs<D, KVDT>(vc, RBn, P, D, kvvec);         /* V(t+1) in flight */

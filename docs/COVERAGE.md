@@ -2642,3 +2642,78 @@ Parsing traps earned (the census family again, all silent-failure class):
 VERDICT: Q21b closed SHIPPED default-ON, v140 is the drafter-mount build.
 Serve restored at close: health 200, gfx1100 rank 0 boot-asserted, coherent
 (one-sentence answer, 767 reasoning tokens -- the window-16 probe law respected).
+
+---
+
+## 2026-10-26 window 19 -- Q11 branch 1: fragment-side softmax ships default-ON (build_v142)
+
+The pinned accumulator lane map (window 17) was the key; the door it opened is
+the shipped attention body's biggest structural idle cost: both passes paid a
+full score-tile round trip through LDS (store S, barrier, read the row back
+scalar-per-column) while the data sat in the fragments. The pinned map says a
+row's 32 score columns live in ONE 16-lane half-wave (even rows lanes 0..15,
+odd 16..31; col c in a0.x[k], col 16+c in a1.x[k], same lane and register k of
+row 2k+(l>>4)) -- so the whole-row reduction is a 4-step butterfly whose XORs
+1/2/4/8 never cross a 16-lane row: it rides the exact DPP row_xmask primitive
+Q6/Q22 shipped. Pass one folds max and exp-sum on the registers with a
+designated lane (c==0) owning the (m,l) update; pass two forms P on the
+fragments straight into Psp. Ssp never exists on this arm: fewer instructions
+(9545 vs 9911 at hd=128), and the l sum is the only thing that changes tree
+(max is order-free, so m and every P bit match the sweep arm by construction).
+
+**The hf bug and why only the sweep caught it.** First implementation used
+`hf = tid >> 4` -- but the map's lane index l is WITHIN THE WAVE (tid & 31),
+so waves 1-3 computed row ownership with hf=2..7 and misowned rows. Every
+small-geometry harness passed: the bogus designated lanes' rows overrun
+`valid` and get gated, so waves 1-3 silently never wrote -- the dead-row trap
+in its third costume (loop, LDS staging, and now lane-partitioned ownership).
+The oracle sweep (attn_oracle_sweep.hip, built exactly because "the shipped
+pack is head_dim-256-only" -- the window's vacuous-pass trap) was the ONLY
+harness reaching geometries with qlen>64: 3 FAILs with rel_l2=-nan and
+thousands of outliers. The bisect was two one-line kills + incremental cmake:
+pass-1-killed still failed, pass-2-killed still failed -- both arms shared the
+broken hf. Fix: `(tid >> 4) & 1`. LAW: a wave-local index must be written
+`(tid & 31)`-masked when the block is multi-wave; and a correctness harness
+whose every geometry fits in wave 0 / one tile cannot see whole-block bugs --
+coverage means ROW count (qlen>64), not just shape variety.
+
+**Gates (v141, lever R3D_ATT_FS dark):** repro prefill 0/16 differ and splitk
+bit-identical (hashes EQUAL incl. the REPRO_SPL=4 host-merge) both arms;
+oracle sweep PASS and ARM-IDENTICAL post-fix; the seven standing battery packs
+zero-diff vs v140 -- AND ALSO under R3D_ATT_FS=1: the battery is BLIND to the
+FS bands (its packs land on non-DBUF/hd256-gated rows; attn_bench's header had
+recorded exactly this blindness). Two runner self-catches: the first battery
+run used an unsynced gate.sh (no R3D_ATT_FS forwarding -> the FS=1 legs
+measured the default -- zero-diff was TRUE but MEANINGLESS; the second lesson
+being that zero-diff is only evidence when the test can SEE the arm); the
+final-log awk had a quote-layer-infected pattern (grep "^geom" became
+"\"^geom\"" through three layers -- silent 0-match, the ledger's own awk law
+again, 4th repetition). A/B on the fixed artifact, 3 rounds interleaved, same
+binary, lever the only axis: 5/5 geometries DISJOINT -- hd128 c1024 +35.6%,
+c2048 +54.2%, c4096 +38.3%, c8192 +33.5%, hd64 c4096 +46.6%. Output hashes
+differ across arms exactly where l drift is expected, and the sweep's
+tolerance evidence bounds that drift.
+
+**Promotion (v142):** default flip is HOST-ONLY -- `.hip_fatbin` of v142 is
+byte-identical to the gated v141 (objcopy+cmp), the device image is the tested
+one verbatim; three standing packs re-zero-diff with FS now default. Serve
+A/B (spec9g 3072-token probes, v136 vs v142, two rounds each + trailing
+confirm): TTFT flat (17.28-17.36 s all four rounds, +-0.4%), decode
+median-to-median inside the per-eval spread (19.2-24.6 tok/s scatter) --
+attention is ~1-3% of a step at this ctx on this model, the same regime law
+that kept Q20 at +2.6% serve despite +12..+51% kernels. The kernel-level win
+IS the delivered artifact; a longer-ctx serve probe (>12k) is the booked
+follow-up if the prefill share is ever questioned. spec9g now lives on
+build_v142; spec9g_v136_rollback prepended; health 200, gfx1100 boot-asserted,
+coherent (162 reasoning + 7 content tokens, "The capital of Western Australia
+is Perth.").
+
+Q11's SECOND branch (VGPR group flushes, Astra-P2) remains open: the flush-
+free accumulator-epilogue datum from bench_skinny (lane reg == output element)
+applies to the row-tile GEMM shapes, and the attention h256/kernel2 256-VGPR
+arms are the flush-flavored pressure -- booked as Q11b.
+
+VERDICT: Q11 branch 1 closed SHIPPED default-ON (build_v142), the eighth
+promotion of the arc: fragment-side softmax +33.5..+54.2% on every bench
+geometry, arm-identical oracle sweep, host-only default flip over a byte-
+identical device image, serve neutral-to-flat with zero regressions.

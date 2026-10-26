@@ -130,7 +130,7 @@ namespace {
  * stubs, and a missing default arg mangles the host launch's symbol differently from
  * the device image's kernel -- the loader then fails with "Cannot find Symbol" at the
  * first real launch (see COVERAGE fold postmortem). */
-template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0, int SB = 0>
+template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0, int SB = 0, int FS = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams) {}
 template <int D, int KVDT, int SPLITK>
 __global__ __launch_bounds__(kT) void attn_paged_wmma_kernel2(R3dAttnParams) {}
@@ -271,6 +271,22 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
     if (f8st < 0) { const char* sv = getenv("R3D_F8ST"); f8st = sv ? atoi(sv) : 3;
                     if (f8st < 0 || f8st > 3) f8st = 3; }
 #endif
+    /* Q11 (R3D_ATT_FS): fragment-side softmax on the DBUF bf16 arms -- the row
+     * max/sum and the P forming ride the accumulator fragments via DPP row_xmask
+     * butterflies (lane maps pinned, COVERAGE window 17). DEFAULT ON (build_v142):
+     * the v141 gates put it +33.5..+54.2% over the DBUF arm on all five bench
+     * geometries, disjoint spreads; oracle sweep (window/unmapped/tile-straddle
+     * geometries the fixture packs cannot reach) PASS and arm-identical; repro
+     * bit-identical incl. the split-4 host merge; seven standing packs zero-diff.
+     * R3D_ATT_FS=0 withdraws to the v140 sweep arm. P bits are e-loop-exact by
+     * construction, only the l sum tree differs (the Q6/Q22 tol-class). R3D_DBG
+     * forces the historical arm. Applies to the dbuf_ok (bf16) arms only. */
+    static int fs = -1;
+#ifdef R3D_DBG
+    fs = 0;
+#else
+    if (fs < 0) { const char* sv = getenv("R3D_ATT_FS"); fs = (sv && atoi(sv) == 0) ? 0 : 1; }
+#endif
 
     const unsigned bm = v3 ? (unsigned)kBM3 : (unsigned)kBM;
     const unsigned tiles = (unsigned)((P.rows + bm - 1) / bm);
@@ -302,8 +318,15 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
         else if (d128 && !kvbf) R3D_LAUNCH4(K, 128, RAD_F8E4M3, SK, DB);              \
         else if (!d128 && kvbf) R3D_LAUNCH4(K, 64, RAD_BF16, SK, DB);                 \
         else                     R3D_LAUNCH4(K, 64, RAD_F8E4M3, SK, DB);
-    if (v3)             { R3D_ARMS3(attn_paged_wmma_kernel3) }
-    else if (v2)        { R3D_ARMS(attn_paged_wmma_kernel2)  }
+    /* Q11 FS arm: DBUF + fragment-side softmax (bf16-only by the dbuf_ok gate).
+     * R3D_LAUNCH4's slot order: <D, KVDT, SPLITK=0, DBUF=1, FOLD=0, PAD=0,
+     * F8ST=0, SB=0, FS=1>. */
+    #define R3D_LAUNCH9(K, D, KV) hipLaunchKernelGGL((K<D, KV, 0, 1, 0, 0, 0, 0, 1>), grid, block, 0, stream, P)
+    #define R3D_ARMS9(K)                                                       \
+        if      (d128 &&  kvbf) R3D_LAUNCH9(K, 128, RAD_BF16);                  \
+        else                    R3D_LAUNCH9(K,  64, RAD_BF16);
+    if (v3)               { R3D_ARMS3(attn_paged_wmma_kernel3) }
+    else if (v2)          { R3D_ARMS(attn_paged_wmma_kernel2)  }
     else if (d256) {
         /* Pad A/B (issue #11 m2): both arms are bit-identical by construction; the
          * paired pinned-clock bench (2026-10-24, XTX, AB_ROT=12) put the odd S pitch
@@ -327,6 +350,7 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
         if (pad) return r3d_launch256<0, 1>(P, grid, stream, dbg256);
         return r3d_launch256<0, 0>(P, grid, stream, dbg256);
     }
+    else if (dbuf_ok && fs) { R3D_ARMS9(attn_paged_wmma_kernel) }
     else if (dbuf_ok)   { R3D_ARMS4(attn_paged_wmma_kernel, 0, 1) }
     else if (f8st && !kvbf) {   /* Q10 armed fp8 staging (v1 only; dbuf_ok implies bf16) */
         #define R3D_LAUNCH8(D, ST) hipLaunchKernelGGL((attn_paged_wmma_kernel<D, RAD_F8E4M3, 0, 0, 0, 0, ST>), grid, block, 0, stream, P)

@@ -63,6 +63,7 @@ stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
     [ -n "${R3D_M64_ROT:-}" ] && envs+=(-e R3D_M64_ROT="$R3D_M64_ROT")
     [ -n "${R3D_F8ST:-}" ] && envs+=(-e R3D_F8ST="$R3D_F8ST")
     [ -n "${R3D_ATTN_NO_DBUF:-}" ] && envs+=(-e R3D_ATTN_NO_DBUF="$R3D_ATTN_NO_DBUF")
+    [ -n "${R3D_ATT_FS:-}" ] && envs+=(-e R3D_ATT_FS="$R3D_ATT_FS")
     local out rc; out=$(mktemp); rc=0
     docker run --rm "${DEVS[@]}" "${envs[@]}" --shm-size=4g -v "$SCRATCH":/scratch -v "$REPO/$BUILD":/build:ro \
         --entrypoint /bin/bash "$IMG" -c "
