@@ -2717,3 +2717,81 @@ VERDICT: Q11 branch 1 closed SHIPPED default-ON (build_v142), the eighth
 promotion of the arc: fragment-side softmax +33.5..+54.2% on every bench
 geometry, arm-identical oracle sweep, host-only default flip over a byte-
 identical device image, serve neutral-to-flat with zero regressions.
+
+## 2026-10-26 — window 20: Q11b CLOSED NULL census-first; ChatGPT pass-3 triage; attention-family artifact census
+
+Inbound state: main moved under the session to `f772417` — PR #17 from the
+review lane adjudicated ChatGPT pass-3 as Q25-Q28 (all parked) and fixed a
+stale DRAFT header on r3d_gemm_w2a8.hip (comment-only, no codegen). Triage
+against the integrity record: no conflicts — Q25 explicitly quarantines Q7's
+q8x depth-2 NULL from transferring to the attention family (correct, same
+conclusion this card family's Q23 reached structurally), Q26 is a genuine
+dtype cross Q21 does not cover, Q27/Q28 are ABI-gated. Nothing re-opened.
+
+Q11b was adjudicated entirely with card-free artifact evidence, per the Q23
+law (census before card, existing barriers before fences, spill-count vs
+window-size pre-screen). The census: every gfx1100 code object carved from
+the SHIPPED build_v142 libr3d.so (25 objects), per-kernel allocator fields
+from `llvm-readelf --notes` and instruction classes from `llvm-objdump -d`
+body slices — 61 attn instantiations, 721,262 instructions parsed, zero
+metadata misses (tools live on cat as ~/scratch/r3d/q11b_carve.py).
+
+Serving-arm facts (spec9g env verified R3D_*-free, so the default dispatch is
+`k1FS1(128,3,0,1,0,0,0,0,1)`, confirmed against the launcher and container
+env): 225 VGPR, ZERO spills, no scratch, 192 DPP ops (the Q11 butterflies are
+visible in the shipped artifact: FS0 DBUF carries 160, FS1 carries 192, the
++32 being the 4-step row_xmask folds x two passes x sites). Occupancy:
+2 workgroups/CU, and 2 is a VGPR HARD CAP — 3x128x225 = 86,400 register
+lanes exceeds the 64K budget regardless of LDS — so any carve-shrink idea
+(including the register-P fantasy of freeing Ssp+Psp) cannot raise
+occupancy. Q23's family split reproduced exactly: kernel2<128,*> arms still
+256-VGPR with scratch ops riding the WMMA chains (resident-accumulator
+class, no cure built per Q23), h256 DBUF still 88/138-VGPR spill cliff
+(drawer-gated, prepared fence evidence unchanged).
+
+(a) Register-built P fragment: the Psp round trip is WAVE-LOCAL (wave w
+writes rows w*16+2k+hf and reads back only its own rows — the producer IS
+the consumer), so no cross-wave exchange would be needed... but the pinned
+acc-map -> A-map permutation is a full 16x16 lane<->register transpose
+(value P[r][c]: source lane (c&15)+16*(r&1) register r>>1 -> target lane
+(r&15)+16*(c>>3) register c&7): >= 4 cross-lane butterfly stages over 8
+registers (~32-64 DPP/select ops per tile). The shipped LDS path it would
+replace measured FAR cheaper in the artifact: the compiler already vectorizes
+the b16 round trip (ds_store_2addr_b32 sites; fragment loads come back as
+ds_load_b64). ~4 stores + ~8 loads per lane per tile — and the b2 barrier
+survives anyway because it gates V(t) visibility, not Psp. Strictly heavier:
+NO BUILD. The ledger law: after Q11-b1 ate the big round trip, what remains
+in Psp is the cheap half; a lane-permutation never beats a 4-store/8-load
+LDS hop on this hardware.
+
+(b) kernel2 direct-O epilogue: not dispatched (R3D_ATTN_V2 env-gated;
+container env carries no R3D_* at all), and its pressure is the resident
+accumulator (Q23 law: caps and tail-trims cannot touch spills bigger than
+the window; 256-VGPR pinned with in-loop scratch). Evidence staged in this
+census, nothing shipped, branch closed.
+
+Bonus census rows for the drawer: k3 (v3 THIN, kBM3=32, env-gated dark) is
+the cleanest arm in the family — 168 VGPR zero-spill, 24,880 B static LDS at
+D=128 — it exists because someone already explored the 2-blocks/CU idea via
+thin blocks; it stays dark until a dispatch decision, not until more
+evidence.
+
+SPAWNED Q29 (open, desk): the shipped FS=1 arms report EACH OTHER's Carve
+totals in group_segment_fixed_size (h128-FS1: 29,776 = Carve<64>; h64-FS1:
+42,064 = Carve<128>), verified by two independent parses; FS=0 reports
+correctly; the fresh save-temps IR declares [42064 x i8] for the FS=1 h128
+instantiation, so the divergence is backend/link-stage. Runtime correctness
+is proven at scale, so this is metadata semantics, not a live bug — but it
+bit this census mid-flight and the mechanism is now owed to the ledger.
+
+Tool/pitfall chronicle (all four fired before any number was trusted):
+(1) `hipcc -S --save-temps` writes the DEVICE `.s` as LLVM IR, not GCN asm —
+the save-temps stage files are compiler-stage artifacts; (2) the save-temps
+device `.o` is BITCODE, llvm-objdump refuses it ("not a valid object file")
+— the assembled truth is only in the fatbin'd host .o or the shipped .so;
+(3) the window-12 LDS-mnemonic rename fired again (ds_store_*/ds_load_*,
+not read/write — my first table showed a tree of zero LDS ops); (4) objdump
+addresses live in the trailing COMMENT — the window-18 trap recurred in the
+body-count regex (`^\t[a-z_]`, never the address prefix). The zero-parse
+coverage asserts fired loudly on attempts 1-3 instead of shipping tables of
+zeros — the pattern the ledger has now saved four times.
