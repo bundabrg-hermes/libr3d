@@ -143,7 +143,19 @@ static void cmp(const char* what, const std::vector<uint8_t>& a, const std::vect
     std::printf("  %s: %zu/%zu bytes differ\n", what, bad, a.size());
 }
 
-struct Geo { int hd, rot, M, nq, nkv, bs, cs_f32, w_f32, pos_i64; };
+struct Geo { int hd, rot, M, nq, nkv, bs, cs_f32, w_f32, pos_i64, pitch; };
+
+/* Copy the valid [M, ncols] window out of a pitched image into a dense buffer, for
+ * comparing the fused side (pitched, like live) against the chain side (dense). */
+static void compact(std::vector<uint8_t>& dense, const std::vector<uint8_t>& img,
+                    long long M, long long pitch, long long ncols) {
+    dense.assign((size_t)M * ncols * 2, 0);
+    const uint16_t* s = (const uint16_t*)img.data();
+    uint16_t* d = (uint16_t*)dense.data();
+    for (long long t = 0; t < M; ++t)
+        for (long long c = 0; c < ncols; ++c)
+            d[t * ncols + c] = s[t * pitch + c];
+}
 
 static void fill_bf16(std::mt19937& rng, Buf& b, float amp) {
     std::uniform_real_distribution<float> u(-amp, amp);
@@ -166,6 +178,7 @@ static void case_run(Lib& lib, std::mt19937& rng, const Geo& g, bool fuse_kv,
                      bool gated, bool pad) {
     const int CS_ROWS = 64, nb = (g.M + g.bs - 1) / g.bs + 2;
     char tag[160];
+    const int fails_before = g_fail;
     std::snprintf(tag, sizeof tag, "%s hd=%d rot=%d M=%d nq=%d nkv=%d cs=%s w=%s pos=%s%s%s",
                   fuse_kv ? "KV" : "plain", g.hd, g.rot, g.M, g.nq, g.nkv,
                   g.cs_f32 ? "f32" : "bf16", g.w_f32 ? "f32" : "bf16",
@@ -175,11 +188,14 @@ static void case_run(Lib& lib, std::mt19937& rng, const Geo& g, bool fuse_kv,
     auto mkbuf = [&](uint32_t dt, std::vector<int64_t> sh) {
         Buf* b = new Buf(); b->init(dt, std::move(sh)); keep.push_back(b); return b;
     };
+    const long long kcols = (long long)g.nkv * g.hd;
+    const long long kpitch = kcols + (g.pitch ? 96 : 0);
 
     Buf* qg  = mkbuf(RAD_BF16, {g.M, (long long)g.nq * 2 * g.hd});
-    Buf* k_c = mkbuf(RAD_BF16, {g.M, (long long)g.nkv * g.hd});
-    Buf* k_f = mkbuf(RAD_BF16, {g.M, (long long)g.nkv * g.hd});
-    Buf* v   = mkbuf(RAD_BF16, {g.M, (long long)g.nkv * g.hd});
+    Buf* k_c = mkbuf(RAD_BF16, {g.M, kcols});                              // chain: dense
+    Buf* k_f = mkbuf(RAD_BF16, {g.M, kpitch});                             // fused: pitched image
+    Buf* v_c = mkbuf(RAD_BF16, {g.M, kcols});                              // chain: dense
+    Buf* v_f = mkbuf(RAD_BF16, {g.M, kpitch});                             // fused: pitched image
     Buf* wq  = mkbuf(g.w_f32 ? RAD_F32 : RAD_BF16, {g.hd});
     Buf* wk  = mkbuf(g.w_f32 ? RAD_F32 : RAD_BF16, {g.hd});
     Buf* pos = mkbuf(g.pos_i64 ? RAD_I64 : RAD_I32, {g.M});
@@ -188,10 +204,13 @@ static void case_run(Lib& lib, std::mt19937& rng, const Geo& g, bool fuse_kv,
     Buf* qc  = mkbuf(RAD_BF16, {g.M, (long long)g.nq * g.hd});
     Buf* qf  = mkbuf(RAD_BF16, {g.M, (long long)g.nq * g.hd});
     Buf* cc  = mkbuf(RAD_BF16, {nb, g.nkv, g.bs, 2 * g.hd});
-    Buf* cf  = mkbuf(RAD_BF16, {nb, g.nkv, g.bs, 2 * g.hd});
+    const long long cfp = g.pitch ? 2 * g.hd + 96 : 2 * g.hd;         // fused cache image pitch
+    Buf* cf  = mkbuf(RAD_BF16, {nb, g.nkv, g.bs, cfp});
+    Buf* cs_f = mkbuf(g.cs_f32 ? RAD_F32 : RAD_BF16,
+                      {CS_ROWS, g.pitch ? (long long)g.rot + 192 : (long long)g.rot});
     Buf* gof = mkbuf(RAD_BF16, {g.M, (long long)g.nq * g.hd});
 
-    fill_bf16(rng, *qg, 1.0f); fill_bf16(rng, *k_c, 1.0f); fill_bf16(rng, *v, 1.0f);
+    fill_bf16(rng, *qg, 1.0f); fill_bf16(rng, *k_c, 1.0f); fill_bf16(rng, *v_c, 1.0f);
     if (g.w_f32) fill_f32(rng, *wq, 0.5f), fill_f32(rng, *wk, 0.5f);
     else         fill_bf16(rng, *wq, 0.5f), fill_bf16(rng, *wk, 0.5f);
     for (int i = 0; i < g.M; ++i) {
@@ -204,6 +223,15 @@ static void case_run(Lib& lib, std::mt19937& rng, const Geo& g, bool fuse_kv,
     }
 
     std::vector<uint8_t> k_seed = k_c->h;
+    /* Seed a pitched image: poison everywhere, valid window from the dense seed. */
+    auto seed_pitched = [&](Buf* img, const std::vector<uint8_t>& dense) {
+        for (auto& b : img->h) b = 0xA5;
+        const uint16_t* s = (const uint16_t*)dense.data();
+        uint16_t* d = (uint16_t*)img->h.data();
+        for (long long t = 0; t < g.M; ++t)
+            for (long long c = 0; c < kcols; ++c) d[t * kpitch + c] = s[t * kcols + c];
+    };
+    seed_pitched(v_f, v_c->h);
     const double theta = 1000000.0, eps = 1e-6, wadd = 1.0;
     if (getenv("QK_DIAG")) std::fprintf(stderr, "PHASE start %s\n", tag);
 
@@ -261,29 +289,55 @@ static void case_run(Lib& lib, std::mt19937& rng, const Geo& g, bool fuse_kv,
         if (rc) { std::printf("%-52s rope(k) rc=%d\n", tag, rc); ++g_fail; }
     }
     if (fuse_kv) {
-        std::vector<Buf*> o{k_c, v, slot, cc};
+        std::vector<Buf*> o{k_c, v_c, slot, cc};
         std::vector<RadParam> p{Pi("M", g.M), Pi("head_dim", g.hd), Pi("n_head_kv", g.nkv),
                                 Pi("block_size", g.bs), Ps("kv_dtype", "bf16")};
         int rc = run(ks_row, o, p);
         if (rc) { std::printf("%-52s kv_store rc=%d\n", tag, rc); ++g_fail; }
     }
 
-    /* ---- fused: same seeds, one launch */
-    k_f->h = k_seed;
+    /* ---- fused: same seeds, one launch, through pitched views exactly like live. The
+     * cos/sin plane on this architecture is shared with the GDN prologue: a [rows, rot]
+     * window of a wider allocation. The cache image is pitched too. Poison fills the
+     * padding so a kernel that walked it would diverge. */
+    seed_pitched(k_f, k_seed);
+    {   /* copy the dense table into the pitched image */
+        const size_t es = g.cs_f32 ? 4 : 2;
+        for (auto& b : cs_f->h) b = 0xA5;
+        const uint8_t* s = cs->h.data(); uint8_t* d = cs_f->h.data();
+        for (long long r = 0; r < CS_ROWS; ++r)
+            for (long long c = 0; c < g.rot; ++c)
+                std::memcpy(d + (r * ((long long)g.rot + (g.pitch ? 192 : 0)) + c) * es,
+                            s + (r * g.rot + c) * es, es);
+    }
+    Buf k_fv; k_fv.dtype = RAD_BF16;
+    if (g.pitch) { k_fv.shape = {g.M, g.nkv, g.hd}; k_fv.strides = {kpitch, g.hd, 1}; }
+    else         { k_fv.shape = {g.M, kcols};       k_fv.strides = {kpitch, 1}; }
+    k_fv.alias = k_f;
+    Buf v_fv; v_fv.dtype = RAD_BF16;
+    if (g.pitch) { v_fv.shape = {g.M, g.nkv, g.hd}; v_fv.strides = {kpitch, g.hd, 1}; }
+    else         { v_fv.shape = {g.M, kcols};       v_fv.strides = {kpitch, 1}; }
+    v_fv.alias = v_f;
+    Buf qg3; qg3.dtype = RAD_BF16; qg3.shape = {g.M, g.nq, 2 * g.hd};
+    qg3.strides = {(long long)g.nq * 2 * g.hd, 2 * g.hd, 1}; qg3.alias = qg;  /* live rank-3 */
+    Buf cs_fv; cs_fv.dtype = g.cs_f32 ? RAD_F32 : RAD_BF16; cs_fv.shape = {CS_ROWS, g.rot};
+    cs_fv.strides = {(long long)g.rot + (g.pitch ? 192 : 0), 1}; cs_fv.alias = cs_f;
+    Buf cf_v; cf_v.dtype = RAD_BF16; cf_v.shape = {nb, g.nkv, g.bs, 2 * g.hd};
+    cf_v.strides = {g.nkv * g.bs * cfp, g.bs * cfp, cfp, 1}; cf_v.alias = cf;
     std::memset(qf->h.data(), 0, qf->h.size());
     std::memset(cf->h.data(), 0xEE, cf->h.size());
     std::memset(gof->h.data(), 0, gof->h.size());
     std::vector<Buf*> fo;
-    if (g.nq > 0) { fo.push_back(qg); } else { Buf none; none.present = false;
-        /* k-only form: q_gate/q_w/q_out absent */ 
+    if (g.nq > 0) { fo.push_back(g.pitch ? &qg3 : qg); } else {
+        /* k-only form: q_gate/q_w/q_out absent */
         keep.push_back(new Buf()); keep.back()->present = false; fo.push_back(keep.back()); }
-    fo.push_back(k_f); fo.push_back(cs); fo.push_back(pos);
+    fo.push_back(&k_fv); fo.push_back(&cs_fv); fo.push_back(pos);
     if (g.nq > 0) fo.push_back(wq); else { keep.push_back(new Buf()); keep.back()->present = false; fo.push_back(keep.back()); }
     fo.push_back(wk);
     if (g.nq > 0) fo.push_back(qf); else { keep.push_back(new Buf()); keep.back()->present = false; fo.push_back(keep.back()); }
-    fo.push_back(k_f);
+    fo.push_back(&k_fv);
     if (gated && g.nq > 0) fo.push_back(gof); else { keep.push_back(new Buf()); keep.back()->present = false; fo.push_back(keep.back()); }
-    if (fuse_kv) { fo.push_back(v); fo.push_back(slot); fo.push_back(cf); }
+    if (fuse_kv) { fo.push_back(&v_fv); fo.push_back(slot); fo.push_back(&cf_v); }
     std::vector<RadParam> fp{Pi("M", g.M), Pi("head_dim", g.hd), Pi("n_head", g.nq),
                              Pi("n_head_kv", g.nkv), Pi("rot", g.rot), Ps("q_dtype", "bf16"),
                              Pf("eps", eps), Pf("wadd", wadd), Pi("cs_f32", g.cs_f32)};
@@ -302,12 +356,25 @@ static void case_run(Lib& lib, std::mt19937& rng, const Geo& g, bool fuse_kv,
             if (!std::equal(qc->h.begin() + rowb, qc->h.end(), qf->h.begin() + rowb)) { ++g_fail; std::printf("  q_out(valid rows) differs\n"); } else ++g_pass;
         }
     }
-    if (!pad) cmp("k_out", k_c->h, k_f->h);
+    std::vector<uint8_t> kf_cmp;
+    compact(kf_cmp, k_f->h, g.M, kpitch, kcols);
+    if (!pad) cmp("k_out", k_c->h, kf_cmp);
     else {
         size_t rowb = (size_t)g.nkv * g.hd * 2;
-        if (!std::equal(k_c->h.begin() + rowb, k_c->h.end(), k_f->h.begin() + rowb)) { ++g_fail; std::printf("  k_out(valid rows) differs\n"); } else ++g_pass;
+        if (!std::equal(k_c->h.begin() + rowb, k_c->h.end(), kf_cmp.begin() + rowb)) { ++g_fail; std::printf("  k_out(valid rows) differs\n"); } else ++g_pass;
     }
-    if (fuse_kv) cmp("cache", cc->h, cf->h);
+    if (fuse_kv) {
+        std::vector<uint8_t> cf_cmp(cc->h.size(), 0);
+        const uint16_t* s = (const uint16_t*)cf->h.data();
+        uint16_t* d = (uint16_t*)cf_cmp.data();
+        for (long long b = 0; b < nb; ++b)
+            for (long long h = 0; h < g.nkv; ++h)
+                for (long long o = 0; o < g.bs; ++o)
+                    for (long long e = 0; e < 2 * g.hd; ++e)
+                        d[(((b * g.nkv + h) * g.bs + o) * 2 * g.hd) + e] =
+                            s[b * g.nkv * g.bs * cfp + h * g.bs * cfp + o * cfp + e];
+        cmp("cache", cc->h, cf_cmp);
+    }
     if (getenv("QK_DIAG") && g_fail) {
         const uint16_t *qc16 = (const uint16_t*)qc->h.data(), *qf16 = (const uint16_t*)qf->h.data();
         std::printf("  DIAG pos:");
@@ -334,7 +401,7 @@ static void case_run(Lib& lib, std::mt19937& rng, const Geo& g, bool fuse_kv,
                     dst[((size_t)t * g.nq + h) * g.hd + e] = src[((size_t)t * g.nq + h) * 2 * g.hd + g.hd + e];
         cmp("gate_out", want, gof->h);
     }
-    std::printf("%-52s %s\n", tag, g_fail ? "(see MISMATCH above)" : "ok");
+    std::printf("%-52s %s\n", tag, g_fail > fails_before ? "(see MISMATCH above)" : "ok");
     if (getenv("QK_DIAG")) std::fprintf(stderr, "PHASE compare-done %s\n", tag);
     if (!getenv("QK_LEAK")) for (auto* b : keep) delete b;
     if (getenv("QK_DIAG")) std::fprintf(stderr, "PHASE freed %s\n", tag);
@@ -362,23 +429,23 @@ int main(int argc, char** argv) {
     for (int hd : {64, 128, 256})
         for (int rot : {hd, hd / 2})
             for (int M : {1, 16})
-                if (pick(idx)) case_run(lib, rng, Geo{hd, rot, M, 8, 2, 16, 1, 1, 0}, false, false, false);
-                else { (void)rng; ++idx - idx; }
+                if (pick(idx)) case_run(lib, rng, Geo{hd, rot, M, 8, 2, 16, 1, 1, 0, 0}, false, false, false);
+                else (void)rng;
     if (!only) {
     for (int M : {1, 8})
-        case_run(lib, rng, Geo{128, 128, M, 8, 2, 16, 1, 1, 0}, true, false, false);
-    case_run(lib, rng, Geo{64, 32, 4, 8, 2, 16, 1, 0, 0}, true, false, false);   // bf16 gains
-    case_run(lib, rng, Geo{64, 32, 4, 8, 2, 16, 1, 1, 1}, true, false, false);   // i64 pos
-    case_run(lib, rng, Geo{128, 128, 8, 8, 2, 16, 1, 1, 0}, false, true, false); // gate_out
-    case_run(lib, rng, Geo{128, 128, 8, 8, 2, 16, 1, 1, 0}, true, false, true);  // padded row 0
-    case_run(lib, rng, Geo{128, 128, 8, 0, 4, 16, 1, 1, 0}, true, false, false); // k-only form
-    case_run(lib, rng, Geo{256, 64, 2, 8, 2, 16, 1, 0, 1}, true, false, false);  // mixed widths
+        case_run(lib, rng, Geo{128, 128, M, 8, 2, 16, 1, 1, 0, M == 8}, true, false, false);
+    case_run(lib, rng, Geo{64, 32, 4, 8, 2, 16, 1, 0, 0, 0}, true, false, false);   // bf16 gains
+    case_run(lib, rng, Geo{64, 32, 4, 8, 2, 16, 1, 1, 1, 1}, true, false, false);   // i64 pos, pitched
+    case_run(lib, rng, Geo{128, 128, 8, 8, 2, 16, 1, 1, 0, 0}, false, true, false); // gate_out
+    case_run(lib, rng, Geo{128, 128, 8, 8, 2, 16, 1, 1, 0, 1}, true, false, true);  // padded row 0
+    case_run(lib, rng, Geo{128, 128, 8, 0, 4, 16, 1, 1, 0, 0}, true, false, false); // k-only form
+    case_run(lib, rng, Geo{256, 64, 2, 8, 2, 16, 1, 0, 1, 1}, true, false, false);  // mixed widths, pitched
     } else {
         /* QK_CASE indices into the extras: 100=bf16g 101=i64 102=gate 103=pad 104=konly 105=mixed */
         int w = atoi(only);
-        if (w == 100) case_run(lib, rng, Geo{64, 32, 4, 8, 2, 16, 1, 0, 0}, true, false, false);
-        if (w == 101) case_run(lib, rng, Geo{64, 32, 4, 8, 2, 16, 1, 1, 1}, true, false, false);
-        if (w == 105) case_run(lib, rng, Geo{256, 64, 2, 8, 2, 16, 1, 0, 1}, true, false, false);
+        if (w == 100) case_run(lib, rng, Geo{64, 32, 4, 8, 2, 16, 1, 0, 0, 0}, true, false, false);
+        if (w == 101) case_run(lib, rng, Geo{64, 32, 4, 8, 2, 16, 1, 1, 1, 1}, true, false, false);
+        if (w == 105) case_run(lib, rng, Geo{256, 64, 2, 8, 2, 16, 1, 0, 1, 1}, true, false, false);
         (void)idx;
     }
     }

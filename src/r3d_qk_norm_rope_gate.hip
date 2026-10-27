@@ -36,9 +36,17 @@
  * barrier was a ~1% scatter of wrong elements that looks like rounding; the barrier before the
  * stores stays. Q31's WGP store law is not engaged: no barrier follows the kernel's global
  * stores (the KV-fold section adds none and never reads what other lanes stored).
+ *
+ * The q/k/v planes arrive as PITCHED rows -- the graph slices `k` (and its `k_out` alias) and
+ * `v` out of wider allocations, exactly the walk the unfused rope and kv_store already do by
+ * row stride. An earlier revision demanded full row-major contiguity of them and STOPPED THE
+ * ENGINE on live spec9g traffic 2026-10-27 (`RAD_E_STRIDE` is a fatal kernel error to the
+ * planner). The law now: unit last stride, pitch >= row width, pitch read from stride[rank-2];
+ * tools/test_qk_fuse.cpp drives the fused side through pitched views to keep that honest.
  */
 
 #include <hip/hip_runtime.h>
+#include <cstdlib>
 #include <cstring>
 #include "r3d_dump.h"
 
@@ -72,11 +80,13 @@ __device__ __forceinline__ float r3d_wave_sum(float v) {
 }
 
 /* The paged cache the KV form writes, in one argument to stay inside the parameter budget.
- * The bf16 form needs no descales (kv_store_bf16's identity multiplies). */
+ * The bf16 form needs no descales (kv_store_bf16's identity multiplies). The strides walk a
+ * possibly-wider allocation, exactly like r3d_kvstore.hip walks its cache by tensor strides. */
 struct QkKvStore {
     uint16_t*       cache;
     const uint16_t* v;
     const int32_t*  slot;
+    long kv_s0, kv_s1, kv_s2;   /* element strides for [n_blocks, kv_heads, block_size] */
     int v_pitch, block_size, n_blocks;
 };
 
@@ -97,7 +107,9 @@ __global__ __launch_bounds__(kThreads) void r3d_qk_norm_rope_gate_kernel(
     const void* __restrict__ WQ, const void* __restrict__ WK,
     const void* __restrict__ CS, const void* __restrict__ POS, long cs_rows,
     int nq, int nkv, int rot, float eps, float wadd,
-    int qg_pitch, int k_pitch, int cs_f32, int pos_i64, int w_f32, QkKvStore kvs) {
+    int qg_pitch, int k_pitch, int qo_pitch, int ko_pitch,
+    int cs_pitch,
+    int cs_f32, int pos_i64, int w_f32, QkKvStore kvs) {
     __shared__ float lds[kWaves];
     const int tok = blockIdx.x, h = blockIdx.y;
     const int t = threadIdx.x;
@@ -108,8 +120,8 @@ __global__ __launch_bounds__(kThreads) void r3d_qk_norm_rope_gate_kernel(
     const uint16_t* in = isk ? (K + (size_t)tok * k_pitch + (size_t)lh * HD)
                              : (QG + (size_t)tok * qg_pitch + (size_t)lh * 2 * HD);
     const void* w = isk ? WK : WQ;
-    uint16_t* out = isk ? (KO + ((size_t)tok * nkv + lh) * HD)
-                        : (QO + ((size_t)tok * nq + lh) * HD);
+    uint16_t* out = isk ? (KO + (size_t)tok * ko_pitch + (size_t)lh * HD)
+                        : (QO + (size_t)tok * qo_pitch + (size_t)lh * HD);
     const float* csf = (const float*)CS;
     const uint16_t* csb = (const uint16_t*)CS;
 
@@ -131,7 +143,7 @@ __global__ __launch_bounds__(kThreads) void r3d_qk_norm_rope_gate_kernel(
     const int ci = rl ? (first ? t : t - half) : 0;
     /* The table row is clamped: a padded (negative) row or a position past the table's height
      * has no row rope_table wrote, and must not read outside the plane. */
-    const size_t co = (size_t)(p < 0 ? 0 : (p < cs_rows ? p : cs_rows - 1)) * rot;
+    const size_t co = (size_t)(p < 0 ? 0 : (p < cs_rows ? p : cs_rows - 1)) * (size_t)cs_pitch;
     const float vt = r3d_bf16_to_f32(in[tc]), gt = gain(tc);
     const float vp = r3d_bf16_to_f32(in[pt]), gp = gain(pt);
     const float c = cs_f32 ? csf[co + ci] : r3d_bf16_to_f32(csb[co + ci]);
@@ -180,9 +192,8 @@ __global__ __launch_bounds__(kThreads) void r3d_qk_norm_rope_gate_kernel(
             if (sl >= 0 && (uint32_t)sl / (uint32_t)kvs.block_size < (uint32_t)kvs.n_blocks) {
                 const uint32_t blk = (uint32_t)sl / (uint32_t)kvs.block_size;
                 const uint32_t off = (uint32_t)sl % (uint32_t)kvs.block_size;
-                const size_t at = ((size_t)blk * nkv * kvs.block_size + off) * 2 * HD +
-                                  (size_t)lh * kvs.block_size * 2 * HD;
-                uint16_t* cch = kvs.cache + at;
+                uint16_t* cch = kvs.cache + (size_t)blk * kvs.kv_s0 +
+                                (size_t)lh * kvs.kv_s1 + (size_t)off * kvs.kv_s2;
                 cch[t]      = r3d_f32_to_bf16(res);
                 cch[HD + t] = kvs.v[(size_t)tok * kvs.v_pitch + (size_t)lh * HD + t];
             }
@@ -195,10 +206,31 @@ __global__ __launch_bounds__(kThreads) void r3d_qk_norm_rope_gate_kernel(
 constexpr int QK_QGATE = 0, QK_K = 1, QK_COSSIN = 2, QK_POS = 3, QK_WQ = 4, QK_WK = 5,
               QK_QOUT = 6, QK_KOUT = 7, QK_GOUT = 8, QK_V = 9, QK_SLOT = 10, QK_CACHE = 11;
 
-/* Full row-major contiguity. The kernels above address operands flat (one row pitch a run),
- * so an operand whose strides are not the contiguous product is refused, not walked. The
- * engine's bands allocate these planes contiguously (the templates' operand shapes come from
- * the graph's own buffers); the check is the cold-call guard. */
+/* Field diagnosis for the live wiring: R3D_QK_TRACE=1 names the operand each refusal was
+ * about. RAD_E_STRIDE is fatal to an engine step, so a wrong refusal must be findable
+ * from the serve log alone (2026-10-27 stop). */
+inline bool qk_trace() { static const bool on = getenv("R3D_QK_TRACE") != nullptr; return on; }
+inline void qk_dump(const char* n, const RadTensor* t) {
+    if (!qk_trace() || !t) return;
+    std::fprintf(stderr, "R3D_QK operand %s rank=%d dtype=%u", n, t->rank, t->dtype);
+    for (int r = 0; r < (int)t->rank && r < 4; ++r)
+        std::fprintf(stderr, " s%d=%lld/e%d=%lld", r, (long long)t->stride[r],
+                     (long long)t->shape[r]);
+    std::fprintf(stderr, "\n");
+}
+#define QK_REFUSE(code, why)                                                        \
+    do { if (qk_trace()) std::fprintf(stderr, "R3D_QK refuse " why "\n");           \
+         return code; } while (0)
+#define QK_REFUSE_T(code, why, t)                                                   \
+    do { if (qk_trace()) { std::fprintf(stderr, "R3D_QK refuse " why "\n");         \
+         qk_dump(#t, t); } return code; } while (0)
+
+/* Full row-major contiguity. Flat-addressed operands (the table, positions, gains, slots, the
+ * cache plane) must be contiguous or the flat index walks off their memory. The q/k/v planes
+ * are NOT checked with this: the graph hands `k` (and its `k_out` alias) as a pitched view of
+ * the fused qkv plane, exactly like the unfused rope/kv_store walk it by row stride. Those
+ * take pitched_ok below -- unit last stride, row pitch read from stride[rank-2], row spans
+ * [0, ncols). Rejecting the pitch is what stopped the engine on live traffic 2026-10-27. */
 bool rad_contig(const RadTensor* t) {
     int64_t want = 1;
     for (int r = (int)t->rank - 1; r >= 0; --r) {
@@ -206,6 +238,22 @@ bool rad_contig(const RadTensor* t) {
         want *= t->shape[r];
     }
     return true;
+}
+
+/* Row view of the flat walk the kernels do: rank >= 2, unit last stride, the inner extents
+ * packed (so the kernel's `head * row + col` flat column arithmetic is the tensor's own
+ * layout), and a row pitch (stride[0]) at least as wide as the row. The graph hands q/k/v as
+ * rank-2 {tok, cols} or rank-3 {tok, head, cols-per-head} with packed heads -- both walk
+ * identically. Returns the row pitch, or -1 to refuse (caller maps to RAD_E_STRIDE). */
+long pitched_ok(const RadTensor* t, long long ncols) {
+    if (t->rank < 2 || t->stride[t->rank - 1] != 1) return -1;
+    long long packed = t->shape[t->rank - 1];
+    for (int r = (int)t->rank - 2; r >= 1; --r) {
+        if (t->stride[r] != packed) return -1;
+        packed *= t->shape[r];
+    }
+    if (packed != ncols) return -1;
+    return t->stride[0] >= (long long)ncols ? (long)t->stride[0] : -1;
 }
 
 /* The body of both forms; KVF is the kv_store fold and `kvs` its cache, already checked. The
@@ -222,10 +270,15 @@ int qk_body(const RadArgs* a, hipStream_t stream, const QkKvStore& kvs) {
     const RadTensor* qo = rad_arg_in(a, QK_QOUT);
     const RadTensor* ko = rad_arg_in(a, QK_KOUT);
     const RadTensor* go = rad_arg_in(a, QK_GOUT);
-    if (!k || !cs || !po || !wk || !ko) return RAD_E_INVAL;
-    if (!rad_contig(cs) || !rad_contig(po) || !rad_contig(wk)) return RAD_E_STRIDE;
-    if (!rad_contig(ko)) return RAD_E_STRIDE;
-    if (go && !rad_contig(go)) return RAD_E_STRIDE;
+    if (!k || !cs || !po || !wk || !ko) QK_REFUSE(RAD_E_INVAL, "missing operand");
+    if (!rad_contig(po)) QK_REFUSE(RAD_E_STRIDE, "positions not contiguous");
+    if (!rad_contig(wk)) QK_REFUSE(RAD_E_STRIDE, "k_w not contiguous");
+    if (go && !rad_contig(go)) QK_REFUSE(RAD_E_STRIDE, "gate_out not contiguous");
+    /* The cos/sin table can be pitched: on this architecture one plane serves both the
+     * gated attention (rot columns) and the GDN prologue (its own rot), so the graph hands
+     * a [rows, rot] view of a wider allocation. Rows come from the declared extent, never
+     * from numel/rot -- the latter would read 4x past a pitched plane. */
+    if (cs->rank < 2 || cs->stride[cs->rank - 1] != 1) QK_REFUSE(RAD_E_STRIDE, "cos_sin stride");
 
     long long hd = 0, nq = 0, nkv = 0, rot = 0;
     rad_args_geti(a, "head_dim", &hd);
@@ -233,21 +286,28 @@ int qk_body(const RadArgs* a, hipStream_t stream, const QkKvStore& kvs) {
     rad_args_geti(a, "n_head_kv", &nkv);
     rad_args_geti(a, "rot", &rot);
     if (nq < 0 || nkv < 1) return RAD_E_SHAPE;
-    if (nq >= 1 && (!qg || !wq || !qo)) return RAD_E_INVAL;
-    if (qg && (!rad_contig(wq) || !rad_contig(qo) || qg->rank != 2)) return RAD_E_STRIDE;
-    if (k->rank != 2 || !rad_contig(k)) return RAD_E_STRIDE;
+    if (nq >= 1 && (!qg || !wq || !qo)) QK_REFUSE(RAD_E_INVAL, "missing q-side operand");
+    if (wq && !rad_contig(wq)) QK_REFUSE(RAD_E_STRIDE, "q_w not contiguous");
 
-    const long long qg_pitch = qg ? qg->stride[0] : 0;
-    const long long k_pitch  = k->stride[0];
-    if (qg_pitch < 0 || k_pitch < 0) return RAD_E_STRIDE;
+    /* Pitched rows are legal for the q/k planes (the graph slices them out of wider
+     * allocations); the last stride must be unit and the pitch must cover the row. */
+    const long qg_pitch = qg ? pitched_ok(qg, nq * 2 * hd) : 0;
+    const long k_pitch  = pitched_ok(k, nkv * hd);
+    const long ko_pitch = pitched_ok(ko, nkv * hd);
+    const long qo_pitch = qo ? pitched_ok(qo, nq * hd) : 0;
+    if (qg_pitch < 0) QK_REFUSE_T(RAD_E_STRIDE, "q_gate stride/pitch", qg);
+    if (k_pitch < 0) QK_REFUSE_T(RAD_E_STRIDE, "k stride/pitch", k);
+    if (ko_pitch < 0) QK_REFUSE_T(RAD_E_STRIDE, "k_out stride/pitch", ko);
+    if (qo_pitch < 0) QK_REFUSE_T(RAD_E_STRIDE, "q_out stride/pitch", qo);
 
-    const long long M = qg ? qg->shape[0] : k->shape[0];
+    const long long M = qg ? qg->shape[0] : k->shape[0];   /* tokens are the outer extent */
     if (M < 1 || M > 0x7ffffffLL) return RAD_E_SHAPE;
     if (rad_tensor_numel(po) < M) return RAD_E_SHAPE;
     if (hd != 64 && hd != 128 && hd != 256) return RAD_E_SHAPE;   /* the compiled set */
     if (rot < 2 || (rot & 1) || rot > hd) return RAD_E_SHAPE;
-    const long long cs_rows = rad_tensor_numel(cs) / rot;
-    if (cs_rows < 1 || rad_tensor_numel(cs) % rot) return RAD_E_SHAPE;
+    const long long cs_rows = cs->shape[cs->rank - 2];
+    const long cs_pitch = (long)cs->stride[cs->rank - 2];
+    if (cs_rows < 1 || cs_pitch < rot) return RAD_E_SHAPE;
 
     const float eps  = (float)rad_args_getf_or(a, "eps", 1e-6);
     const float wadd = (float)rad_args_getf_or(a, "wadd", 0.0);
@@ -271,6 +331,8 @@ int qk_body(const RadArgs* a, hipStream_t stream, const QkKvStore& kvs) {
         (uint16_t*)(go ? go->data : nullptr),                                     \
         wq ? wq->data : nullptr, wk->data, cs->data, po->data, (long)cs_rows,     \
         (int)nq, (int)nkv, (int)rot, eps, wadd, (int)qg_pitch, (int)k_pitch,      \
+        (int)qo_pitch, (int)ko_pitch,                                             \
+        (int)cs_pitch,                                                            \
         cs_f32, pos_i64, w_f32, kvs)
     switch (hd) {
         case 64:  R3D_QKG_L(64);  break;
@@ -309,7 +371,8 @@ static int r3d_qk_norm_rope_gate_kv_store_impl(const RadArgs* a, RadStream s) {
     if ((kvd && std::strcmp(kvd, "bf16") != 0) ||
         v->dtype != RAD_BF16 || kv->dtype != RAD_BF16 || sm->dtype != RAD_I32)
         return RAD_E_DTYPE;
-    if (!rad_contig(sm) || !rad_contig(v) || !rad_contig(kv)) return RAD_E_STRIDE;
+    if (!rad_contig(sm)) QK_REFUSE(RAD_E_STRIDE, "slot_mapping not contiguous");
+    if (kv->rank != 4 || kv->stride[3] != 1) QK_REFUSE(RAD_E_STRIDE, "kv_cache stride");  /* walked by tensor strides */
 
     long long hd = 0, nkv = 0, bs = 0;
     rad_args_geti(a, "head_dim", &hd);
@@ -319,9 +382,11 @@ static int r3d_qk_norm_rope_gate_kv_store_impl(const RadArgs* a, RadStream s) {
     if (kv->rank != 4 || kv->shape[1] != nkv || kv->shape[2] != bs || kv->shape[3] != 2 * hd)
         return RAD_E_SHAPE;
     const long long M = qg ? qg->shape[0] : k->shape[0];
-    if (v->rank != 2 || v->shape[1] < nkv * hd || v->shape[0] < M ||
-        rad_tensor_numel(sm) != M)
-        return RAD_E_SHAPE;
+    if (v->shape[0] < M || rad_tensor_numel(sm) != M) return RAD_E_SHAPE;
+    /* The width check lives in pitched_ok: the inner extents must be packed to exactly
+     * nkv * head_dim, whether the view is rank-2 {tok, cols} or rank-3 {tok, head, cols}. */
+    const long v_pitch = pitched_ok(v, nkv * hd);   /* v may be pitched too */
+    if (v_pitch < 0) QK_REFUSE_T(RAD_E_STRIDE, "v stride/pitch", v);
 
     /* The donor validates the descales even for the bf16 fold (where they are unused, as
      * kv_store_bf16's are); the same non-positive guard keeps a confused caller honest. */
@@ -333,7 +398,10 @@ static int r3d_qk_norm_rope_gate_kv_store_impl(const RadArgs* a, RadStream s) {
     kvs.v          = (const uint16_t*)v->data;
     kvs.slot       = (const int32_t*)sm->data;
     kvs.cache      = (uint16_t*)kv->data;
-    kvs.v_pitch    = (int)v->stride[0];
+    kvs.v_pitch    = (int)v_pitch;
+    kvs.kv_s0      = (long)kv->stride[0];
+    kvs.kv_s1      = (long)kv->stride[1];
+    kvs.kv_s2      = (long)kv->stride[2];
     kvs.block_size = (int)bs;
     kvs.n_blocks   = (int)kv->shape[0];
     return qk_body<QK_KV_BF16>(a, (hipStream_t)(uintptr_t)s, kvs);
