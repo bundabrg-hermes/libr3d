@@ -31,6 +31,8 @@
 #include <hip/hip_runtime.h>
 #include "r3d_dump.h"
 #include <cstring>
+#include <cstdlib>
+#include <cstdio>
 #include <cmath>
 
 #include "rad_abi.h"
@@ -198,6 +200,144 @@ __global__ __launch_bounds__(kThreads) void gated_quant_fp8_kernel(
             qr[k0 + i] = r3d_f32_to_e4m3(c);
         }
         __syncthreads();   /* s_sc reused next group */
+    }
+}
+
+/* ------------------------------------------------------------------ Q49 vectorisation
+ * 128-bit arms for the two elementwise band members the Q49 serve-profile
+ * attribution proved hot: gated_quant_fp8 (MLP silu*mul+quant, 33 launches per
+ * decode step, ONE block a row at M=1) and mul (attn output gate, 9 launches a
+ * step). Q32's recipe with per-kernel width math: uint4 loads = 8 contiguous
+ * bf16; the fp8 codes pack into ONE uint2 store (8 e4m3 bytes -- 1-byte
+ * elements, not b128); the optional bf16 side output packs 8 RTNE values into
+ * one uint4. The gated_quant group walk RESTRUCTURES (Q49 re-derivation):
+ * instead of ngrp sequential block-wide amax reductions (block_max + two
+ * __syncthreads + an LDS scale round-trip per group), each group is OWNED by a
+ * cpg-lane subgroup (cpg = g/8 chunks per group, pow-2 gated below), amax
+ * folds as a strict-> butterfly of shfl_xor moves masked to the subgroup, and
+ * the scale is broadcast by replication -- no syncthreads, no LDS.
+ * Bit-identity is structural: the per-element math is the scalar kernel's
+ * gated_h verbatim (gated_v_bf16 mirrors it expression for expression, gs==1)
+ * and amax is a MAX -- order-free, and NaN-losing under the same strict > the
+ * scalar scan uses (fabsf(NaN) never wins either side).
+ * Gates: bf16 dtypes; pow-2 group 16..256; n % g == 0; 16B bases; row pitches
+ * % 8; mul additionally n >= 2048 and no broadcast (Q32's small-row carve).
+ * Anything else rides the untouched scalar kernels above. Kill-switches
+ * R3D_VEC_GATE / R3D_VEC_MUL (default 0 = scalar verbatim until adjudication);
+ * R3D_DEBUG_VEC names the arm each launch rode. */
+__device__ __forceinline__ uint32_t r3d_mul_pair_bf16(uint32_t a, uint32_t b) {
+    const float u0 = r3d_bf16_to_f32((uint16_t)(a & 0xffffu)), v0 = r3d_bf16_to_f32((uint16_t)(b & 0xffffu));
+    const float u1 = r3d_bf16_to_f32((uint16_t)(a >> 16)),     v1 = r3d_bf16_to_f32((uint16_t)(b >> 16));
+    const uint32_t lo = (uint32_t)r3d_f32_to_bf16(u0 * v0);
+    const uint32_t hi = (uint32_t)r3d_f32_to_bf16(u1 * v1);
+    return lo | (hi << 16);
+}
+
+__global__ __launch_bounds__(kThreads) void mul_kernel_vec(
+    const uint16_t* __restrict__ A, int64_t a_pitch,
+    const uint16_t* __restrict__ B, int64_t b_pitch,
+    uint16_t* __restrict__ Y, int64_t y_pitch, int64_t nv) {
+    const int64_t r = blockIdx.x;
+    const uint4* __restrict__ ar = (const uint4*)(A + r * a_pitch);
+    const uint4* __restrict__ br = (const uint4*)(B + r * b_pitch);
+    uint4* __restrict__ yr = (uint4*)(Y + r * y_pitch);
+    for (int64_t c = (int64_t)threadIdx.x; c < nv; c += (int64_t)kThreads) {
+        const uint4 a = ar[c], b = br[c];
+        uint4 o;
+        o.x = r3d_mul_pair_bf16(a.x, b.x);
+        o.y = r3d_mul_pair_bf16(a.y, b.y);
+        o.z = r3d_mul_pair_bf16(a.z, b.z);
+        o.w = r3d_mul_pair_bf16(a.w, b.w);
+        yr[c] = o;
+    }
+}
+
+__device__ __forceinline__ float gated_v_bf16(float gt, float up, int silu) {
+    const float sg = r3d_sigmoid(gt);
+    /* Q49 codegen pitfall (Q44 law, NaN edition): RDNA propagates the FIRST NaN
+     * operand's sign through v_mul_f32, and LLVM commutes the product's operands
+     * differently in the scalar walk vs this uint4 walk -- the arms then land on
+     * opposite NaN signs for NaN inputs. The opaque barriers pin the operand
+     * order to this source order, which is the scalar kernel's order as
+     * compiled (empirically: gate-side NaN wins, matching the scalar arm). */
+    float a = gt, b = sg;
+    uint32_t ua = __float_as_uint(a), ub = __float_as_uint(b);
+    asm volatile("" : "+v"(ua), "+v"(ub));   /* opaque vector-reg barrier: no operand
+                                                 commute across the product below */
+    a = __uint_as_float(ua); b = __uint_as_float(ub);
+    float sel = silu ? a * b : b;
+    return r3d_bf16_to_f32(r3d_f32_to_bf16(sel * up));
+}
+
+__global__ __launch_bounds__(kThreads) void gated_quant_fp8_vec_kernel(
+    const uint16_t* __restrict__ gu, int64_t gu_pitch,
+    uint8_t* __restrict__ q, int64_t q_pitch,
+    float* __restrict__ scale, int64_t s_pitch,
+    uint16_t* __restrict__ ob, int64_t ob_pitch,
+    int64_t n, int64_t g, uint32_t cpg, int silu) {
+    const int64_t row = blockIdx.x;
+    const uint16_t* __restrict__ gub = gu + row * gu_pitch;
+    uint8_t* __restrict__ qr = q + row * q_pitch;
+    uint16_t* __restrict__ yr = ob ? ob + row * ob_pitch : nullptr;
+    const uint32_t ngrp = (uint32_t)(n / g);
+    const uint32_t gpb  = kThreads / cpg;             /* groups a block sweep covers */
+    const uint32_t sub  = threadIdx.x % cpg;          /* chunk slot inside its group */
+    const uint32_t wgrp = threadIdx.x / cpg;          /* group handled this sweep     */
+    const uint32_t sbase = threadIdx.x & ~(cpg - 1u);
+    const uint32_t mask  = (cpg == 32u) ? 0xffffffffu
+                                        : (((1u << cpg) - 1u) << sbase);
+    for (uint32_t base = 0; base < ngrp; base += gpb) {
+        const uint32_t gi = base + wgrp;
+        if (gi < ngrp) {
+            const uint32_t c = gi * cpg + sub;        /* global uint4 chunk index */
+            const uint4 gv = ((const uint4*)gub)[c];
+            const uint4 uv = ((const uint4*)(gub + n))[c];
+            const uint32_t gw[4] = { gv.x, gv.y, gv.z, gv.w };
+            const uint32_t uw[4] = { uv.x, uv.y, uv.z, uv.w };
+            float h[8];
+            float amax = 0.0f;                        /* the scalar scan's initial */
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float g0 = r3d_bf16_to_f32((uint16_t)(gw[k] & 0xffffu));
+                const float g1 = r3d_bf16_to_f32((uint16_t)(gw[k] >> 16));
+                const float u0 = r3d_bf16_to_f32((uint16_t)(uw[k] & 0xffffu));
+                const float u1 = r3d_bf16_to_f32((uint16_t)(uw[k] >> 16));
+                h[2 * k]     = gated_v_bf16(g0, u0, silu);
+                h[2 * k + 1] = gated_v_bf16(g1, u1, silu);
+                const float m0 = fabsf(h[2 * k]), m1 = fabsf(h[2 * k + 1]);
+                if (m0 > amax) amax = m0;             /* strict >: NaN never wins */
+                if (m1 > amax) amax = m1;
+            }
+            for (uint32_t off = cpg / 2u; off; off >>= 1u) {   /* cpg-wide butterfly */
+                const float part = __shfl_xor_sync((unsigned long long)mask, amax, (int)off);
+                if (part > amax) amax = part;
+            }
+            const float sc = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
+            if (sub == 0u) scale[row * s_pitch + gi] = sc;
+            const float inv = 1.0f / sc;
+            uint8_t code[8];
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                float t = h[k] * inv;
+                if (t >  448.0f) t =  448.0f;
+                if (t < -448.0f) t = -448.0f;
+                code[k] = r3d_f32_to_e4m3(t);
+            }
+            uint2 packed;
+            packed.x = (uint32_t)code[0] | ((uint32_t)code[1] << 8)
+                     | ((uint32_t)code[2] << 16) | ((uint32_t)code[3] << 24);
+            packed.y = (uint32_t)code[4] | ((uint32_t)code[5] << 8)
+                     | ((uint32_t)code[6] << 16) | ((uint32_t)code[7] << 24);
+            *(uint2*)(qr + (int64_t)c * 8) = packed;
+            if (yr) {
+                uint4 o;
+                o.x = (uint32_t)r3d_f32_to_bf16(h[0]) | ((uint32_t)r3d_f32_to_bf16(h[1]) << 16);
+                o.y = (uint32_t)r3d_f32_to_bf16(h[2]) | ((uint32_t)r3d_f32_to_bf16(h[3]) << 16);
+                o.z = (uint32_t)r3d_f32_to_bf16(h[4]) | ((uint32_t)r3d_f32_to_bf16(h[5]) << 16);
+                o.w = (uint32_t)r3d_f32_to_bf16(h[6]) | ((uint32_t)r3d_f32_to_bf16(h[7]) << 16);
+                ((uint4*)yr)[c] = o;
+            }
+        }
     }
 }
 
@@ -373,6 +513,28 @@ static int r3d_gated_quant_fp8_impl(const RadArgs* a, RadStream s) {
     if (row2_pitch(q, n, &qp)) return RAD_E_STRIDE;
     if (row2_pitch(sc, ngrp, &sp)) return RAD_E_STRIDE;
     if (ob) { if (row2_pitch(ob, n, &op)) return RAD_E_STRIDE; }
+    /* Q49 lever: vec arm gates -- see r3d_mul_impl for the family law. */
+    static const int vec_gate = []{ const char* e = std::getenv("R3D_VEC_GATE");
+                                   return e && std::atoi(e) != 0 ? 1 : 0; }();
+    const uint32_t cpg = (uint32_t)(g / 8);
+    const bool pow2 = g >= 16 && g <= 256 && (g & (g - 1)) == 0;
+    const bool vec_ok = vec_gate && gu->dtype == RAD_BF16
+        && (!ob || ob->dtype == RAD_BF16)
+        && pow2 && (n % g) == 0 && (kThreads % cpg) == 0
+        && (gp % 8) == 0 && (qp % 8) == 0 && (!ob || (op % 8) == 0)
+        && (((uintptr_t)gu->data | (uintptr_t)q->data
+             | (ob ? (uintptr_t)ob->data : 0)) & 15u) == 0;
+    if (std::getenv("R3D_DEBUG_VEC"))
+        std::fprintf(stderr, "[r3d] gated_quant_fp8 arm=%s n=%lld g=%lld rows=%lld ob=%d\n",
+                     vec_ok ? "vec" : "scalar", (long long)n, (long long)g,
+                     (long long)rows, ob ? 1 : 0);
+    if (vec_ok) {
+        gated_quant_fp8_vec_kernel<<<dim3((uint32_t)rows), dim3(kThreads), 0,
+                                     (hipStream_t)(uintptr_t)s>>>(
+            (const uint16_t*)gu->data, gp, (uint8_t*)q->data, qp, (float*)sc->data, sp,
+            ob ? (uint16_t*)ob->data : nullptr, op, n, g, cpg, silu);
+        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    }
     gated_quant_fp8_kernel<<<dim3((uint32_t)rows), dim3(kThreads), 0,
                              (hipStream_t)(uintptr_t)s>>>(
         (const uint8_t*)gu->data, gu->dtype, rad_dtype_bytes(gu->dtype, gp), 1,
@@ -437,6 +599,23 @@ static int r3d_mul_impl(const RadArgs* a, RadStream s) {
     if (row2_pitch(Y, n, &yp)) return RAD_E_STRIDE;
     if (bcast) { if (row2_pitch(B, n, &bp)) return RAD_E_STRIDE; bp = 0; }
     else if (row2_pitch(B, n, &bp)) return RAD_E_STRIDE;
+    /* Q49 lever: the mul arm (mode 1) only -- add() below stays verbatim. */
+    static const int vec_mul = []{ const char* e = std::getenv("R3D_VEC_MUL");
+                                  return e && std::atoi(e) != 0 ? 1 : 0; }();
+    const bool vec_ok = vec_mul && !bcast
+        && A->dtype == RAD_BF16 && B->dtype == RAD_BF16 && Y->dtype == RAD_BF16
+        && n >= 2048 && (n % 8) == 0
+        && (ap % 8) == 0 && (bp % 8) == 0 && (yp % 8) == 0
+        && (((uintptr_t)A->data | (uintptr_t)B->data | (uintptr_t)Y->data) & 15u) == 0;
+    if (std::getenv("R3D_DEBUG_VEC"))
+        std::fprintf(stderr, "[r3d] mul arm=%s n=%lld rows=%lld\n",
+                     vec_ok ? "vec" : "scalar", (long long)n, (long long)rows);
+    if (vec_ok) {
+        mul_kernel_vec<<<dim3((uint32_t)rows), dim3(kThreads), 0, (hipStream_t)(uintptr_t)s>>>(
+            (const uint16_t*)A->data, ap, (const uint16_t*)B->data, bp,
+            (uint16_t*)Y->data, yp, n / 8);
+        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    }
     add_kernel<<<dim3((uint32_t)rows), dim3(kThreads), 0, (hipStream_t)(uintptr_t)s>>>(
         (const uint8_t*)A->data, A->dtype, rad_dtype_bytes(A->dtype, ap), 1,
         (const uint8_t*)B->data, B->dtype, rad_dtype_bytes(B->dtype, bp), 1,
