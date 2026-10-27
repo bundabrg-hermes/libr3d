@@ -3626,3 +3626,18 @@ v149 serve on the hd256 model 16Q/4KV, spec3, 1281 positions):
   kernel matches rmsnorm_kernel_vec too). Artifacts cat:~/scratch/r3d/
   q32_arm{0,1,D}.txt, q32_ab.log, q32_ab2.log, q32_batt.log, q32_serve_ab2.log,
   v153_*.md, build_v153.log.
+
+
+## Window 44 (2026-10-27, AWST ~17:30-18:15) — Q48 CLOSED DARK: attention butterflies already folded at v142 (manager/subagent delegation begins)
+
+Operator switched this project to manager/subagent mode: manager books, briefs, verifies, adjudicates bookkeeping; one subagent at a time owns the card window. First delegated item: Q48 (attention-side score reductions onto the shipped DPP/permlanex16 kit).
+
+Premise re-verification killed the work before any build, correctly: the row's anchor (decode fold path predating the Q6 kit) went stale when Q11-FS shipped fragment-side softmax at v142. The shipped attention body IS the kit -- fs_rowmax/fs_rowsum (r3d_attn_wmma_body.inc:43-51) with the 0x161/0x162/0x164/0x168 xmask chain, dispatched first (R3D_DK_LAUNCHFS at r3d_attn_paged_decode.hip:568). No attention kernel ever carried a ds_bpermute butterfly. Census re-validated first by reproducing Q19/Q22's authoritative numbers exactly (468/234/244/148 at w2a8 hotspots, 208 DPP at <4,16>) -- then the new datum: attention family 0 bpermute across all 69 instantiations both TUs; serving fold arm = 0 bpermute, 192 v_mov_b32_dpp, 212 ds_swizzle; tree 8,504 bpermute (all non-attention) / 18,507 ds_swizzle (96.7% attention = rocwmma col-B fragment feed).
+
+THE DS-PIPE DOCTRINAL UPDATE: for our attention mix the DS-pipe pressure is the rocwmma column-B fragment swizzle -- a library lowering, out of the source kit's reach. The source-level cure the row proposed shipped eight builds before the row was booked. If attention DS pressure is ever attacked, the path is rocprofv3 attribution (Q50 pattern) then the rocwmma lowering, not our butterflies.
+
+Probe discipline still ran and paid: three-way probe (shfl chain / LDS oracle / DPP fold) on the exact shipped fold shapes, PROBE-BITEXACT at 2.684e8 lane-ops per shape incl. raw sNaN torture bits. New datum: the LDS-oracle ref diverges only on both-operand-sNaN cases (v_add_f32 operand order is a codegen contract -- re-probe after toolchain bumps); production rowsum inputs are finite by construction, FNV class unaffected.
+
+Child-process lessons (both caught by their own guards, documented in-tree): first census parse hit the known trailing-comment-address objdump trap (coverage guards fired); first probe revision had a vacuous ref leg (shuffled the wrong accumulator -- dbg forensics tool caught it; vacuous-pass class, fifth sighting). Card untouched: spec9g never stopped, health 200, restarts 0; rollback container never started.
+
+Operator cross-verify (manager): branch ff-merged to main (tools/logs/report only -- 422ca5f); DPP literals re-grepped at source independently; dispatch order re-read; report file read whole. Verdict DARK accepted: zero card time for a stale premise is the ledger working as designed.
