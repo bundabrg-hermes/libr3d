@@ -75,6 +75,9 @@ stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
     [ -n "${R3D_ATT_FS:-}" ] && envs+=(-e R3D_ATT_FS="$R3D_ATT_FS")
     [ -n "${R3D_RMS_VEC:-}" ] && envs+=(-e R3D_RMS_VEC="$R3D_RMS_VEC")
     [ -n "${R3D_DEBUG_RMS:-}" ] && envs+=(-e R3D_DEBUG_RMS="$R3D_DEBUG_RMS")
+    [ -n "${R3D_VEC_GATE:-}" ] && envs+=(-e R3D_VEC_GATE="$R3D_VEC_GATE")
+    [ -n "${R3D_VEC_MUL:-}" ] && envs+=(-e R3D_VEC_MUL="$R3D_VEC_MUL")
+    [ -n "${R3D_DEBUG_VEC:-}" ] && envs+=(-e R3D_DEBUG_VEC="$R3D_DEBUG_VEC")
     [ -n "${R3D_SPLIT_POLICY:-}" ] && envs+=(-e R3D_SPLIT_POLICY="$R3D_SPLIT_POLICY")
     [ -n "${R3D_SPLIT_CU:-}" ] && envs+=(-e R3D_SPLIT_CU="$R3D_SPLIT_CU")
     local out rc; out=$(mktemp); rc=0
