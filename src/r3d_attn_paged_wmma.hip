@@ -136,7 +136,7 @@ namespace {
  * stubs, and a missing default arg mangles the host launch's symbol differently from
  * the device image's kernel -- the loader then fails with "Cannot find Symbol" at the
  * first real launch (see COVERAGE fold postmortem). */
-template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0, int SB = 0, int FS = 0>
+template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0, int SB = 0, int FS = 0, int SBZ = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams) {}
 template <int D, int KVDT, int SPLITK>
 __global__ __launch_bounds__(kT) void attn_paged_wmma_kernel2(R3dAttnParams) {}
