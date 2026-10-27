@@ -3751,3 +3751,27 @@ Manager/subagent item 10 (Q44 desk probe, 60 calls / 14 min, tools-only to main)
 
 Probe: standalone Form A = shipped kernel verbatim, its MT=8 census byte-exact vs the shipped binary (fidelity gate before any diff); Form B = the lane-owns-group map (full 32-code group per lane, per-lane SG/AS/sc containment, one 5-op DPP-kit tail reduce). Numbers: in-walk executed cross-lane 40 -> 0; static 176 -> 80 (-54.5%); instrs 2895 -> 1415; VGPR 36 -> 40, SGPR 73 -> 59, spills 0; fusion parity. Zero saveexec regions in either form -- the Q43 guard-that-ate-the-prize cannot bite this topology. Verdict: CARD EARNED, 3x the row's 20% gate. Card session queued next with the report's plan (verify-band-first, KLD/rel_l2 class step, ragged-K peel, M=1 expected-flat caveat).
 
+
+
+## Window 54 (2026-10-27, AWST ~07:50-09:20) — Q44 PROMOTED: lane-map verify band live on v160 (serve decode +13.8..20.9%)
+
+Manager/subagent item 11 (Q44 card session, 254 calls / 86 min) + manager promotion. The desk-earned lane-owns-group walk shipped: in-walk cross-lane ops 88 -> 0, EQUIV PASS 504/504 bit-identical non-NaN (FNV class after all -- the tail reduce order was preservable), battery withdrawal arm zero-diff, kernel A/B 12/12 disjoint-positive (+43.8..+66.7% verify band, M=1 flat control intact), serve A/B 3/3 disjoint-positive (+13.8/+16.3/+20.9% decode tok/s, non-overlap across ALL samples, crossed round order).
+
+The fold-tax model closed end-to-end this window: Q35 measured the tax linear in MT and exposed at M=4; Q44 desk proved the cure (-100% in-walk cross-lane, no saveexec exposure); the card session banked it at band AND serve. This is the first delegation-mode item to run the full arc premise->desk->card->promotion.
+
+Manager promotion ceremony: default flip (unset=1; explicit =0 = byte-identical withdrawal arm), commit 46f2291, incremental build_v160 from v159 cache (radiance-dev v1.11.0, md5 5f345d0c), spec9g recreated from LIVE inspect body onto v160 with stock env + debug liveness, /tokenize 200 in 10s, stock-env lane-map liveness proven (mt=4 lmap=1 with NO lever env), decode probe median 71.88 tok/s ctx 3072. Latent shipped m-ladder property (rows m in [MT,M) unwritten at M 5..7 mt=4; engine never issues those) flagged in the kernel and this chronicle, mirrored not introduced.
+
+Liveness-law addition: /tokenize -- NEVER /health -- is the readiness gate (Q44 child law, honored); q8x arm liveness strings: 'mxfp4 q8x dot4 arm launched (... lmap=N)' and 'mxfp4 q8x lane-map arm launched (mt=...)' under R3D_DEBUG_GEMM.
+
+
+
+## Window 55 (2026-10-27, AWST ~09:20-09:40) — Q45 named Q45a (staging barrier SOUND on the live fold arm); Q40 step-0 blocked-by-registers (FS-alone falsified)
+
+Two parallel desk children (Q45 census, Q40 step-0) while the manager ran the v160 promotion -- no card contention by design (both were CPU-side; containers explicitly hands-off).
+
+Q45: post-Q52 re-census (build_v159, 239 fns, 2059 s_barriers) found exactly two hot full-drain sites swallowing a real prefetch window, both live-dispatched in the h256 fold DBUF arm; 0x4c00 is SOUND for lgkmcnt-scoped staging (cross-lane dep is 8 LDS stores only; vmcnt gate for the thread-private prefetch already exists; no vscnt in lowering), 0xc7b4 stays verbatim (global publish, Q31 store law). GDN fused arm already donor-form everywhere -- Q20's fence law holds. Named experiment Q45a booked in the row (lever R3D_ATTN256_STAGEBAR, stall-counter prescreen before any timing leg per Q43's lesson). New objdump drift class: instruction-first printing with address only in the trailing comment (naive parsers read hot=0 silently -- the vacuous-parse family strikes again, caught by the non-zero-hit assertion law).
+
+Q40 step-0: FS template at D=256 spills WORSE (220/368 vs live 167/284, all variants; ssp clean) -- the row's premise that FS frees enough live state is FALSIFIED: oa[] stays pinned (Q23) and pass-one ADDS 16 register arrays. Q40 stays gated behind real register-discipline work (Q42 class), now with hard numbers as input. The h256 family baseline census table (delivered with it) backs the void gbs_kv register attribution.
+
+Both children honored hygiene (Q45: 59 calls/12 min; Q40: 20 calls/4 min) and the no-card contract during the promotion window.
+
