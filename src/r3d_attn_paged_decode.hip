@@ -698,8 +698,24 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
         /* GQA fold: one block per kv head (grid x = gx = kv_heads), rows = the group's
          * heads token-major. DBUF staging composes (bf16 arm only, dispatch on the
          * runtime gate -- template args must stay literal); fp8 keeps the scalar
-         * staging. Per-row arithmetic is v1's exactly -- hashes must match the plain
-         * arm bit for bit at pinned splits. */
+         * staging. Per-row SOURCE arithmetic is v1's exactly, but pinned-splits
+         * hash equality with the plain arm is a PARITY-CLASS law, not a bit law
+         * (Q53, branch card/q53-fold-fnv forensics): v_wmma_f32_16x16x16_bf16
+         * dot results are lane-parity stable, not arm-stable. The fold puts a row
+         * at tile row = head-in-group (the token selects the wave); the plain arm
+         * puts tokens on tile rows. On gfx1100 the hardware dot chain returns
+         * values differing by 1-2 f32 ulp between even and odd tile-row positions
+         * for IDENTICAL operand bytes -- witnessed inside one arm by
+         * tools/q53_probe.cpp Q53_DUPROWS (even-parity tokens agree bit for bit,
+         * odd-parity ones do not), so no source path reassociates and no source
+         * path can pin both arms to the same lane parity: packing IS the fold.
+         * Hence drift(tok, head) iff parity(tok) != parity(head-in-group): at
+         * most 1 bf16 ulp per output element (or a difference <= 2e-6 in absolute
+         * value at the near-zero softmax tails), under ~0.5% of elements, both
+         * arms inside the oracle
+         * class. Pinned-splits hashes stay a FREE bit gate for same-parity levers
+         * (any arm against itself, schedule or staging changes); fold-vs-plain is
+         * a class gate -- assert it with tools/q53_law_check.sh. */
         if      (dbuf_ok && fs && d128) R3D_DK_LAUNCHFS(attn_paged_wmma_kernel, 128, 1);
         else if (dbuf_ok && fs)         R3D_DK_LAUNCHFS(attn_paged_wmma_kernel,  64, 1);
         else if (dbuf_ok &&  d128) R3D_DK_LAUNCH4(attn_paged_wmma_kernel, 128, RAD_BF16,   1, 1, 1);
