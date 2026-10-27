@@ -884,6 +884,8 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_recurrent_update_kernel(
         s_kn[e] *= ks;
         __syncthreads();
 
+        float orow = 0.0f;                    /* the q readout, ascending d (Q52: declared
+                                               * outside if(own): live across the hoisted rms pair) */
         if (own) {
             /* The delta rule, ref's update(): decay + the S k product in one ascending d loop,
              * the beta correction, then the rank-1 add -- all register-local per column. */
@@ -905,7 +907,6 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_recurrent_update_kernel(
             r3d_sched_stop();
             }
             const float uu = bt * (vreg - sk2);
-            float orow = 0.0f;                                /* the q readout, ascending d */
             if constexpr (SB >= 3) {
                 /* fused rank-1 add + q readout: per-d values and the d-ascending
                  * accumulation orders are the verbatim loops' own, so the chain is
@@ -952,11 +953,24 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_recurrent_update_kernel(
                 }
                 s_orow[e] = orow * orow;                      /* squares for the serial rms */
             }
-            float sq2 = 0.0f;
-            __syncthreads();
-            if (e == 0) { sq2 = s_orow[0]; for (int64_t i = 1; i < V; ++i) sq2 += s_orow[i];
-                          s_sc = 1.0f / sqrtf(sq2 / (float)V + neps); }
-            __syncthreads();
+        }
+        /* Q52: the rms pair must sit at wave-uniform level. It used to live INSIDE
+         * if (own) with a matching pair in the else: with V % 32 != 0 the owning
+         * tail columns share a wave with idle threads, and such a mixed wave executes
+         * BOTH barrier pairs, skewing the s_barrier arrival count. Thread 0's serial
+         * rms read then raced -- reading uninitialized LDS at token 0 -- the s_orow
+         * stores of the tail wave: run-to-run nondeterminism at every V % 32 != 0.
+         * Same fence points, wave-uniform placement: with V % 32 == 0 the branch is
+         * wave-uniform and the shipped code was already correct, so the in-contract
+         * execution is bit-identical by construction (no arithmetic moved). */
+        __syncthreads();
+        if (e == 0) {
+            float sq2 = s_orow[0];
+            for (int64_t i = 1; i < V; ++i) sq2 += s_orow[i];
+            s_sc = 1.0f / sqrtf(sq2 / (float)V + neps);
+        }
+        __syncthreads();
+        if (own) {
             float r = orow * s_sc;
             r *= nwv;                                         /* ref's three separate steps */
             if (z) {
@@ -965,8 +979,6 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_recurrent_update_kernel(
             }
             stt2(ob + tok * o_s0b, dtO, e, r);
             sv = (dtO == RAD_F32) ? r : r3d_bf16_to_f32(r3d_f32_to_bf16(r));
-        } else {
-            __syncthreads(); __syncthreads();
         }
 
         if (oq) {
@@ -1443,6 +1455,7 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kern
         s_kn[e] *= ks;
         __syncthreads();
 
+        float orow = 0.0f;                    /* Q52: live across the hoisted rms pair */
         if (own) {
             const float dec = r3d_exp_f(gv);
             float sk2 = 0.0f;
@@ -1462,7 +1475,6 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kern
             r3d_sched_stop();
             }
             const float uu = bt * (vreg - sk2);
-            float orow = 0.0f;
             if constexpr (SB >= 3) {
                 #pragma unroll
                 for (int c = 0; c < kRecK / kSbChunk; ++c) {
@@ -1504,11 +1516,19 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kern
                 }
             }
             s_orow[e] = orow * orow;
-            float sq2 = 0.0f;
-            __syncthreads();
-            if (e == 0) { sq2 = s_orow[0]; for (int64_t i = 1; i < V; ++i) sq2 += s_orow[i];
-                          s_sc = 1.0f / sqrtf(sq2 / (float)V + neps); }
-            __syncthreads();
+        }
+        /* Q52: rms pair hoisted to wave-uniform level -- see the same comment in
+         * gdn_recurrent_update_kernel. The fused arm copied the divergent barrier
+         * pair; it is live on the serve path at V % 32 == 0 geometries today, so
+         * the in-contract execution is bit-identical by construction. */
+        __syncthreads();
+        if (e == 0) {
+            float sq2 = s_orow[0];
+            for (int64_t i = 1; i < V; ++i) sq2 += s_orow[i];
+            s_sc = 1.0f / sqrtf(sq2 / (float)V + neps);
+        }
+        __syncthreads();
+        if (own) {
             float r = orow * s_sc;
             r *= nwv;
             if (z) {
@@ -1517,8 +1537,6 @@ __global__ __launch_bounds__(kRecThreads, 1) void gdn_conv_recurrent_update_kern
             }
             stt2(ob + tok * o_s0b, dtO, e, r);
             sv = (dtO == RAD_F32) ? r : r3d_bf16_to_f32(r3d_f32_to_bf16(r));
-        } else {
-            __syncthreads(); __syncthreads();
         }
 
         if (oq) {

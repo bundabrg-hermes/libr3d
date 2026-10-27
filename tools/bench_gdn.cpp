@@ -120,7 +120,7 @@ int main(int argc, char** argv) {
     }
     CK(hipSetDevice(0));
 
-    const int K = 128, V = 128, Hv = 32, Hg = 8, GRP = Hv / Hg;
+    const int K = 128, V = (getenv("BG_V") ? atoi(getenv("BG_V")) : 128), Hv = 32, Hg = 8, GRP = Hv / Hg; /* Q52: BG_V lever for ragged-width determinism forensics; default = shipped geometry */
     const int SLOTS = 64, SW = 6;
     const int CD = 2 * Hg * K + Hv * V, CSL = 6;
 
