@@ -43,6 +43,8 @@
 /* The split-KV decode entry (r3d_attn_paged_decode.hip), reached from this row's
  * live decode band -- see the band comment in r3d_attn_paged_impl. */
 extern "C" int r3d_rad_attn_paged_decode(const RadArgs*, RadStream);
+/* the single R3D_HD256 law, defined in r3d_attn_paged_wmma.hip (q8x value rule) */
+extern "C" int r3d_hd256_on(void);
 
 namespace {
 
@@ -397,7 +399,6 @@ static int r3d_attn_paged_impl(const RadArgs* a, RadStream s) {
      * plain tile or v1) exactly as it did at v148. rows <= 8*n_seq is the
      * per-step bound that survives cu_seqlens (q_len_uniform is 0 whenever the
      * engine passes it). */
-    extern "C" int r3d_hd256_on(void);   /* the single law, r3d_attn_paged_wmma.hip */
     const int d256_mirror = r3d_hd256_on() && P.head_dim == 256 && P.kvdt == RAD_BF16;
     if (P.window == 0 && P.n_seq > 0 && P.rows <= 8 * P.n_seq &&
         (P.head_dim == 64 || P.head_dim == 128 || d256_mirror) &&

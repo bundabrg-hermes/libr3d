@@ -57,6 +57,11 @@
 #include "rad_abi.h"
 #include "r3d_attn.h"
 
+/* the single R3D_HD256 law -- defined at this file's tail (q8x value rule);
+ * read by the prefill launcher here, the decode launcher, the arena hook, and
+ * the attn_paged decode mirror. */
+extern "C" int r3d_hd256_on(void);
+
 namespace {
 
 /* dtype-widening helpers: bit-identical to the v1 kernel's (same contracts, see
@@ -228,7 +233,6 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
      * backstops is the ordinary contract. Accept evidence: COVERAGE windows 35/37/38
      * (fragment-class drift accepted by the operator; split-KV decode 3.8-5.7x,
      * numeric band flat across SPL 1..64). */
-    extern "C" int r3d_hd256_on(void);   /* the single law, defined at file tail */
     const int hd256 = r3d_hd256_on();
     if (P.head_dim != 64 && P.head_dim != 128 && !(hd256 && P.head_dim == 256))
         return RAD_E_UNSUPPORTED;
