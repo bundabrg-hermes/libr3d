@@ -234,15 +234,17 @@ static int r3d_rmsnorm_impl(const RadArgs* a, RadStream s) {
 
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
 
-    /* Q32 lever (two-state, the R3D_BF16_DPP law; shipped DARK: 0 = the scalar
-     * kernel verbatim). The vector arm takes only rows the b128 walk can serve
-     * unchanged: n >= 2048 (head dims 128/256 and every small row stay scalar
-     * by geometry), n % 8 == 0, both row pitches a multiple of 8 (every row
-     * base then inherits the base alignment), and 16B-aligned x/y/w bases.
-     * Any miss falls to the untouched scalar kernel -- refuse, never approximate. */
+    /* Q32 lever. PROMOTED DEFAULT-ON after adjudication (A/B: +54-56% at every
+     * gated shape, hot and cold, disjoint ranges). R3D_RMS_VEC=0 is the
+     * kill-switch back to the scalar kernel. The vector arm takes only rows the
+     * b128 walk can serve unchanged: n >= 2048 (head dims 128/256 and every
+     * small row stay scalar by geometry), n % 8 == 0, both row pitches a
+     * multiple of 8 (every row base then inherits the base alignment), and
+     * 16B-aligned x/y/w bases. Any miss falls to the untouched scalar kernel --
+     * refuse, never approximate. */
     static const int rms_vec = []{
         const char* e = getenv("R3D_RMS_VEC");
-        return e && atoi(e) != 0 ? 1 : 0;
+        return !e || atoi(e) != 0 ? 1 : 0;
     }();
     const bool vec_ok = rms_vec && n >= 2048 && (n % 8) == 0
                      && (x_ld % 8u) == 0 && (y_ld % 8u) == 0
