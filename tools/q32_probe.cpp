@@ -69,7 +69,7 @@ struct Guard {
         for (long i = 0; i < kGuard; ++i) if (lo[i] != 0xcd || hi[i] != 0xcd) return false;
         return true;
     }
-    void free() { if (base) hipFree(base); }
+    void free() { if (base) (void)hipFree(base); }
 };
 
 int main(int argc, char** argv) {
