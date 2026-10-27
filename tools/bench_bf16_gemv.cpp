@@ -8,8 +8,10 @@
 //     rate -- a rate from a dead row is a lie. The dpp=<N> liveness line from
 //     R3D_DEBUG_GEMM must name the arm each leg actually rode.
 // Build/run (in radiance-dev ON the card, gfx1100 pinned via ROCR_VISIBLE_DEVICES):
-//   hipcc -O1 -std=c++20 -I/opt/radiance/include/radiance -w tools/bench_bf16_gemv.cpp \
-//     -o /tmp/bbf -ldl
+//   hipcc -O1 -std=c++20 -I/opt/radiance/include/radiance -Wall \
+//     /work/tools/bench_bf16_gemv.cpp -o /scratch/bbf -ldl
+//   (the -w inherited from bench_w2a8's doc comment once hid a format-arg
+//    skew that printed heap pointers as yhash -- keep -Wall on this file)
 //   ROCR_VISIBLE_DEVICES=1 LIBR3D_SO=$PWD/build_v152/radiance_home/kernels/libr3d.so \
 //     R3D_DEBUG_GEMM=1 /tmp/bbf <K> <N> <REPS> [ROT]
 #include <hip/hip_runtime.h>
@@ -34,7 +36,7 @@ int main(int argc, char** argv) {
     const int       rot  = argc > 4 ? atoi(argv[4]) : 1;
     const long long M = 1;   /* the GEMV band is M == 1 by dispatch law */
     if (K <= 0 || N <= 0 || K % 8 || rot < 1 || rot > 4) {
-        printf("usage: bench_bf16_gemv K(%8) N REPS ROT(<=4)\n"); return 2; }
+        printf("usage: bench_bf16_gemv K(K%%8) N REPS ROT(<=4)\n"); return 2; }
 
     void* dl = dlopen(getenv("LIBR3D_SO") ? getenv("LIBR3D_SO")
                                           : "/build/radiance_home/kernels/libr3d.so",
@@ -46,7 +48,7 @@ int main(int argc, char** argv) {
     hipDeviceProp_t prop;
     die("getprops", hipGetDeviceProperties(&prop, 0));
     printf("DEV name=%s arch=%s l2Bytes=%zu memGB=%.1f\n", prop.name, prop.gcnArchName,
-           prop.l2CacheSize, prop.totalGlobalMem / 1073741824.0);
+           (size_t)prop.l2CacheSize, prop.totalGlobalMem / 1073741824.0);
 
     uint32_t st = 0x2468ace1u;
     auto rnd = [&]() { st ^= st << 13; st ^= st >> 17; st ^= st << 5; return st; };
@@ -123,7 +125,7 @@ int main(int argc, char** argv) {
 
     printf("ROW M=%lld K=%lld N=%lld rot=%d reps=%d | t_med=%.3f ms  bf16-stream %.1f GB/s"
            "  nonzero=%zu/%lld yhash=%016llx %s\n",
-           M, K, N, rot, reps, med * 1e3, gbs, nz, (long long)(M * N),
+           M, K, N, rot, reps, med * 1e3, gbs, nz, (long long)(M * N), yhash,
            nz ? "" : " <-- DEAD ROW, RATE IS A LIE");
     return nz ? 0 : 4;
 }
