@@ -31,6 +31,8 @@
 #include "r3d_dump.h"
 
 #include <cstdlib>
+#include <cstring>
+#include <cstdio>
 
 #include "rad_abi.h"
 #include "rad_plugin.h"
@@ -148,10 +150,40 @@ __device__ __forceinline__ float r3d_dot8_bf16(const uint4& av, const uint4& bv,
     return acc;
 }
 
+/* Q33 (REVIEW_QUEUE): the GEMV butterfly as DPP row_xmask + v_permlanex16 --
+ * a TRANSFER of two shipped mechanisms onto this row: Q6/Q22's DPP16 row
+ * control (0x160|mask fetches lane n^mask inside the 16-lane row on VALU;
+ * __shfl_xor lowers to ds_bpermute_b32 on the DS pipe) and Q24's xor-16 tail
+ * as ONE v_permlanex16_b32 (ISA p.432 identity laneSel; the builtin's THIRD
+ * arg must land in the LOW SGPR word -- the swapped pairing silently gathers
+ * the wrong nibble stream, no crash, no build error). Bit-identical by
+ * construction: every stage adds the SAME partner value in the SAME order as
+ * the shipped butterfly (16,8,4,2,1 descending), adjudicated lane-exact by
+ * tools/q33_probe.hip BEFORE any A/B (the Q24 three-way probe law). The DPP
+ * control word must be a compile-time constant -- hence the template. Lever
+ * R3D_BF16_DPP is three-state (the R3D_W2_DPP law): 0 keeps the verbatim shfl
+ * chain below (literal), 1 rides the DPP row arms, 2 also rides permlanex16
+ * for the xor-16. */
+template <int MASK>
+__device__ __forceinline__ uint32_t bf16_dpp_x(uint32_t p) {
+    return __builtin_amdgcn_update_dpp(p, p, 0x160u | MASK, 0xf, 0xf, 0);
+}
+__device__ __forceinline__ uint32_t bf16_perm_x16(uint32_t v) {
+    return __builtin_amdgcn_permlanex16(v, v, 0x76543210u, 0xFEDCBA98u, false, false);
+}
+__device__ __forceinline__ void bf16_fold_bfly_f32(float* s, const int dpp) {
+    *s += dpp >= 2 ? __uint_as_float(bf16_perm_x16(__float_as_uint(*s)))
+                   : __shfl_xor(*s, 16);                /* Q24 helper; Q6 tail */
+    *s += __uint_as_float(bf16_dpp_x<8>(__float_as_uint(*s)));
+    *s += __uint_as_float(bf16_dpp_x<4>(__float_as_uint(*s)));
+    *s += __uint_as_float(bf16_dpp_x<2>(__float_as_uint(*s)));
+    *s += __uint_as_float(bf16_dpp_x<1>(__float_as_uint(*s)));
+}
+
 __global__ __launch_bounds__(kGemvThreads) void gemv_nt_bf16_kernel(
     const uint16_t* __restrict__ A, const uint16_t* __restrict__ B,
     uint16_t* __restrict__ Y, float* __restrict__ Yf,
-    int N, int K, int64_t b_pitch) {
+    int N, int K, int64_t b_pitch, const int dpp) {
 
     const int lane = threadIdx.x & (kWave - 1);
     const int row  = blockIdx.x * kGemvRows + (threadIdx.x / kWave);
@@ -165,9 +197,12 @@ __global__ __launch_bounds__(kGemvThreads) void gemv_nt_bf16_kernel(
             acc = r3d_dot8_bf16(av[v], bp[v], acc);   /* A is one row: same vector index */
     }
 
-    #pragma unroll
-    for (int o = kWave / 2; o > 0; o >>= 1)
-        acc += __shfl_xor_sync(0xffffffffffffffffull, acc, o);  /* ROCm 10.1: mask must be 64-bit */
+    if (dpp) bf16_fold_bfly_f32(&acc, dpp);   /* Q33 arms: bit-identical by probe law */
+    else {
+        #pragma unroll
+        for (int o = kWave / 2; o > 0; o >>= 1)
+            acc += __shfl_xor_sync(0xffffffffffffffffull, acc, o);  /* ROCm 10.1: mask must be 64-bit */
+    }
 
     /* Store flat at [row], NOT row*y_pitch: y_pitch is the pitch BETWEEN M rows (the
      * ref fold), and this kernel is the M == 1 band -- the tile kernel's m = 0 store is
@@ -241,12 +276,23 @@ static int gemm_nt_launch(const RadArgs* a, RadStream s, const char* n_name, con
      * for all shapes, merely slow at M = 1. */
     if (M == 1 && (K % 8) == 0 && (b_pitch % 8) == 0 &&
         ((uintptr_t)A->data & 15u) == 0 && ((uintptr_t)B->data & 15u) == 0) {
+        /* Q33 lever (three-state, the R3D_W2_DPP law; SHIPPED DARK on v152:
+         * default 0 = the verbatim shfl butterfly, so the binary is behavior-
+         * identical to v151 until the same-binary kernel A/B adjudicates). */
+        static const int bf16_dpp = []{
+            const char* e = getenv("R3D_BF16_DPP");
+            if (e && !std::strcmp(e, "1")) return 1;
+            if (e && !std::strcmp(e, "2")) return 2;
+            return 0; }();
+        if (getenv("R3D_DEBUG_GEMM"))
+            fprintf(stderr, "libr3d: bf16 gemv arm launched (N=%lld K=%lld dpp=%d)\n",
+                    N, K, bf16_dpp);
         hipLaunchKernelGGL((gemv_nt_bf16_kernel), dim3((unsigned)((N + kGemvRows - 1) / kGemvRows)),
                            dim3(kGemvThreads), 0, stream,
                            (const uint16_t*)A->data, (const uint16_t*)B->data,
                            (uint16_t*)Y->data,
                            Y->dtype == RAD_F32 ? (float*)Y->data : nullptr,
-                           (int)N, (int)K, b_pitch);
+                           (int)N, (int)K, b_pitch, bf16_dpp);
         return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
     }
 
