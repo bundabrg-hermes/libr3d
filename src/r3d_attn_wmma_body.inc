@@ -623,7 +623,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             } else {
             roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP,      a0, C::kSP, roCW::mem_row_major);
             roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP + 16, a1, C::kSP, roCW::mem_row_major);
-            r3d_stage_bar<SBZ>();                              /* K(t)'s fragments have left [Q45a-site1] */
+            r3d_stage_bar<SBZ>();  /* K(t)'s fragments have left. Q45a NAMED SITE: the 0x4c00-class staging barrier -- the drain here swallows the 16 b128 K/V register prefetch; cross-lane dep at this barrier is the 8 preceding LDS staging stores only, and the shipped lowering carries no vscnt. The only such site in the current binary; the vscnt-bearing 0xc7b4/0xd234-class barriers stay compiler-emitted verbatim (Q31 store law). */
             if (tid < kBM && tid < valid) {
                 const int64_t rowpos = rowpos_of(tid);
                 const float* srow = Ssp + tid * C::kSP;
@@ -646,16 +646,16 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                     LSP[tid] += sum;
                 }
             }
-            r3d_stage_bar<SBZ>();                              /* CBc reads complete [Q45a-site2] */
+            __syncthreads();                                   /* CBc reads complete [Q45a-site2:OFF] */
             }
             st_kv_regs<D, PAD>(kx, KVp);                            /* K(t+1) -> LDS */
             address_tile(t + 2, RBc, CBc);                     /* refill the freed slot */
             { int64_t* tmp = RBc; RBc = RBn; RBn = tmp; }
             { unsigned char* tmp = CBc; CBc = CBn; CBn = tmp; }
-            r3d_stage_bar<SBZ>();
+            __syncthreads();
         }
 
-        /* pass two, pipelined */   /* [Q45a-site3 pass1 close] */
+        /* pass two, pipelined */   /* [Q45a-site3 pass1 close:OFF] */
         address_tile(et0, RBc, CBc);
         address_tile(et0 + 1, RBn, CBn);
         __syncthreads();
@@ -699,7 +699,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             } else {
             roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP,      a0, C::kSP, roCW::mem_row_major);
             roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP + 16, a1, C::kSP, roCW::mem_row_major);
-            r3d_stage_bar<SBZ>();                              /* b1: K(t)'s fragments left; S visible [Q45a-site4] */
+            __syncthreads();                                   /* b1: K(t)'s fragments left; S visible [Q45a-site4:OFF] */
             for (int e = tid; e < kBM * kBN; e += kThreads) {  /* S -> P, all four waves */
                 const int r = e >> 5, jj = e & 31;
                 float pv = 0.0f;
@@ -713,7 +713,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             st_kv_regs<D, PAD>(vc, KVp);                            /* V(t) -> LDS (K(t) dead per b1) */
             ld_kv_regs<D, KVDT>(vc, RBn, P, D, kvvec);         /* V(t+1) in flight */
             if (SB) r3d_attn_sched_stop();                     /* Q23: cap the in-flight window */
-            r3d_stage_bar<SBZ>();                              /* b2: Psp + V(t) visible [Q45a-site5] */
+            __syncthreads();                                   /* b2: Psp + V(t) visible [Q45a-site5:OFF] */
             for (int jk = 0; jk < kBN / 16; ++jk) {
                 roCW::fragment<roCW::matrix_a, 16, 16, 16, bf16, roCW::row_major> fap;
                 roCW::load_matrix_sync(fap, Psp + (w * 16) * C::kPP + jk * 16, C::kPP,
@@ -726,12 +726,12 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                     roCW::mma_sync(oa[d0], fap, fbv, oa[d0]);
                 }
             }
-            r3d_stage_bar<SBZ>();                              /* b3: V(t)'s fragments left [Q45a-site6] */
+            __syncthreads();                                   /* b3: V(t)'s fragments left [Q45a-site6:OFF] */
             st_kv_regs<D, PAD>(kx, KVp);                            /* K(t+1) -> LDS */
             address_tile(t + 2, RBc, CBc);
             { int64_t* tmp = RBc; RBc = RBn; RBn = tmp; }
             { unsigned char* tmp = CBc; CBc = CBn; CBn = tmp; }
-            r3d_stage_bar<SBZ>();                              /* b4: K(t+1)+addressing visible [Q45a-site7] */
+            __syncthreads();                                   /* b4: K(t+1)+addressing visible [Q45a-site7:OFF] */
         }
     } else {
     /* ================= pass one: per-row running max m and exp-sum l ================= */

@@ -143,7 +143,7 @@ using bf16 = roCW::bfloat16_t;
         * the launcher's gcnArchName gate never dispatches it on such a chip. */
 
 namespace {
-template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0, int SB = 0, int FS = 0>
+template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0, int SB = 0, int FS = 0, int SBZ = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams) {}
 template <int D, int KVDT, int SPLITK>
 __global__ __launch_bounds__(kT) void attn_paged_wmma_kernel2(R3dAttnParams) {}
@@ -653,8 +653,8 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
      * r3d_attn_wmma_body.inc). Doubles only the DBUF=1 h256 instantiations. */
     #define R3D_DK_L256(DB, PAD, FD)                                                                     \
         do {                                                                                             \
-            if (DB && stagebar256) { R3D_DK_L256_S(DB, PAD, FD, 1) }                                     \
-            else                   { R3D_DK_L256_S(DB, PAD, FD, 0) }                                     \
+            if (DB && FD && stagebar256) { R3D_DK_L256_S(DB, PAD, FD, 1); }                                 \
+            else                         { R3D_DK_L256_S(DB, PAD, FD, 0); }                                 \
         } while (0)
     #define R3D_DK_L256_S(DB, PAD, FD, SB)                                                               \
         do {                                                                                             \
