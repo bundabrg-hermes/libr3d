@@ -3775,3 +3775,13 @@ Q40 step-0: FS template at D=256 spills WORSE (220/368 vs live 167/284, all vari
 
 Both children honored hygiene (Q45: 59 calls/12 min; Q40: 20 calls/4 min) and the no-card contract during the promotion window.
 
+
+
+## Window 56 (2026-10-27, AWST ~09:45-11:00) — Q49 PROMOTED to v161: hot elementwise band vectorised (serve +23%); NaN-sign commute law pinned; family majority proven cold
+
+Manager/subagent item 13 (Q49, attribution->build->card in one child, 173 calls / 53 min) + manager promotion. The row's own gate did the triage: live-graph capture proved rope fused and store_kv prefill-only, killing most of the reviewer's family list before any code; two members were hot (gated_quant_fp8 at 33 launches/decode-step ~ 10x the rmsnorm bytes; mul at 9), both vectorised, both bit-identical (4737-row battery byte-identical), both disjoint-positive at kernel level (+80.6/+53-55%), and the serve moved +23% paired (4/4 rounds).
+
+NaN-SIGN COMMUTE LAW (new drift class): RDNA v_mul propagates the FIRST NaN operand; LLVM may commute mathematically-equal products differently between arms, flipping NaN SIGN payloads that bit-compare as different. Any rewrite that gives the compiler commuting freedom on NaN-capable products must be pinned (opaque +v barrier pattern in tools/q49_nan_diag.hip) or probed with raw NaN payloads.
+
+Promotion: defaults flipped (explicit =0 stays verbatim withdrawal), v161 (md5 be50cd43) live on spec9g, R3D_DEBUG_VEC liveness naming arm=vec on the live graph, decode probe median 80.70 tok/s (from 71.88 pre-Q49 same rig, and the child's paired A/B measured +23% inside the session). Two promotions this delegation session (v160, v161) — the queue's 'bench-order' thesis earned its keep: Q44 band fix first, then the band's neighbor elementwise ops.
+
