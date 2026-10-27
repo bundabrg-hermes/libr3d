@@ -3725,3 +3725,13 @@ Escalation-grade finding: the serve-dispatched FUSED conv-recurrent kernel carri
 
 Promotion: merged to main (91c31ea). NO serve swap (fix inert at V=128; next mount bump carries it; v158 = drafter build). Audit grep-pattern booked for future code review: syncthreads inside V-derived divergent branches.
 
+
+
+## Window 51 (2026-10-27, AWST ~06:45-07:10) — Q53 CLOSED: WMMA bf16 dot parity law (hardware); pinned-splits cross-arm FNV downgraded to class gate; comment + law-check tool merged
+
+Manager/subagent item 8 (Q53, 117 calls / 21 min). The parity-shaped drift between fold and plain arms at pinned splits is a HARDWARE PROPERTY of gfx1100: v_wmma_f32_16x16x16_bf16 accumulators are lane-parity stable, NOT arm-stable -- identical operand bytes come back 1-2 f32 ulp apart depending on whether the fragment sits on an even or odd tile row. The DUPROWS witness is textbook (all tokens = token 0's Q row: intra-arm drift exactly on parity mismatch, none on parity match). No compiler reassociation involved; no fix-code path (packing IS the fold's point).
+
+Consequence booked into the launcher comment and this chronicle: cross-arm pinned-splits bit-identity is only free for SAME-PARITY comparisons; fold-vs-plain is a CLASS gate (<=1 bf16 ulp on <0.5% of elements, parity law exact, tails <=2e-6 absolute). tools/q53_law_check.sh enforces the class (PASS: 21/16384 = 0.13%, zero parity or ulp violations). Every future attention FNV gate (Q41 first) must use the class gate when arms differ in row parity.
+
+Manager verification: diff is comment-only in src (20 lines, all comment), tools additions only; merged; battery waived per same-binary law.
+
