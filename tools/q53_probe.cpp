@@ -58,8 +58,20 @@ int main(int argc, char** argv) {
     if (!entry) { printf("dlsym: %s\n", dlerror()); return 1; }
 
     std::vector<uint16_t> hq((size_t)rows * ROWW), hkv((size_t)NB * KVH * BS * SLOTW);
-    for (auto& v : hq)  { float f; do f = (float)rndu(-2.0, 2.0); while (f == 0.0f); v = f32_bf16(f); }
-    for (auto& v : hkv) { float f; do f = (float)rndu(-2.0, 2.0); while (f == 0.0f); v = f32_bf16(f); }
+    const bool exact = getenv("Q53_EXACT") != nullptr;   // power-of-2 operands: every QK dot is
+                                                          // an exact f32 integer-scaled sum, so
+                                                          // any surviving diff is structural,
+                                                          // never addition-order rounding
+    auto gen = [exact]() {
+        if (exact) {
+            static const float pw[] = {1.f, 2.f, 4.f, 8.f, -1.f, -2.f, -4.f, -8.f};
+            return (double)pw[rnd32() % 8];
+        }
+        double f; do f = rndu(-2.0, 2.0); while (f == 0.0f);
+        return f;
+    };
+    for (auto& v : hq)  v = f32_bf16((float)gen());
+    for (auto& v : hkv) v = f32_bf16((float)gen());
     std::vector<int32_t> hbt(NB), hsu(1, CTX), hcu(2);
     for (int i = 0; i < NB; i++) hbt[i] = i;
     hcu[0] = 0; hcu[1] = rows;
