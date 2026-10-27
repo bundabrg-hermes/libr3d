@@ -3580,3 +3580,49 @@ v149 serve on the hd256 model 16Q/4KV, spec3, 1281 positions):
   lands — background watcher pattern instead. (3) The Q24 probe->arms->census
   ->battery->A/B gate script shape transfers cleanly to fold items
   (q33_gates.sh is the template).
+
+## WINDOW 43 (2026-10-27, AWST ~13:30-14:20) — Q32 SHIPPED: VECTISED RMSNorm, v153 PROMOTED (SERVE ARTIFACT)
+- BUILD a40fc94(+fixes): rmsnorm_kernel_vec<WF32> -- 8 contiguous bf16/thread as
+  ONE uint4 (global_load/store_b128 confirmed in the device object: load=3-4,
+  store=1 per instantiation), gated n>=2048 && n%8==0 && pitch%8==0 && 16B bases;
+  the scalar kernel stays verbatim under R3D_RMS_VEC=0 (kill-switch). Per-element
+  store chain is the scalar's verbatim (r3d_scale_pair, same f32 associativity,
+  one RTNE); the ONLY arithmetic delta is the sum-of-squares reassociation.
+- PROBES (tools/q32_probe.cpp, stay in tree): 19-leg matrix (head 128/256, gate
+  1024, hidden 2048/4096/5120/6144 x gain none/bf16/f32, ragged 2047/4095,
+  rejected-alignment x/y/w, pitch 2x and pitch-odd, wadd/mult legs), CPU ref,
+  sentinel red-zones, per-leg yhash + ARMWANT/liveness cross-check + gfx1100
+  device assertion. PASS both arms and default-on: 9 vec / 10 scalar legs exactly
+  as gated; ZERO cross-arm hash drift (reassociation crossed no rounding
+  boundary on random planes -- drift is possible, tolerance gates kept anyway).
+- BATTERY: 7/7 OK; fingerprints zero-diff vs v151 EXCEPT 22 rows = rmsnorm
+  n=5120 rel_l2 6.7e-5..1.5e-4 moving by ~1e-6 (all ok vs 4e-03 bar; slightly
+  BETTER toward ref), head dims EXACT -- the gate held. Liveness inside the
+  harness (instrumented stock re-run): arm=vec 20 / arm=scalar 20.
+- A/B (same binary, exclusive card, spec9g stopped mid-script per standing grant,
+  restored after; tools/bench_rmsnorm.cpp batch-timed, -Wall): +54.1/+54.1/+55.6/
+  +54.8% (4096x1024 hot, cold rot4; 2048x4096 cold; 6144x512 f32-gain cold),
+  medians over 5 rounds, ranges DISJOINT; 256-control +0.7% (gate keeps it
+  scalar, timing unchanged). Mechanism as the row predicted: scalar ran 287-390
+  GB/s (issue-bound, under the ~960 DRAM ceiling) -> LSU-op starvation, not
+  bandwidth; vec climbs to 630-750 GB/s.
+- PROMOTION: v153 = serve artifact. spec9g remounted build_v153 (md5-checked
+  inside the container), tokenize-200 readiness, restarts 0; old container kept
+  stopped as spec9g_v151_rollback (lineage: v112...v150 all kept). DECODE A/B
+  (gen=512, n=4/arm, warmed prompt): v153 44.72 vs v151 41.52 tok/s mean
+  (+7.7%, medians 45.24 vs 41.98 = +7.8%, one overlap point); draft acceptance
+  unchanged (both 308-319/round) -- the spec9g speed record is now 44.72.
+- PROCESS FINDINGS: (1) PHANTOM-PASS GAP FOUND IN THE HARNESS: tools/gate.sh
+  whitelists forwarded envs and R3D_BF16_DPP was never in it -- Q33's lever-2
+  battery legs silently rode the DEFAULT arm (harmless only because that fold is
+  bit-identical; for any drifting lever it is a false zero-diff). gate.sh now
+  forwards R3D_RMS_VEC/R3D_DEBUG_RMS and the battery legs carry liveness greps;
+  Q33's lever-2 battery claim is downgraded in retrospect to "ran default" (its
+  bench arms, which DID get the env, carry the identity). (2) The probe's first
+  2 FAIL legs were probe-side (forgot RAD_F64 wadd/mult -- entry silently used
+  defaults); kernel never implicated; RAD_F64/RAD_INT macros are in rad_types.h,
+  NOT rad_abi.h. (3) carve_dis.py needle is a code-object selector + full-TU
+  dump -- per-kernel counts need symbol-section parsing (the substring rmsnorm_
+  kernel matches rmsnorm_kernel_vec too). Artifacts cat:~/scratch/r3d/
+  q32_arm{0,1,D}.txt, q32_ab.log, q32_ab2.log, q32_batt.log, q32_serve_ab2.log,
+  v153_*.md, build_v153.log.
