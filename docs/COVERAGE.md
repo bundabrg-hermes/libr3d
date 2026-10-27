@@ -3477,3 +3477,61 @@ v149 serve on the hd256 model 16Q/4KV, spec3, 1281 positions):
   gfx1100 rank 0; restarts 0; chat probe live). v148 serve kept stopped as
   spec9g_v148_rollback. LINEAGE: v148 SUPERSEDED; v150 is the serve/drafter-
   mount artifact; v146/v147/v149 never promoted.
+
+## Window 40 (2026-10-27) — Q27 SHIPPED: fused QKV prologue on gfx1100, v151 promoted (serve artifact)
+- SCOPE (from the window-39 trace): port libr4d's `qk_norm_rope_gate` +
+  `qk_norm_rope_gate_kv_store_bf16` to libr3d and register the schemas; the
+  graph template auto-wires them via rad_op_declared (replacing
+  rmsnorm(q/k) + rope(q/k) + kv_store per gated-attn layer). fp8 cache fold NOT
+  ported — no native E4M3 on RDNA3, bf16-KV-only scope law (kv_store_bf16
+  precedent). Operand/parameter names verbatim libr4d.
+- CODE 712903a (10:40): src/r3d_qk_norm_rope_gate.hip (342 lines) + r3d_rows
+  registrations + tools/test_qk_fuse.cpp. Bit-identity anchored to libr3d's OWN
+  stack: fold transcribes r3d_rmsnorm's butterfly+ascending-wave partials, the
+  rotation consumes the table rope_table_f32 already fills, the cache write
+  copies the same bytes kv_store_bf16 copies. Differential harness
+  device-vs-device: 47/47 byte-identical across every compiled head width,
+  partial rotary, both gain widths, both position widths, gate copy, padded
+  slots, k-only. Census (build_v151): 18 code objects, 18 VGPR, 0 spill, 0
+  priv, 32B LDS; Q31 barrier law clean (2081 barriers, 0 pending global stores).
+- INCIDENT + FIX b174055 (11:21): the first port demanded row-major
+  contiguity of q/k/v planes; live spec9g proved the graph hands those planes
+  as SLICES — q_gate rank-3 {tokens, heads, 2*head_dim} with packed heads, k/
+  k_out/v pitched views of wider allocations, cos/sin a [rows, rot] window of
+  the shared table. RAD_E_STRIDE refuse-at-issue is FATAL to the engine step
+  (planner treats it as misselection: the step aborts) — the contiguity check
+  stopped live serve. The law now: rank-2 {tok, cols} or rank-3 {tok, head,
+  cols} with packed inner extents, unit last stride, pitch >= row read from
+  stride[rank-2]; cs_rows from the declared extent (numel/rot would read 4x
+  past a pitched table). R3D_QK_TRACE=1 names the refused operand + dumps its
+  descriptor: a fatal refusal must be findable from the serve log. Differential
+  re-run through pitched views with poison in the padding lanes: 47/47
+  byte-identical.
+- GATES (card exclusive, spec9g stopped for battery; artifacts
+  cat:~/scratch/r3d/v151_*): battery 7/7 OK default env; fingerprints v151 vs
+  v150 = 22 uniform lines across ALL SEVEN packs — pure registration
+  accounting (op vocab 205->207, declared rows 57->59 = the two new rows,
+  numeric columns byte-equal incl. the 6.99e-03 error column). Live serve
+  probes: qk_norm_rope_gate_kv_store issued=True across 9 layers, unfused
+  rope_bf16/kv_store_bf16 issued=False; boot prints the wiring
+  `qk_norm_rope_gate_kv_store -> qk_norm_rope_gate_kv_store_bf16`.
+- SERVE A/B (the fused prologue is default-ON — no lever; graph presence is
+  the gate): spec9g v151 vs v150_rollback, warm + 3 rounds each, decode
+  gen=512: v151 [48.9 44.9 50.9 46.8 45.7 47.5] mean 47.45; v150 [47.6 46.3
+  44.9 45.9 45.0 44.2] mean 45.65 -> +3.9% mean (+3.7% median 47.15 vs 45.45),
+  spreads overlap at the single point 44.9 — a small consistent win, honest
+  n=6. spec9g LIVE on build_v151 (mount md5-checked, gfx1100 rank 0, health
+  200, restarts 0); rollback spec9g_v150_rollback (stopped). LINEAGE: v150
+  SUPERSEDED; v151 is the serve/drafter-mount artifact.
+- LESSONS: (1) a contiguity/shape refusal inside a graph-issued kernel is not
+  a graceful fallback — the planner aborts the STEP; accept the geometry the
+  graph actually passes (pitched/rank-3), and make refusals nameable in the
+  serve log. Cold-call dense-fixture tests are structurally blind to this
+  class. (2) Uniform difflines across all fingerprint packs = registration
+  accounting signature; verify by reading the lines, not by hoping. (3) ssh-
+  nested double-quoted awk silently zeroed the A/B mean (MEAN 0 n=6) — parse
+  serve logs with python, not nested-quote awk. NOTE ON RECORD: the
+  orchestrating session died (known replay-duplication overflow family) right
+  after parsing the raw A/B lines; the mean recompute and all bookkeeping in
+  this entry were completed by its successor session, same artifacts verified
+  on disk.
