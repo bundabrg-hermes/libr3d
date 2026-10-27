@@ -3338,7 +3338,7 @@ tautology/zero-fill chronicle); header date 2026-10-26.
 State: local == GitHub == cat, trees clean. Q30 (card session) is now the ONLY
 ready item in the queue.
 
-## Window 35 (2026-10-27) — issue #11 milestone 3: hd256 split-KV decode arm (R3D_HD256, code + gates + bench)
+## Window 37 (2026-10-27) — issue #11 milestone 3: hd256 split-KV decode arm (R3D_HD256, code + gates + bench)
 
 The two booked items the operator greenlit together: build milestone 3, then the
 teacher-forced KLD pair as the hd256 accept-evidence. This window closes the build;
@@ -3392,7 +3392,7 @@ the row-count assertion (81/round) caught the empty run. Fixed with SWEEP_ROUND 
 KLD accept-evidence pair (teacher-forced, differential law, v149 serve on
 qwen35-9b-mxfp4 = the hd256 serve geometry 16Q/4KV): see next entry.
 
-KLD accept-evidence pair, window 35 continued (teacher-forced, differential law,
+KLD accept-evidence pair, window 37 continued (teacher-forced, differential law,
 v149 serve on the hd256 model 16Q/4KV, spec3, 1281 positions):
 - Boot arithmetic: flashnext's deploy took the host's third-serve headroom
   (avail 3.3 GB, serve wants ~4.5 with the engine's default 4.0 GiB
