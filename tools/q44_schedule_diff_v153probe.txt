@@ -1,0 +1,39 @@
+  L0 [0x4afc,0x4efc] n=224 bperm=6 plx=1 dppmv=4 ds=0 dot4=2 add3=0 cndmask=0 gload=7 XOP=11
+  L1 [0x4580,0x48cc] n=178 bperm=6 plx=1 dppmv=4 ds=0 dot4=2 add3=0 cndmask=0 gload=6 XOP=11
+  L2 [0x49a8,0x4b68] n=91 bperm=0 plx=0 dppmv=0 ds=0 dot4=0 add3=1 cndmask=0 gload=0 XOP=0
+SYM _Z16q44_formA_kernelILi1EEvPKhPKaPKfS5_Ptiiilliii n=593 vgpr=27 sgpr=26 vsp=0 ssp=0 TOT-XOP=22 XOP-in-loops=22 XOP-tail=0
+  TOT bperm=12 plx=2 dppmv=8 rfl=0 ds=0 dot4=4 add3=1 cndmask=0 vadd_f32=12 vmul_f32=8 gload=17 cvt=0 | medXOP->cons=2 maxfoldrun=8 runs=9 saveexec=0
+  L0 [0x573c,0x5f14] n=434 bperm=12 plx=2 dppmv=8 ds=0 dot4=4 add3=0 cndmask=0 gload=10 XOP=22
+  L1 [0x5020,0x5654] n=342 bperm=12 plx=2 dppmv=8 ds=0 dot4=4 add3=0 cndmask=0 gload=9 XOP=22
+SYM _Z16q44_formA_kernelILi2EEvPKhPKaPKfS5_Ptiiilliii n=938 vgpr=29 sgpr=41 vsp=0 ssp=0 TOT-XOP=44 XOP-in-loops=44 XOP-tail=0
+  TOT bperm=24 plx=4 dppmv=16 rfl=0 ds=0 dot4=8 add3=2 cndmask=0 vadd_f32=24 vmul_f32=16 gload=23 cvt=0 | medXOP->cons=2 maxfoldrun=13 runs=18 saveexec=0
+  L0 [0x7044,0x7c1c] n=664 bperm=24 plx=4 dppmv=16 ds=0 dot4=8 add3=0 cndmask=0 gload=16 XOP=44
+  L1 [0x62d8,0x6e04] n=622 bperm=24 plx=4 dppmv=16 ds=0 dot4=8 add3=0 cndmask=0 gload=15 XOP=44
+  L2 [0x7cd0,0x7db0] n=45 bperm=0 plx=0 dppmv=0 ds=0 dot4=0 add3=2 cndmask=0 gload=0 XOP=0
+SYM _Z16q44_formA_kernelILi4EEvPKhPKaPKfS5_Ptiiilliii n=1615 vgpr=32 sgpr=49 vsp=0 ssp=0 TOT-XOP=88 XOP-in-loops=88 XOP-tail=0
+  TOT bperm=48 plx=8 dppmv=32 rfl=0 ds=0 dot4=16 add3=4 cndmask=0 vadd_f32=48 vmul_f32=32 gload=35 cvt=0 | medXOP->cons=2 maxfoldrun=14 runs=31 saveexec=0
+  L0 [0x8458,0x9ea4] n=1454 bperm=48 plx=8 dppmv=32 ds=0 dot4=16 add3=8 cndmask=0 gload=27 XOP=88
+  L1 [0x9e00,0xb458] n=1256 bperm=48 plx=8 dppmv=32 ds=0 dot4=16 add3=0 cndmask=0 gload=28 XOP=88
+  L2 [0x818c,0x88d0] n=389 bperm=0 plx=0 dppmv=0 ds=0 dot4=0 add3=8 cndmask=0 gload=4 XOP=0
+SYM _Z16q44_formA_kernelILi8EEvPKhPKaPKfS5_Ptiiilliii n=2979 vgpr=36 sgpr=73 vsp=0 ssp=0 TOT-XOP=176 XOP-in-loops=176 XOP-tail=0
+  TOT bperm=96 plx=16 dppmv=64 rfl=0 ds=0 dot4=32 add3=8 cndmask=0 vadd_f32=96 vmul_f32=64 gload=59 cvt=0 | medXOP->cons=2 maxfoldrun=14 runs=63 saveexec=0
+  L0 [0xb5c4,0xb7a0] n=91 bperm=0 plx=0 dppmv=0 ds=0 dot4=8 add3=0 cndmask=0 gload=9 XOP=0
+  L1 [0xb864,0xb9d0] n=80 bperm=5 plx=0 dppmv=0 ds=0 dot4=0 add3=1 cndmask=0 gload=0 XOP=5
+  L2 [0xb654,0xb7b8] n=67 bperm=0 plx=0 dppmv=0 ds=0 dot4=8 add3=0 cndmask=0 gload=7 XOP=0
+SYM _Z16q44_formB_kernelILi1EEvPKhPKaPKfS5_Ptiiilliii n=253 vgpr=30 sgpr=24 vsp=0 ssp=0 TOT-XOP=10 XOP-in-loops=5 XOP-tail=5
+  TOT bperm=5 plx=1 dppmv=4 rfl=0 ds=0 dot4=8 add3=1 cndmask=0 vadd_f32=10 vmul_f32=4 gload=9 cvt=0 | medXOP->cons=6 maxfoldrun=6 runs=5 saveexec=0
+  L0 [0xbea4,0xc23c] n=195 bperm=10 plx=1 dppmv=4 ds=0 dot4=0 add3=2 cndmask=0 gload=0 XOP=15
+  L1 [0xbf68,0xc240] n=153 bperm=5 plx=1 dppmv=4 ds=0 dot4=0 add3=2 cndmask=0 gload=0 XOP=10
+  L2 [0xbb3c,0xbde8] n=128 bperm=0 plx=0 dppmv=0 ds=0 dot4=16 add3=0 cndmask=0 gload=13 XOP=0
+SYM _Z16q44_formB_kernelILi2EEvPKhPKaPKfS5_Ptiiilliii n=433 vgpr=34 sgpr=28 vsp=0 ssp=0 TOT-XOP=20 XOP-in-loops=15 XOP-tail=5
+  TOT bperm=10 plx=2 dppmv=8 rfl=0 ds=0 dot4=16 add3=2 cndmask=0 vadd_f32=20 vmul_f32=8 gload=13 cvt=0 | medXOP->cons=6 maxfoldrun=7 runs=9 saveexec=0
+  L0 [0xca2c,0xd220] n=426 bperm=20 plx=3 dppmv=12 ds=0 dot4=0 add3=4 cndmask=0 gload=0 XOP=35
+  L1 [0xcaf0,0xd224] n=384 bperm=15 plx=3 dppmv=12 ds=0 dot4=0 add3=4 cndmask=0 gload=0 XOP=30
+  L2 [0xcc2c,0xd23c] n=324 bperm=15 plx=2 dppmv=8 ds=0 dot4=0 add3=3 cndmask=0 gload=0 XOP=25
+SYM _Z16q44_formB_kernelILi4EEvPKhPKaPKfS5_Ptiiilliii n=805 vgpr=42 sgpr=38 vsp=0 ssp=0 TOT-XOP=40 XOP-in-loops=35 XOP-tail=5
+  TOT bperm=20 plx=4 dppmv=16 rfl=0 ds=0 dot4=32 add3=4 cndmask=0 vadd_f32=40 vmul_f32=16 gload=21 cvt=0 | medXOP->cons=6 maxfoldrun=7 runs=17 saveexec=0
+  L0 [0xde2c,0xeee4] n=891 bperm=40 plx=7 dppmv=28 ds=0 dot4=0 add3=8 cndmask=0 gload=0 XOP=75
+  L1 [0xdef0,0xeee8] n=849 bperm=35 plx=7 dppmv=28 ds=0 dot4=0 add3=8 cndmask=0 gload=0 XOP=70
+  L2 [0xe02c,0xef00] n=789 bperm=35 plx=6 dppmv=24 ds=0 dot4=0 add3=7 cndmask=0 gload=0 XOP=65
+SYM _Z16q44_formB_kernelILi8EEvPKhPKaPKfS5_Ptiiilliii n=1503 vgpr=40 sgpr=59 vsp=0 ssp=0 TOT-XOP=80 XOP-in-loops=75 XOP-tail=5
+  TOT bperm=40 plx=8 dppmv=32 rfl=0 ds=0 dot4=64 add3=8 cndmask=0 vadd_f32=80 vmul_f32=32 gload=37 cvt=0 | medXOP->cons=6 maxfoldrun=7 runs=33 saveexec=0

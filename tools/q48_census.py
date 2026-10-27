@@ -13,8 +13,12 @@
 import os, re, struct, subprocess, sys, tempfile
 
 path, needle = sys.argv[1], sys.argv[2]
-ENV = dict(os.environ, PATH="/opt/rocm/core-10.1/lib/llvm/bin:"
-           + os.environ.get("PATH", ""))
+# Window-52 drift repair: the pinned /opt/rocm/core-10.1 LLVM path is gone.
+# The LLVM bin dir is now overridable via R3D_LLVM_BIN=<dir> or --llvm <dir>;
+# the DEFAULT is the system PATH (current /usr/bin llvm-readelf/objdump/objcopy).
+LLVM = os.environ.get("R3D_LLVM_BIN", "").strip()
+if "--llvm" in sys.argv: LLVM = sys.argv[sys.argv.index("--llvm") + 1]
+ENV = dict(os.environ, PATH=(LLVM + ":" if LLVM else "") + os.environ.get("PATH", ""))
 
 def rd(tag):
     p = tempfile.mktemp(suffix=".elf")
@@ -31,7 +35,10 @@ def rd(tag):
         open(q, "wb").write(data[i:])
         txt = subprocess.run(["llvm-readelf", "--notes", q], capture_output=True,
                              text=True, env=ENV).stdout
-        if needle in txt and "gfx1100" in txt:
+        # Window-52 drift repair: current llvm-readelf prints "amdhsa.target:";
+        # ROCm 10.1-era printed ".target:". Match BOTH forms explicitly.
+        tg = re.search(r"(?:amdhsa\.target|\.target):\s*(\S+)", txt)
+        if tg and "gfx1100" in tg.group(1):
             objs.append(q)
         else:
             os.unlink(q)
@@ -53,8 +60,14 @@ CLASSES = {
 }
 
 objs = rd(needle)
+# Window-52 guard law: zero selected objects is a REGEX/NOTES DRIFT signal,
+# never a silent pass (previously the needle-in-notes check matched zero and
+# the tool printed an empty table).
+if not objs:
+    sys.exit("GUARD: 0 gfx1100 objects selected -- target-note form or fatbin "
+             "layout drift; check the llvm-readelf --notes output form.")
 rows = []
-lab = re.compile(r"^([0-9a-f]+) <(.+)>:$")
+lab = re.compile(r"^([0-9a-fA-F]+) <(.+)>:$")  # window-52: current llvm prints UPPER-CASE hex
 full_out = None
 if "--full" in sys.argv:
     full_out = open(sys.argv[sys.argv.index("--full") + 1], "w")
@@ -68,7 +81,7 @@ for obj in objs:
         if m:
             if cur: rows.append(acc)
             cur = m.group(2)
-            acc = {"name": cur, "n": 0, "lastaddr": 0, "backbranch": 0}
+            acc = {"name": cur, "n": 0, "lastaddr": 0, "backbranch": 0, "base": int(m.group(1), 16)}
             acc.update({k: 0 for k in CLASSES})
             continue
         if acc is None or line[:1] != "\t": continue
@@ -80,14 +93,15 @@ for obj in objs:
         body = am.group(1) + " " + am.group(2)
         for k, rx in CLASSES.items():
             if rx.search(body): acc[k] += 1
-        cm = re.search(r"//\s*([0-9a-f]+):", line)
+        cm = re.search(r"//\s*([0-9a-fA-F]+):", line)
         addr = int(cm.group(1), 16) if cm else acc["lastaddr"] + 4
         acc["lastaddr"] = addr
         if body.startswith("s_cbranch"):
-            tm = re.search(r"<([^>+]+)\+0x([0-9a-f]+)>", line)
+            tm = re.search(r"<([^>+]+)\+0x([0-9a-fA-F]+)>", line)
             if tm:
                 if tm.group(1) == acc["name"]:
-                    if int(tm.group(2), 16) <= addr: acc["backbranch"] += 1
+                    # window-52: comment offsets are SYMBOL-RELATIVE
+                    if int(tm.group(2), 16) <= addr - acc["base"]: acc["backbranch"] += 1
             else:
                 tm = re.search(r"//\s*[0-9a-f]+:\s*[0-9a-f]+\s+(0x[0-9a-f]+)", line)
                 if tm and int(tm.group(1), 16) <= addr: acc["backbranch"] += 1
@@ -103,5 +117,7 @@ for acc in rows:
     print(f"{acc['name']:80.80s} {acc['n']:7d} {acc['ds_bpermute']:6d} {acc['ds_swizzle']:6d} "
           f"{acc['permlanex16']:6d} {acc['dpp_mov']:6d} {acc['dpp_other']:5d} "
           f"{acc['ds_read']:6d} {acc['ds_write']:6d} {acc['wmma']:5d} {acc['branch']:4d} {acc['backbranch']:5d}{flag}{bug}")
-print("objects=%d total_symbols=%d filtered=%d" % (len(objs), len(rows),
-      sum(1 for a in rows if needle in a["name"])))
+filtered = sum(1 for a in rows if needle in a["name"])
+print("objects=%d total_symbols=%d filtered=%d" % (len(objs), len(rows), filtered))
+if filtered == 0:
+    sys.exit("GUARD: filter %s matched 0 symbols -- symbol-form drift." % needle)

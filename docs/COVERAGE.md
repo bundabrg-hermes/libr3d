@@ -3743,3 +3743,11 @@ Manager/subagent item 9 (Q34, desk-only, 32 calls / 6 min). v_add3_u32 present x
 
 TOOL DRIFT: q31/q48 census tools pin a ROCm path that no longer exists on cat, and current llvm-readelf renamed the target note; object-selection regexes now match zero (guards will raise, not silently pass). Fix scheduled as a prerequisite in the next desk window.
 
+
+
+## Window 53 (2026-10-27, AWST ~07:30-07:45) — Q44 gate-0 PASSED at 3x the bar: card earned; census tools repaired (third LLVM drift: upper-case hex)
+
+Manager/subagent item 10 (Q44 desk probe, 60 calls / 14 min, tools-only to main). Prerequisite first: q48/q31 census drift repaired (path overrides, dual target-note forms, dual hex-case -- NEW third drift finding: current llvm-objdump prints UPPER-CASE hex, which had been silently degrading q48's back-branch guard to 170 bogus vs the true 56 -- window-18 address law in offset form), zero-selection now RAISES instead of silent-passing, and the repaired tool reproduces Q35's fold-tax exactly (2895 instrs, 96/16/64 at MT=8).
+
+Probe: standalone Form A = shipped kernel verbatim, its MT=8 census byte-exact vs the shipped binary (fidelity gate before any diff); Form B = the lane-owns-group map (full 32-code group per lane, per-lane SG/AS/sc containment, one 5-op DPP-kit tail reduce). Numbers: in-walk executed cross-lane 40 -> 0; static 176 -> 80 (-54.5%); instrs 2895 -> 1415; VGPR 36 -> 40, SGPR 73 -> 59, spills 0; fusion parity. Zero saveexec regions in either form -- the Q43 guard-that-ate-the-prize cannot bite this topology. Verdict: CARD EARNED, 3x the row's 20% gate. Card session queued next with the report's plan (verify-band-first, KLD/rel_l2 class step, ragged-K peel, M=1 expected-flat caveat).
+
