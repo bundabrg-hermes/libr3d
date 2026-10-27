@@ -112,14 +112,17 @@ int main(int argc, char** argv) {
 
     die("copyY", hipMemcpy(hY_p, dY, (size_t)M * N * 2, hipMemcpyDeviceToHost));
     size_t nz = 0;
+    unsigned long long yhash = 1469598103934665603ull;   // FNV-1a over Y bytes
     {
         std::vector<uint16_t> y((size_t)M * N);
         memcpy(y.data(), hY_p, y.size() * 2);
-        for (auto v : y) if (v) ++nz;
+        for (auto v : y) { if (v) ++nz;
+                           yhash = (yhash ^ (v & 0xffu)) * 1099511628211ull;
+                           yhash = (yhash ^ (v >> 8))    * 1099511628211ull; }
     }
 
     printf("ROW M=%lld K=%lld N=%lld rot=%d reps=%d | t_med=%.3f ms  bf16-stream %.1f GB/s"
-           "  nonzero=%zu/%lld %s\n",
+           "  nonzero=%zu/%lld yhash=%016llx %s\n",
            M, K, N, rot, reps, med * 1e3, gbs, nz, (long long)(M * N),
            nz ? "" : " <-- DEAD ROW, RATE IS A LIE");
     return nz ? 0 : 4;
