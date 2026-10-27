@@ -3687,3 +3687,17 @@ SIDE FINDING (w2a8 owner): q8c walks the packed plane at 69-123 GB/s — ALU/fol
 
 No code shipped (branch card/q35-attribution, tools/logs only). Serve never left v153 except during timed legs; closed health 200 on 9008.
 
+
+
+## Window 48 (2026-10-27, AWST ~03:15-05:05) — Q38 WITHDRAWN: nibble plane is bit-exact and memory-free but flat; GB/s-above-spec = L2 signal law; three V_PERM emit laws pinned
+
+Manager/subagent item 5 (Q38, effort M, build+adjudication in one child window, 217 calls — over the 200 budget but it committed at every milestone so the tail survived).
+
+Built the full native-nibble mxfp4 decode arm (R3D_MX_NIB, both arms one binary): WALKDIFF-EXACT at walk level, battery 7/7 zero-diff both arms with liveness, census clean, memory prize real (0 plugin plane bytes vs 13-107 MB/tensor; the 27B repack guard becomes unreachable by the nibble path). Timing prize: NIL. Kernel 0/6 disjoint-positive (0.869-1.031), serve 0/4 fully overlapping. WITHDRAWN per the mechanical gate; lever stays dark on branch card/q38-nibble-gemv (kept whole for a future regime where DRAM genuinely binds — long-ctx rig).
+
+THE WINDOW'S LAW (manager's projection error, on the record deliberately): Q35 measured the expanded plane at 575-821 GB/s BUS and I projected the byte-halving prize from that. But 575-821 GB/s on this card EXCEEDS sustained DRAM delivery at those working sets — the walk was riding L2 assist, so DRAM was never the wall-clock limiter and Q38's halved bytes bought only perm VALU. A measured GB/s above spec is an L2-assist signal, not a DRAM-bound signal. Byte-prize projections must subtract the L2 story first. The gates caught it at 2/2 levels anyway — this is the ledger's designed failure mode working.
+
+THREE V_PERM EMIT LAWS (card-pinned, each was silently-wrong before, now in skill gpu-kernel-dev:references/vperm-decode-laws.md): (1) builtin perm maps sel 0-3 to the SECOND operand; out-of-range sel yields 0x00; (2) immediate LUT words trigger a src0/src1 emit-swap — VGPR-table and immediate decode DIFFER from the same source; probe the WALK not the decoder (probe1 was invalidated while the battery would have passed at rel~1.2 — caught by walking, not hoping); (3) XOR-negating perm output borrows across byte lanes within a dword (no lop3 on RDNA3) — use dual pos/neg perm banks + per-byte sign-mask perm.
+
+KNOCK-ONS: Q47 synergy premise dead (no winning plane), parked on its own merits. Q44 unaffected (VALU-tax target). Q50 (counter-based attribution) is now the honest next measurement for the q8x family. Process notes: serve container create-template had drifted (dev-dump Cmd=/bin/bash → exit-0 restart loops) — child rebuilt from live inspect; runner scripts must be serial with distinct container names (double-script race cost one serve round, adjudicated by the clean r4 pair).
+
