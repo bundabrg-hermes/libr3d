@@ -1624,15 +1624,17 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
                 if (e && !std::strcmp(e, "2")) return 2;
                 return 1; }();
             /* Q44 (REVIEW_QUEUE): R3D_Q8X_LMAP is the three-state lane-map lever.
-             * 0 (DEFAULT, unset or any other spelling) = shipped walk verbatim --
-             * the withdrawal arm, byte-identical dispatch to pre-Q44.
-             * 1 = lane-map walk at the VERIFY BAND (mt 4..8) only; M=1/2 decode
-             *     legs stay on the shipped walk (the serve-binding path is not
-             *     risked in round one; the probe expects it flat anyway).
+             * 0 = shipped walk verbatim -- the withdrawal arm, byte-identical
+             *     dispatch to pre-Q44 (explicit R3D_Q8X_LMAP=0).
+             * 1 (DEFAULT, unset or any other spelling) = lane-map walk at the
+             *     VERIFY BAND (mt 4..8) only; M=1/2 decode legs stay on the
+             *     shipped walk. Promoted default 2026-10-28 per the Q44 card-
+             *     session adjudication (kernel 12/12 disjoint +43.8..66.7%,
+             *     serve 3/3 disjoint +13.8..20.9%, EQUIV 504/504 bit-identical).
              * 2 = lane-map at every mt (bench arm; adjudicate only if 1 wins). */
             static const int q8x_lmap = []{
                 const char* e = getenv("R3D_Q8X_LMAP");
-                return (e && e[0] == '1') ? 1 : (e && e[0] == '2') ? 2 : 0; }();
+                return (e && e[0] == '0') ? 0 : (e && e[0] == '2') ? 2 : 1; }();
             const bool lm_arm = q8x_lmap == 2 || (q8x_lmap == 1 && mt >= 4);
             const unsigned pgrid = (unsigned)((P.M * (P.K >> 5) + 7) / 8);
             hipLaunchKernelGGL(m4_act_i8_kernel, dim3(pgrid), dim3(256), 0, stream,
