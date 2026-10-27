@@ -167,8 +167,14 @@ int main(int argc, char** argv) {
                 }
             }
         double rel = sqrt(sd / sr);
-        printf("PARITY arm=r3d hd=%d qh=%d kvh=%d rows=%d ctx=%d rel_l2=%.6f rel_max=%.6g nonfinite=%d %s\n",
-               HD, QH, KVH, rows, CTX, rel, smax, bad, (rel < 0.01 && !bad) ? "PASS" : "FAIL");
+        /* Q46: FNV-1a 64 over the raw bf16 output bytes (Q33 tool law: a hash per
+         * leg turns the parity harness into a bit-drift sweep: identical splits MUST
+         * hash-equal across builds/arms; only split-COUNT changes may move it). */
+        uint64_t yh = 1469598103934665603ULL;
+        for (size_t i = 0; i < got.size(); i++) { yh ^= got[i]; yh *= 1099511628211ULL; }
+        printf("PARITY arm=r3d hd=%d qh=%d kvh=%d rows=%d ctx=%d rel_l2=%.6f rel_max=%.6g "
+               "nonfinite=%d yhash=%016llx %s\n",
+               HD, QH, KVH, rows, CTX, rel, smax, bad, (unsigned long long)yh, (rel < 0.01 && !bad) ? "PASS" : "FAIL");
         return (rel < 0.01 && !bad) ? 0 : 4;
     }
 

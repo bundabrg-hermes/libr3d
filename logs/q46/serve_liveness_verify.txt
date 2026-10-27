@@ -1,0 +1,10 @@
+# stderr-DBG probe (throwaway v155test build; engine swallows plugin stdout, stderr flows)
+q46_spec0 (POLICY=1 default cu, speculative-tokens=0): 16 splitk lines;
+  DBG attn-decode split-policy arm=wave cu=48 units=16 tiles_kv=128 fold=0 s=3
+  DBG attn-decode splitk hd=256 kvdt=3 spl=10 fold=1 tiles_kv=128 grid(4,1,10) merge(16,1)
+q46_vfy0 (R3D_SPLIT_POLICY=0, prod Cmd):
+  DBG attn-decode split-policy arm=fixed cu=48 units=16 tiles_kv=128 fold=0 s=12
+  DBG attn-decode splitk hd=256 kvdt=3 spl=32 fold=1 grid(4,1,32)
+q46_vfy1 (R3D_SPLIT_POLICY=1 R3D_SPLIT_CU=96, prod Cmd):
+  DBG attn-decode split-policy arm=wave cu=96 units=16 tiles_kv=128 fold=0 s=5
+  DBG attn-decode splitk hd=256 kvdt=3 spl=19 fold=1 grid(4,1,19)

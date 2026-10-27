@@ -25,13 +25,19 @@
  *   m   sm[idx]            the slice's row max (exp2 domain, as the tile tracks it)
  *   l   sl[idx]            its exp-sum
  *   idx = (tok*q_heads + h)*splits + sp, O plane first, then m, then l.
- * A slice with no tiles writes m=-inf, l=0 and no O bytes; the merge skips the O read on
- * m==-inf, so the inert splits cost two floats, not a row.
+ * A slice with no tiles writes m=-inf, l=0 and no O bytes; the merge skips the O VALUE
+ * on m==-inf (the load itself is speculative under Q46's kMergeU batching -- dead
+ * register, never accumulated), so the inert splits cost no arithmetic and no partial
+ * bytes on the write side.
  *
  * Shape law (host, one place): splits = min(wave / (q_heads*n_seq), cap, tiles_kv,
  * 64) with (wave, cap) = (128, tiles_kv) for the GQA-fold arm and (192, tiles_kv/2)
  * for the plain arm; an explicit `splits` (the row's tuner axis, or the engine
- * passing a tuned value) wins outright. The SAME
+ * passing a tuned value) wins outright. Q46 (window 45): the closed form is now
+ * R3D_SPLIT_POLICY=0; arm 1 replaces the (wave) target with the FA2 wave-efficiency
+ * rule (short-circuit at 0.8*CUs blocks, else smallest s within 0.85 of best
+ * wave-efficiency, same caps incl. the 64 that preserves the arena law) -- see
+ * decode_splits below for the full rule and its precision class. The SAME
  * closed form sizes the arena at declare (swept over every seq count up to max_seqs,
  * because splits*seqs is not monotone in seqs). The fold-arm constants are the
  * 2026-10-24 retune: device-asserted paired sweeps (M 1..8, ctx 512..8192, 32Q/8KV
@@ -149,9 +155,30 @@ namespace {
 
 /* ---- merge: one output row per block, one thread per head_dim column ----
  * out = vds * sum_sp w_sp * O_sp / sum_sp w_sp * l_sp,  w_sp = exp2(m_sp - max m),
- * inert splits (m=-inf) skipped with no O traffic. m/l addresses are warp-uniform, so
- * the skip predicate cannot diverge a wave. With one live split this is the tile's own
- * (O * (1/l)) * vds, to the rounding. */
+ * inert splits (m=-inf) skipped with no O VALU traffic. m/l addresses are warp-uniform,
+ * so the skip predicate cannot diverge a wave. With one live split this is the tile's
+ * own (O * (1/l)) * vds, to the rounding.
+ *
+ * Q46 (window 45) re-verification of the "bound the walk at n_act" half of the row,
+ * on-card law reading: the shipped slice cut is the FLOOR cut (r3d_attn_wmma_body.inc
+ * :445-456: a = t0 + nt*sp/spl, b = t0 + nt*(sp+1)/spl), so the LIVE splits of a row
+ * are NOT a prefix of [0, splits). Worked counterexample to the donor's prefix bound
+ * (nt=3 visible tiles, spl=8): cell edges floor(3k/8) = 0,0,0,1,1,2,2,2,3 -> live =
+ * {2,4,6}: split 0 itself is inert and the last split spl-1 is ALWAYS live (its cell
+ * is ceil(nt/spl) >= 1 tiles). "Splits beyond n_act are inert" is false for this cut
+ * law, so a prefix walk bound would silently drop live splits -- the bound is NOT
+ * shipped; walking to `splits` stays exact. What IS shipped from the donor is the
+ * kMergeU=16 batching with the partial loads hoisted AHEAD of the skip-select (their
+ * recorded fix: loads must not sink behind the branch): each batch loads m, l and O
+ * for all 16 slots unconditionally into registers, and only the ACCUMULATE selects.
+ * Bit-identical by construction: the accumulate set/order is unchanged (ascending sp,
+ * live splits only -- inert still contributes nothing, not even a +0.0f add), so a
+ * garbage O row behind an inert m=-inf is loaded into a dead register and never
+ * touches the arithmetic. The only behavioural delta is arena READ traffic for inert
+ * rows (they now cost the O row in loads, not in VALU), which exists only at
+ * ctx < splits*kBN -- a few KB of scratch noise against the KV stream. */
+constexpr int kMergeU = 16;    /* donor Strata qsa merge_v2 batch depth */
+
 template <int D>
 __global__ __launch_bounds__(D) void attn_splitk_merge_kernel(R3dAttnParams P, int splits) {
     const int h = blockIdx.x;
@@ -178,9 +205,14 @@ __global__ __launch_bounds__(D) void attn_splitk_merge_kernel(R3dAttnParams P, i
 
     const int64_t ob = tok * P.o_rs + (int64_t)h * P.o_hs + (int64_t)d * P.o_ds;
     float mx = -INFINITY;
-    for (int sp = 0; sp < splits; ++sp) {
-        const float m = psm[base + sp];
-        if (m > mx) mx = m;
+    for (int sp0 = 0; sp0 < splits; sp0 += kMergeU) {
+        float mm[kMergeU];
+        #pragma unroll
+        for (int k = 0; k < kMergeU; ++k)          /* loads first: no select between */
+            if (sp0 + k < splits) mm[k] = psm[base + sp0 + k];
+        #pragma unroll
+        for (int k = 0; k < kMergeU; ++k)
+            if (sp0 + k < splits && mm[k] > mx) mx = mm[k];
     }
     if (mx == -INFINITY) {                  /* every split inert: the zero row, as v1 */
         if (P.out_f32) ((float*)P.out)[ob] = 0.0f;
@@ -188,16 +220,84 @@ __global__ __launch_bounds__(D) void attn_splitk_merge_kernel(R3dAttnParams P, i
         return;
     }
     float num = 0.0f, den = 0.0f;
-    for (int sp = 0; sp < splits; ++sp) {
-        const float m = psm[base + sp];
-        if (m == -INFINITY) continue;
-        const float w = exp2f(m - mx);
-        num += w * pso[(base + sp) * D + d];
-        den += w * psl[base + sp];
+    for (int sp0 = 0; sp0 < splits; sp0 += kMergeU) {
+        float mm[kMergeU], ll[kMergeU], oo[kMergeU];
+        #pragma unroll
+        for (int k = 0; k < kMergeU; ++k) {        /* hoisted ahead of the skip-select:
+                                                    * one dependency-free load wave */
+            if (sp0 + k < splits) {
+                mm[k] = psm[base + sp0 + k];
+                ll[k] = psl[base + sp0 + k];
+                oo[k] = pso[(base + sp0 + k) * D + d];
+            }
+        }
+        #pragma unroll
+        for (int k = 0; k < kMergeU; ++k)          /* the accumulate is verbatim v153 */
+            if (sp0 + k < splits && mm[k] != -INFINITY) {
+                const float w = exp2f(mm[k] - mx);
+                num += w * oo[k];
+                den += w * ll[k];
+            }
     }
     const float o = (den > 0.0f ? num * (1.0f / den) : 0.0f) * vds;
     if (P.out_f32) ((float*)P.out)[ob] = o;
     else           ((uint16_t*)P.out)[ob] = f32_bf16_w(o);
+}
+
+/* Q46 split-count policy arms. ONE binary carries both:
+ *   R3D_SPLIT_POLICY=0  the fixed closed form below, verbatim (the 2026-10-24 retune);
+ *   R3D_SPLIT_POLICY=1  wave-efficiency policy (FA2 rule, QFN pass3 P3-009).
+ * Default = R3D_SPLIT_POLICY_DEFAULT (set by the Q46 A/B verdict, see the report).
+ *
+ * The wave rule (host-only arithmetic; the arena hook and the launcher run the SAME
+ * function so the declared arena always covers what the launch asks for -- the arena
+ * law is structural, not hoped-for):
+ *   units  = heads_per_block * max(n_seq,1)  (q_heads plain, kv_heads folded, as today)
+ *   blocks(s) = units * s
+ *   short-circuit: the FIRST s whose blocks(s) reaches 0.8*CUs (FA2: stop splitting
+ *     once there are enough blocks to fill the device); if units alone already
+ *     reaches it, that is s=1 -> no split arm at all, exactly the FA2 meaning.
+ *   else: wave_eff(s) = blocks / (CUs * ceil(blocks/CUs)) over s <= smax; pick the
+ *     SMALLEST s whose eff is within 0.85 of the best.
+ *   caps identical to the closed form (tiles_kv, tiles_kv/2 for plain, 64 -- the 64
+ *   cap is what preserves the arena sizing law and the bench's 64-slot scratch).
+ * CU count is queried from the device once per process (hipGetDeviceProperties'
+ * multiProcessorCount). On-card fact 2026-10-27, this XTX: the HIP runtime answers
+ * 48 while rocminfo lists 96 "Compute Unit" -- RDNA3 HIP multiProcessorCount counts
+ * 16-lane SIMD pairs, not the 96 physical CUs. The runtime value is what the wave
+ * model uses (a wave is the device's own accounting), the sweep A/B's both divisors
+ * via R3D_SPLIT_CU (the explicit override), and 48 is the query-failure fallback so
+ * the dead path matches the device's live answer.
+ * Precision class of arm 1: it CHANGES SPLIT COUNTS, which changes the partial-combine
+ * order -- precision-visible on split-sensitive attention rows (the m=-inf inert law
+ * covers degenerate splits, NOT the ordering): graded by battery tolerance + a decode
+ * hash sweep, not by zero-diff. Arm 0 is bit-verbatim by construction. */
+#define R3D_SPLIT_POLICY_DEFAULT 0
+
+int decode_split_policy(void) {
+    static int arm = -1;
+    if (arm < 0) {
+        const char* e = getenv("R3D_SPLIT_POLICY");
+        arm = e ? (atoi(e) != 0 ? 1 : 0) : R3D_SPLIT_POLICY_DEFAULT;
+    }
+    return arm;
+}
+
+int decode_split_cu(void) {
+    static int cu = -1;
+    if (cu < 0) {
+        const char* e = getenv("R3D_SPLIT_CU");
+        if (e && atoi(e) > 0) {
+            cu = atoi(e);
+        } else {
+            hipDeviceProp_t d;
+            int dev = 0;
+            cu = (hipGetDevice(&dev) == hipSuccess &&
+                  hipGetDeviceProperties(&d, dev) == hipSuccess &&
+                  d.multiProcessorCount > 0) ? (int)d.multiProcessorCount : 48;
+        }
+    }
+    return cu;
 }
 
 /* The shape law, host side, one closed form shared by the launch and the arena hook.
@@ -215,12 +315,47 @@ int decode_splits(int64_t q_heads, int64_t n_seq, int64_t tiles_kv, int forced,
                   bool fold) {
     if (forced > 0) return forced > 64 ? 64 : forced;
     const int64_t units = q_heads * (n_seq > 0 ? n_seq : 1);
-    int64_t s = (fold ? 128 : 192) / units;
     const int64_t cap = fold ? tiles_kv : tiles_kv / 2;
-    if (s > cap) s = cap;
-    if (s > tiles_kv) s = tiles_kv;
-    if (s > 64) s = 64;
+    int64_t smax = tiles_kv < 64 ? tiles_kv : 64;
+    if (cap < smax) smax = cap;
+    if (smax < 1) smax = 1;
+
+    int64_t s;
+    if (decode_split_policy() == 0) {                    /* fixed closed form */
+        s = (fold ? 128 : 192) / units;
+    } else {                                             /* wave-efficiency policy */
+        const int cu = decode_split_cu();
+        const int64_t fill = (int64_t)cu * 8 / 10;       /* 0.8*CUs, integer */
+        s = 0;
+        double best = 0.0;
+        for (int64_t t = 1; t <= smax; ++t) {
+            const int64_t blocks = units * t;
+            if (blocks >= fill) { s = t; break; }        /* FA2 short-circuit */
+            const int64_t waves = (blocks + cu - 1) / cu;
+            const double eff = (double)blocks / (double)(waves * cu);
+            if (eff > best) best = eff;
+        }
+        if (s <= 0) {                                    /* cap never reached fill */
+            for (int64_t t = 1; t <= smax; ++t) {
+                const int64_t blocks = units * t;
+                const int64_t waves = (blocks + cu - 1) / cu;
+                const double eff = (double)blocks / (double)(waves * cu);
+                if (eff >= 0.85 * best) { s = t; break; }
+            }
+        }
+        if (s <= 0) s = 1;
+    }
+    if (s > smax) s = smax;
     if (s < 1) s = 1;
+    static int once = 0;
+    if (!once && getenv("R3D_DEBUG_DECODE")) {           /* liveness: names the arm */
+        once = 1;
+        printf("DBG attn-decode split-policy arm=%s cu=%lld units=%lld tiles_kv=%lld "
+               "fold=%d s=%lld\n",
+               decode_split_policy() ? "wave" : "fixed",
+               (long long)decode_split_cu(), (long long)units, (long long)tiles_kv,
+               (int)fold, (long long)s);
+    }
     return (int)s;
 }
 

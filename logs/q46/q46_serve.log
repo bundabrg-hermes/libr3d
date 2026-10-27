@@ -1,0 +1,51 @@
+  probe#0: [Errno 104] Connection reset by peer
+  ready after 2 probes (prompt-body)
+  settle q46_pol0 #0: 71.4
+  settle q46_pol0 #1: 70.5
+  liveness q46_pol0: ARM LINE MISSING (0 splitk launch DBG lines) ok=False
+DEC arm=p0 r1 tok/s=70.7 LIVENESS-FAIL
+  I req cmpl-404dbdf427d70e99e79476bf done from 172.17.0.1:42736 finish=length prompt=21 (cache 0) gen=512 ttft=0.20s 70.7 tok/s 7.43s
+  probe#0: [Errno 104] Connection reset by peer
+  ready after 2 probes (prompt-body)
+  settle q46_wave #0: 64.4
+  settle q46_wave #1: 71.9
+  liveness q46_wave: ARM LINE MISSING (0 splitk launch DBG lines) ok=False
+DEC arm=wave-cu96 r2 tok/s=63.9 LIVENESS-FAIL
+  I req cmpl-c74bbf0bfba2ce43aa81e1cb done from 172.17.0.1:49546 finish=length prompt=19 (cache 0) gen=512 ttft=0.20s 63.9 tok/s 8.19s
+  probe#0: [Errno 104] Connection reset by peer
+  ready after 2 probes (prompt-body)
+  settle q46_pol0 #0: None
+  settle q46_pol0 #1: 73.0
+  settle q46_pol0 #2: 69.6
+  liveness q46_pol0: ARM LINE MISSING (0 splitk launch DBG lines) ok=False
+DEC arm=p0 r3 tok/s=63.6 LIVENESS-FAIL
+  I req cmpl-772eb21ece277f1168d5912b done from 172.17.0.1:41636 finish=length prompt=21 (cache 0) gen=512 ttft=0.20s 63.6 tok/s 8.23s
+  probe#0: [Errno 104] Connection reset by peer
+  ready after 2 probes (prompt-body)
+  settle q46_wave #0: 64.5
+  settle q46_wave #1: 66.9
+  liveness q46_wave: ARM LINE MISSING (0 splitk launch DBG lines) ok=False
+DEC arm=wave-cu96 r4 tok/s=65.9 LIVENESS-FAIL
+  I req cmpl-73c1536807935ba567e1751e done from 172.17.0.1:38564 finish=length prompt=21 (cache 0) gen=512 ttft=0.20s 65.9 tok/s 7.96s
+  probe#0: [Errno 104] Connection reset by peer
+  ready after 2 probes (prompt-body)
+  settle q46_pol0 #0: 62.8
+  settle q46_pol0 #1: 67.8
+  liveness q46_pol0: ARM LINE MISSING (0 splitk launch DBG lines) ok=False
+DEC arm=p0 r5 tok/s=62.3 LIVENESS-FAIL
+  I req cmpl-0fbe7760fb64912e19562ff3 done from 172.17.0.1:50078 finish=length prompt=20 (cache 0) gen=512 ttft=0.20s 62.3 tok/s 8.40s
+  probe#0: [Errno 104] Connection reset by peer
+  ready after 2 probes (prompt-body)
+  settle q46_wave #0: 67.8
+  settle q46_wave #1: 69.0
+  liveness q46_wave: ARM LINE MISSING (0 splitk launch DBG lines) ok=False
+DEC arm=wave-cu96 r6 tok/s=65.8 LIVENESS-FAIL
+  I req cmpl-2ed80f3240d78a01354fd4a8 done from 172.17.0.1:42060 finish=length prompt=20 (cache 0) gen=512 ttft=0.20s 65.8 tok/s 7.96s
+  probe#0: [Errno 104] Connection reset by peer
+  ready after 2 probes (prompt-body)
+  settle q46_pol0 #0: 72.1
+  settle q46_pol0 #1: 63.2
+  liveness q46_pol0: ARM LINE MISSING (0 splitk launch DBG lines) ok=False
+DEC arm=p0 CONFIRM-A tok/s=63.5 LIVENESS-FAIL
+  I req cmpl-a707cb6658e616c82a91e6cd done from 172.17.0.1:43730 finish=length prompt=20 (cache 0) gen=512 ttft=0.19s 63.5 tok/s 8.24s
+== serve A/B DONE ==

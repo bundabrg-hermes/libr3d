@@ -1,0 +1,70 @@
+gfx1100 kernels: 280  spilling/private: 41
+   320 vsp   95 ssp    708 priv  256 vgpr   1556 lds  r3d_gdn.hip.o                  _ZN12_GLOBAL__N_132gdn_conv_recurrent_update_kernelILb1ELi0EEEvPKhjlS2_jlS2_jPhjllllPKvjS2_jlS2_jlS2_jlS2_jlS3_jlllS5_jlllS5_jS5_jS2_jllS2_jlS3_jllS3_NS_6R3dRowES3_S6_lllliffffilllllll
+   222 vsp   79 ssp    692 priv  256 vgpr   1556 lds  r3d_gdn.hip.o                  _ZN12_GLOBAL__N_127gdn_recurrent_update_kernelILb1ELi0EEEvPKhjllS2_jllS2_jllS2_jlS2_jlS2_jlS2_jlPhjlllPKvjlllS5_jS5_jS2_jllS2_jlS3_jllS3_NS_6R3dRowES3_S6_llffffilllllll
+   224 vsp    2 ssp    568 priv  256 vgpr    768 lds  r3d_gdn.hip.o                  _ZN12_GLOBAL__N_121gdn_chunk_scan_kernelILi1EEEvPKhjllS2_jllS2_jllS2_jllS2_jlS2_jlS2_jlllPhjllS3_jlllPKvjS5_jllllf
+   189 vsp    2 ssp    560 priv  256 vgpr    768 lds  r3d_gdn.hip.o                  _ZN12_GLOBAL__N_121gdn_chunk_scan_kernelILi0EEEvPKhjllS2_jllS2_jllS2_jllS2_jlS2_jlS2_jlllPhjllS3_jlllPKvjS5_jllllf
+    98 vsp   49 ssp    360 priv  256 vgpr   1556 lds  r3d_gdn.hip.o                  _ZN12_GLOBAL__N_127gdn_recurrent_update_kernelILb0ELi0EEEvPKhjllS2_jllS2_jllS2_jlS2_jlS2_jlS2_jlPhjlllPKvjlllS5_jS5_jS2_jllS2_jlS3_jllS3_NS_6R3dRowES3_S6_llffffilllllll
+   167 vsp    0 ssp    284 priv  256 vgpr      0 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi256ELi3ELi1ELi1ELi1ELi1ELi0ELi0ELi0EEEv13R3dAttnParams
+   167 vsp    0 ssp    284 priv  256 vgpr      0 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi256ELi3ELi1ELi1ELi1ELi0ELi0ELi0ELi0EEEv13R3dAttnParams
+   179 vsp    0 ssp    268 priv  256 vgpr      0 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi256ELi3ELi1ELi1ELi0ELi0ELi0ELi0ELi0EEEv13R3dAttnParams
+   163 vsp    0 ssp    268 priv  256 vgpr      0 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi256ELi3ELi1ELi1ELi0ELi1ELi0ELi0ELi0EEEv13R3dAttnParams
+    73 vsp   67 ssp    284 priv  256 vgpr   1556 lds  r3d_gdn.hip.o                  _ZN12_GLOBAL__N_132gdn_conv_recurrent_update_kernelILb0ELi0EEEvPKhjlS2_jlS2_jPhjllllPKvjS2_jlS2_jlS2_jlS2_jlS3_jlllS5_jlllS5_jS5_jS2_jllS2_jlS3_jllS3_NS_6R3dRowES3_S6_lllliffffilllllll
+    88 vsp    0 ssp    324 priv  256 vgpr      0 lds  r3d_attn_paged_wmma.hip.o      _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi256ELi3ELi0ELi1ELi0ELi0ELi0ELi0ELi0EEEv13R3dAttnParams
+   138 vsp    0 ssp    268 priv  256 vgpr      0 lds  r3d_attn_paged_wmma.hip.o      _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi256ELi3ELi0ELi1ELi0ELi1ELi0ELi1ELi0EEEv13R3dAttnParams
+   138 vsp    0 ssp    268 priv  256 vgpr      0 lds  r3d_attn_paged_wmma.hip.o      _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi256ELi3ELi0ELi1ELi0ELi1ELi0ELi0ELi0EEEv13R3dAttnParams
+    66 vsp    0 ssp    268 priv  256 vgpr  32768 lds  r3d_gemm_w2a8.hip.o            _ZN12_GLOBAL__N_124gemm_nt_w2a8_gemv_kernelILi16ELi16EEEvPKaPKhPtPKfPK6__halfS4_S7_iiiiilllllli
+    58 vsp    0 ssp    236 priv  256 vgpr  32768 lds  r3d_gemm_w2a8.hip.o            _ZN12_GLOBAL__N_124gemm_nt_w2a8_gemv_kernelILi16ELi8EEEvPKaPKhPtPKfPK6__halfS4_S7_iiiiilllllli
+     0 vsp    0 ssp    272 priv   81 vgpr   4096 lds  r3d_gemm_w2a8.hip.o            _ZN12_GLOBAL__N_127gemm_nt_w2a8_gemv_q8_kernelILi8ELi16ELi0ELi0EEEvPKaPKhPtPKfPK6__halfS4_S7_iiiiilllllli   <- private w/o spill: objdump for scratch_store
+     0 vsp    0 ssp    272 priv  119 vgpr   8192 lds  r3d_gemm_w2a8.hip.o            _ZN12_GLOBAL__N_127gemm_nt_w2a8_gemv_q8_kernelILi16ELi16ELi0ELi0EEEvPKaPKhPtPKfPK6__halfS4_S7_iiiiilllllli   <- private w/o spill: objdump for scratch_store
+    51 vsp    0 ssp    208 priv  256 vgpr  32768 lds  r3d_gemm_w2a8.hip.o            _ZN12_GLOBAL__N_124gemm_nt_w2a8_gemv_kernelILi16ELi1EEEvPKaPKhPtPKfPK6__halfS4_S7_iiiiilllllli
+     5 vsp    0 ssp    224 priv  256 vgpr  40752 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_123attn_paged_wmma_kernel2ILi128ELi4ELi1EEEv13R3dAttnParams
+     2 vsp    0 ssp    192 priv  256 vgpr  40752 lds  r3d_attn_paged_wmma.hip.o      _ZN12_GLOBAL__N_123attn_paged_wmma_kernel2ILi128ELi4ELi0EEEv13R3dAttnParams
+     0 vsp    0 ssp    160 priv   81 vgpr   4096 lds  r3d_gemm_w2a8.hip.o            _ZN12_GLOBAL__N_127gemm_nt_w2a8_gemv_q8_kernelILi8ELi8ELi0ELin8EEEvPKaPKhPtPKfPK6__halfS4_S7_iiiiilllllli   <- private w/o spill: objdump for scratch_store
+     0 vsp    0 ssp    160 priv  119 vgpr   8192 lds  r3d_gemm_w2a8.hip.o            _ZN12_GLOBAL__N_127gemm_nt_w2a8_gemv_q8_kernelILi16ELi8ELi0ELin8EEEvPKaPKhPtPKfPK6__halfS4_S7_iiiiilllllli   <- private w/o spill: objdump for scratch_store
+     0 vsp    0 ssp    144 priv   81 vgpr   4096 lds  r3d_gemm_w2a8.hip.o            _ZN12_GLOBAL__N_127gemm_nt_w2a8_gemv_q8_kernelILi8ELi8ELi0ELi0EEEvPKaPKhPtPKfPK6__halfS4_S7_iiiiilllllli   <- private w/o spill: objdump for scratch_store
+     0 vsp    0 ssp    144 priv  119 vgpr   8192 lds  r3d_gemm_w2a8.hip.o            _ZN12_GLOBAL__N_127gemm_nt_w2a8_gemv_q8_kernelILi16ELi8ELi0ELi0EEEvPKaPKhPtPKfPK6__halfS4_S7_iiiiilllllli   <- private w/o spill: objdump for scratch_store
+     0 vsp    0 ssp    132 priv   17 vgpr    256 lds  r3d_logit_rerank.hip.o         _ZN12_GLOBAL__N_119logit_rerank_kernelEPKhjlS1_jlPKilPilPflS5_iill   <- private w/o spill: objdump for scratch_store
+     0 vsp    0 ssp    132 priv   17 vgpr    256 lds  r3d_logit_rerank_e4m3.hip.o    _ZN12_GLOBAL__N_124logit_rerank_e4m3_kernelEPKhjlS1_lPKvlijPKilPilPflS7_iill   <- private w/o spill: objdump for scratch_store
+     0 vsp    0 ssp    128 priv  178 vgpr  39680 lds  r3d_gemm_fp8a8.hip.o           _ZN12_GLOBAL__N_123gemm_nt_fp8a8_sk_kernelILi3EEEvPKhS2_PtPKfPKtiiiiillllli   <- private w/o spill: objdump for scratch_store
+     0 vsp   95 ssp      0 priv  179 vgpr   1556 lds  r3d_gdn.hip.o                  _ZN12_GLOBAL__N_132gdn_conv_recurrent_update_kernelILb1ELi1EEEvPKhjlS2_jlS2_jPhjllllPKvjS2_jlS2_jlS2_jlS2_jlS3_jlllS5_jlllS5_jS5_jS2_jllS2_jlS3_jllS3_NS_6R3dRowES3_S6_lllliffffilllllll
+     0 vsp   95 ssp      0 priv  180 vgpr   1556 lds  r3d_gdn.hip.o                  _ZN12_GLOBAL__N_132gdn_conv_recurrent_update_kernelILb1ELi3EEEvPKhjlS2_jlS2_jPhjllllPKvjS2_jlS2_jlS2_jlS2_jlS3_jlllS5_jlllS5_jS5_jS2_jllS2_jlS3_jllS3_NS_6R3dRowES3_S6_lllliffffilllllll
+     0 vsp   84 ssp      0 priv  187 vgpr   1556 lds  r3d_gdn.hip.o                  _ZN12_GLOBAL__N_127gdn_recurrent_update_kernelILb1ELi3EEEvPKhjllS2_jllS2_jllS2_jlS2_jlS2_jlS2_jlPhjlllPKvjlllS5_jS5_jS2_jllS2_jlS3_jllS3_NS_6R3dRowES3_S6_llffffilllllll
+     0 vsp    0 ssp     80 priv   55 vgpr     64 lds  r3d_gemm_mxfp4.hip.o           _ZN12_GLOBAL__N_125gemm_nt_mxfp4_gemv_kernelILi1ELi4ELi1ELi1EEEvPKhS2_PtPKfS2_iiilllll   <- private w/o spill: objdump for scratch_store
+     0 vsp   79 ssp      0 priv  187 vgpr   1556 lds  r3d_gdn.hip.o                  _ZN12_GLOBAL__N_127gdn_recurrent_update_kernelILb1ELi1EEEvPKhjllS2_jllS2_jllS2_jlS2_jlS2_jlS2_jlPhjlllPKvjlllS5_jS5_jS2_jllS2_jlS3_jllS3_NS_6R3dRowES3_S6_llffffilllllll
+     0 vsp   67 ssp      0 priv  167 vgpr   1556 lds  r3d_gdn.hip.o                  _ZN12_GLOBAL__N_132gdn_conv_recurrent_update_kernelILb0ELi3EEEvPKhjlS2_jlS2_jPhjllllPKvjS2_jlS2_jlS2_jlS2_jlS3_jlllS5_jlllS5_jS5_jS2_jllS2_jlS3_jllS3_NS_6R3dRowES3_S6_lllliffffilllllll
+     0 vsp   62 ssp      0 priv  167 vgpr   1556 lds  r3d_gdn.hip.o                  _ZN12_GLOBAL__N_132gdn_conv_recurrent_update_kernelILb0ELi1EEEvPKhjlS2_jlS2_jPhjllllPKvjS2_jlS2_jlS2_jlS2_jlS3_jlllS5_jlllS5_jS5_jS2_jllS2_jlS3_jllS3_NS_6R3dRowES3_S6_lllliffffilllllll
+     0 vsp   49 ssp      0 priv  168 vgpr   1556 lds  r3d_gdn.hip.o                  _ZN12_GLOBAL__N_127gdn_recurrent_update_kernelILb0ELi1EEEvPKhjllS2_jllS2_jllS2_jlS2_jlS2_jlS2_jlPhjlllPKvjlllS5_jS5_jS2_jllS2_jlS3_jllS3_NS_6R3dRowES3_S6_llffffilllllll
+     0 vsp   49 ssp      0 priv  168 vgpr   1556 lds  r3d_gdn.hip.o                  _ZN12_GLOBAL__N_127gdn_recurrent_update_kernelILb0ELi3EEEvPKhjllS2_jllS2_jllS2_jlS2_jlS2_jlS2_jlPhjlllPKvjlllS5_jS5_jS2_jllS2_jlS3_jllS3_NS_6R3dRowES3_S6_llffffilllllll
+     0 vsp    0 ssp     48 priv   58 vgpr   8256 lds  r3d_gemm_mxfp4.hip.o           _ZN12_GLOBAL__N_125gemm_nt_mxfp4_gemv_kernelILi8ELi4ELi1ELi1EEEvPKhS2_PtPKfS2_iiilllll   <- private w/o spill: objdump for scratch_store
+     0 vsp   47 ssp      0 priv  123 vgpr   8192 lds  r3d_gemm_w2a8.hip.o            _ZN12_GLOBAL__N_127gemm_nt_w2a8_gemv_q8_kernelILi16ELi8ELi1ELi4EEEvPKaPKhPtPKfPK6__halfS4_S7_iiiiilllllli
+     0 vsp   47 ssp      0 priv  131 vgpr   8192 lds  r3d_gemm_w2a8.hip.o            _ZN12_GLOBAL__N_127gemm_nt_w2a8_gemv_q8_kernelILi16ELi8ELi0ELi4EEEvPKaPKhPtPKfPK6__halfS4_S7_iiiiilllllli
+     3 vsp    0 ssp     16 priv  256 vgpr  40752 lds  r3d_attn_paged_wmma.hip.o      _ZN12_GLOBAL__N_123attn_paged_wmma_kernel2ILi128ELi3ELi0EEEv13R3dAttnParams
+     2 vsp    0 ssp     12 priv  256 vgpr  40752 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_123attn_paged_wmma_kernel2ILi128ELi3ELi1EEEv13R3dAttnParams
+
+near-ceiling (no spill, VGPR >= 200): one edit away from the cliff
+ 249 vgpr      0 lds  r3d_attn_paged_wmma.hip.o      _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi256ELi3ELi0ELi0ELi0ELi0ELi0ELi0ELi0EEEv13R3dAttnParams
+ 244 vgpr      0 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi256ELi3ELi1ELi0ELi1ELi1ELi0ELi0ELi0EEEv13R3dAttnParams
+ 244 vgpr      0 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi256ELi3ELi1ELi0ELi1ELi0ELi0ELi0ELi0EEEv13R3dAttnParams
+ 242 vgpr      0 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi256ELi3ELi1ELi0ELi0ELi1ELi0ELi0ELi0EEEv13R3dAttnParams
+ 242 vgpr      0 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi256ELi3ELi1ELi0ELi0ELi0ELi0ELi0ELi0EEEv13R3dAttnParams
+ 242 vgpr      0 lds  r3d_attn_paged_wmma.hip.o      _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi256ELi3ELi0ELi0ELi0ELi1ELi0ELi0ELi0EEEv13R3dAttnParams
+ 226 vgpr  42064 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi128ELi3ELi1ELi1ELi1ELi0ELi0ELi0ELi1EEEv13R3dAttnParams
+ 226 vgpr  42064 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi128ELi3ELi1ELi1ELi0ELi0ELi0ELi0ELi1EEEv13R3dAttnParams
+ 225 vgpr  42064 lds  r3d_attn_paged_wmma.hip.o      _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi128ELi3ELi0ELi1ELi0ELi0ELi0ELi0ELi1EEEv13R3dAttnParams
+ 216 vgpr  29776 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi64ELi3ELi1ELi1ELi1ELi0ELi0ELi0ELi1EEEv13R3dAttnParams
+ 216 vgpr  29776 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi64ELi3ELi1ELi1ELi0ELi0ELi0ELi0ELi1EEEv13R3dAttnParams
+ 215 vgpr  29776 lds  r3d_attn_paged_wmma.hip.o      _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi64ELi3ELi0ELi1ELi0ELi0ELi0ELi0ELi1EEEv13R3dAttnParams
+ 213 vgpr  42064 lds  r3d_attn_paged_wmma.hip.o      _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi128ELi3ELi0ELi1ELi0ELi0ELi0ELi0ELi0EEEv13R3dAttnParams
+ 213 vgpr  42064 lds  r3d_attn_paged_wmma.hip.o      _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi128ELi4ELi0ELi1ELi0ELi0ELi0ELi0ELi0EEEv13R3dAttnParams
+ 202 vgpr  42064 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi128ELi3ELi1ELi1ELi1ELi0ELi0ELi0ELi0EEEv13R3dAttnParams
+ 201 vgpr  29776 lds  r3d_attn_paged_wmma.hip.o      _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi64ELi3ELi0ELi1ELi0ELi0ELi0ELi0ELi0EEEv13R3dAttnParams
+ 201 vgpr  29776 lds  r3d_attn_paged_wmma.hip.o      _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi64ELi4ELi0ELi1ELi0ELi0ELi0ELi0ELi0EEEv13R3dAttnParams
+ 200 vgpr  42064 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi128ELi3ELi1ELi1ELi0ELi0ELi0ELi0ELi0EEEv13R3dAttnParams
+
+biggest LDS (occupancy budget, couples to the above)
+ 43072 lds  r3d_gemm_mxfp4.hip.o           _ZN12_GLOBAL__N_124gemm_nt_mxfp4_m64_kernelILb1EEEvPKhS2_PtPKfS2_iiiiilllllii
+ 43008 lds  r3d_gemm_fp8a8.hip.o           _ZN12_GLOBAL__N_124gemm_nt_fp8a8_m64_kernelILb1EEEvPKhS2_PtPKfPKtiiiiillllli
+ 42576 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi128ELi4ELi1ELi0ELi1ELi0ELi2ELi0ELi0EEEv13R3dAttnParams
+ 42576 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi128ELi4ELi1ELi0ELi1ELi0ELi3ELi0ELi0EEEv13R3dAttnParams
+ 42576 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi128ELi4ELi1ELi0ELi0ELi0ELi2ELi0ELi0EEEv13R3dAttnParams
+ 42576 lds  r3d_attn_paged_decode.hip.o    _ZN12_GLOBAL__N_122attn_paged_wmma_kernelILi128ELi4ELi1ELi0ELi0ELi0ELi3ELi0ELi0EEEv13R3dAttnParams
