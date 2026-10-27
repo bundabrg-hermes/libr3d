@@ -3659,3 +3659,17 @@ ENVIRONMENT LAW (highest reuse value from this window): the serve engine SWALLOW
 
 Process notes: child voided its first parallel battery attempt (D4, solo-runner law re-earned); child tried to write memory files in another profile's store and correctly reported the failure instead of hiding it — its laws are recorded here instead. flashnext showed one app-level restart during the window (RestartCount=1, not OOM, no amdgpu events; our containers pinned ROCR_VISIBLE_DEVICES=1) — operator visibility only.
 
+
+
+## Window 46 (2026-10-27, AWST ~22:40-02:20) — Q43 WITHDRAWN after gate PASSED: saveexec/DPP poison law, vbitmerge guard, meeting tax > barrier tax; Q52 spawned
+
+Manager/subagent item 3, run as TWO child sessions. Session A died of context overflow at ~296 calls (41M input tokens; cause: raw large-output dumps into tool results — the hygiene fix for later briefs: route output to files, read by grep-ranges, count don't list). Its tree survived uncommitted; manager committed it as WIP (eb8218e) before re-dispatch — recovery-by-tree worked exactly as the playbook prescribes.
+
+Session B finished the tail. FORENSICS (the window's keepers):
+1. SAVEEXEC/DPP POISON LAW: LLVM if-converts expensive-true-side selects into s_and_saveexec regions and sinks pinned DPP groups inside; partner lanes EXEC=0 => DPP is a hardware no-op => stale value. Silent, 15-of-16-lane class, invisible in disassembly unless you look for the region. Card repro standalone (tools/q43_comb_w46.hip). GUARD (vbitmerge): full-exec-consumed merges must be pure bit-select merges — NaN-exact, cannot be predicated. This law gates any future wave-shuffle-under-select construction, and explains why the predecessor's NaN-byte trail led nowhere: it was EXEC poisoning presenting as NaN payloads.
+2. ORDER GATE PASSED (finite-only, in-contract): 40/40, 1.262e9 lane-ops. Torture-class divergences = NaN-sign/payload only (Q48 precedent class). Both "finite" failures resolved as bench artifacts: fill-overflow (state contained 1.2M NaNs before divergence; slots-locked control bit-identical) and out-of-contract widths.
+3. OUT-OF-CONTRACT DETERMINISM FINDING -> Q52: the SHIPPED recurrent kernel is not self-reproducing run-to-run at V=33/40/48 (OLD-vs-OLD fails). Not live-breaking (launcher never emits those widths) but a race canary + test-surface hazard. One-line repro: probe OLDVSOLD mode.
+4. PERFORMANCE VERDICT WITHDRAWN: wave arm DISJOINT-slower on ALL rec rows (-23.8% to -113.4%). The 4-lane column split pays 3 redundant folds per meeting once vbitmerge-guarded; barrier removal bought nothing because the barrier wasn't the binding term.
+5. SERVE PREMISE CORRECTION: stderr liveness shows spec9g's serving model dispatches ONLY the fused GDN recurrent row — the non-fused gdn_recurrent_update this item rebuilt is dead code on the live path. Any future GDN decode item must start from a fused-vs-nonfused dispatch audit (rewrites Q20-era "24 live layers" framing for the non-fused arms).
+Ceremony clean (census 280/280 byte-identical v153-vs-v155, battery 7/7 zero-diff + one phantom leg self-caught via fixture-mispair check, third sighting of that class). Nothing shipped to main; assets dark on branch card/q43-gdn-barrierfree. Serve: spec9g v153 health 200 on port 9008.
+
