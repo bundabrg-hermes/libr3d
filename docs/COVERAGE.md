@@ -3795,3 +3795,13 @@ Second target delivered too: the post-Q44 verify-band residual is walk load->fol
 
 Counter-availability ledger (operator note): rocprofv3 1.4.1 works only inside radiance-dev:v1.11.0 (host has no counters), and on this SDK the wait-class/GL2C/TCP/GRBM counters are dead zeros (GRBM_COUNT=0 is the tell) -- the alive set (SQ_BUSY_CYCLES/SQ_WAVES/SQC_LDS_BANK_CONFLICT/Wavefronts + dispatch metadata) was sufficient for this attribution; a vmcnt-vs-lgkmcnt split needs an SDK upgrade.
 
+
+
+## Window 58 (2026-10-27, AWST ~11:30-12:30) — Q45a DARK (drain was free) + the template-mirror trap fixed; delegation campaign closes with 2 shipped promotions
+
+Manager/subagent item 15 (Q45a named experiment, 146 calls / 51 min): the scoped staging barrier is ISA-correct, bit-identical 20/20, battery-clean, resource-neutral -- and the prescreen showed the full drain was never costing queue time, so the row's own gate stopped it before the timing ceremony. DARK, lever merged default-off. Together with Q43 (barrier removal flat) and Q33 (schedule transfer flat), the doctrine firms up: on this workload mix, latency hiding is deep -- removing WORK wins (Q44 -100% cross-lane ops, Q49 vector width), re-ordering or un-blocking does not.
+
+MIRROR TRAP (build-integrity law): r3d_attn_paged_decode.hip:139 mirrors the attn kernel template list for host stubs. A new template slot without mirror updates mangles host stubs against the device image -> segfault / 'Cannot find Symbol' at BOTH lever arms -- looking exactly like a broken kernel. The spl<=1 fallback leg of the probe matrix was the ONLY signal (serve rides spl=32). Fixed in the merge; law booked: template additions update every mirror decl, and probe spl<=1 legs before trusting any attn lever.
+
+Serve state at campaign close: spec9g LIVE on build_v161 (Q49 vector band, md5 be50cd43, /tokenize 200, both debug envs live). Rollback lineage spec9g_v151_rollback stopped and untouched all session; flashnext untouched all session (one app-level restart was flagged in window 45 and left alone per protocol).
+
