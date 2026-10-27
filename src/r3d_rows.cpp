@@ -354,6 +354,68 @@ static const RadOperandSpec oRopeTable[] = {
     { "positions", RAD_OPD_IN,  0 },
     { "cos_sin",   RAD_OPD_OUT, 0 },
 };
+/* qk_norm_rope_gate (+ the kv_store fold): parameter and operand names, order and optionality
+ * verbatim libr4d (r4d_rows.cpp pQkNormRopeGate/oQkNormRopeGate and the Kv pair) -- the graph
+ * template binds them by name, so the spelling is the ABI. Not docs/OPS.md's `qk_norm_rope`:
+ * different operands, and a precomputed cos/sin table instead of theta. The fp8 cache fold of
+ * the donor has no row here (RDNA3 has no native E4M3 path); the bf16 fold is `k_out`'s and v's
+ * two copies in the prologue's own blocks. */
+static const RadParamSpec pQkNormRopeGate[] = {
+    { "M",          RAD_P_INT, RAD_REQUIRED },
+    { "head_dim",   RAD_P_INT, RAD_REQUIRED },
+    { "n_head",     RAD_P_INT, RAD_REQUIRED },
+    { "n_head_kv",  RAD_P_INT, RAD_REQUIRED },
+    { "rot",        RAD_P_INT, RAD_REQUIRED },   /* rotary_dim, even and <= head_dim */
+    { "q_dtype",    RAD_P_STR, RAD_REQUIRED },
+    { "eps",        RAD_P_F64, RAD_OPTIONAL },
+    { "wadd",       RAD_P_F64, RAD_OPTIONAL },   /* GemmaRMSNorm's `1 +`; 0 for a plain norm */
+    { "cs_f32",     RAD_P_INT, RAD_OPTIONAL },   /* cos_sin table is f32 rather than bf16 */
+    { "pos_i64",    RAD_P_INT, RAD_OPTIONAL },
+};
+/* The q half is optional (the k-only form): with `n_head` 0 there is no `q_gate`, `q_w` or
+ * `q_out`, and every head is read from `k` at its row pitch. The gated attention template
+ * passes no `gate_out`: `gate_quant_fp8` reads the gate in place in the projection. */
+static const RadOperandSpec oQkNormRopeGate[] = {
+    { "q_gate",    RAD_OPD_IN,     1 },
+    { "k",         RAD_OPD_IN,     0 },
+    { "cos_sin",   RAD_OPD_IN,     0 },
+    { "positions", RAD_OPD_IN,     0 },
+    { "q_w",       RAD_OPD_WEIGHT, 1 },
+    { "k_w",       RAD_OPD_WEIGHT, 0 },
+    { "q_out",     RAD_OPD_OUT,    1 },
+    { "k_out",     RAD_OPD_OUT,    0 },
+    { "gate_out",  RAD_OPD_OUT,    1 },
+};
+static const RadParamSpec pQkNormRopeGateKv[] = {
+    { "M",          RAD_P_INT, RAD_REQUIRED },
+    { "head_dim",   RAD_P_INT, RAD_REQUIRED },
+    { "n_head",     RAD_P_INT, RAD_REQUIRED },
+    { "n_head_kv",  RAD_P_INT, RAD_REQUIRED },
+    { "rot",        RAD_P_INT, RAD_REQUIRED },
+    { "q_dtype",    RAD_P_STR, RAD_REQUIRED },
+    { "eps",        RAD_P_F64, RAD_OPTIONAL },
+    { "wadd",       RAD_P_F64, RAD_OPTIONAL },
+    { "cs_f32",     RAD_P_INT, RAD_OPTIONAL },
+    { "pos_i64",    RAD_P_INT, RAD_OPTIONAL },
+    { "block_size", RAD_P_INT, RAD_REQUIRED },
+    { "kv_dtype",   RAD_P_STR, RAD_REQUIRED },
+    { "k_scale",    RAD_P_F64, RAD_OPTIONAL },
+    { "v_scale",    RAD_P_F64, RAD_OPTIONAL },
+};
+static const RadOperandSpec oQkNormRopeGateKv[] = {
+    { "q_gate",       RAD_OPD_IN,     1 },
+    { "k",            RAD_OPD_IN,     0 },
+    { "cos_sin",      RAD_OPD_IN,     0 },
+    { "positions",    RAD_OPD_IN,     0 },
+    { "q_w",          RAD_OPD_WEIGHT, 1 },
+    { "k_w",          RAD_OPD_WEIGHT, 0 },
+    { "q_out",        RAD_OPD_OUT,    1 },
+    { "k_out",        RAD_OPD_OUT,    0 },
+    { "gate_out",     RAD_OPD_OUT,    1 },
+    { "v",            RAD_OPD_IN,     0 },
+    { "slot_mapping", RAD_OPD_IN,     0 },
+    { "kv_cache",     RAD_OPD_INOUT,  0 },
+};
 /* gdn_gated_rmsnorm: verbatim libref (pGatedNorm/oGatedNorm). */
 static const RadParamSpec pGatedNorm[] = {
     { "M",        RAD_P_INT, RAD_REQUIRED },
@@ -841,6 +903,18 @@ static const RadOpSchema kSchemas[] = {
         "the cos/sin plane a fused prologue reads instead of theta: cos then sin of "
         "`rope`'s ladder at each position's own row of a [max_ctx, rot] table; a negative "
         "position writes nothing." },
+      { "qk_norm_rope_gate", pQkNormRopeGate, (int)(sizeof(pQkNormRopeGate)/sizeof(pQkNormRopeGate[0])),
+        oQkNormRopeGate, (int)(sizeof(oQkNormRopeGate)/sizeof(oQkNormRopeGate[0])),
+        "split [q|gate] per head, QK RMS norm over the head, partial NeoX RoPE and the gate "
+        "copy, in one pass. Not docs/OPS.md's qk_norm_rope: different operands, and a "
+        "precomputed cos/sin table instead of theta. `n_head` 0 is the K-ONLY FORM -- no "
+        "`q_gate`, no `q_w`, no `q_out` -- for an input that is already one plain head per "
+        "`head_dim` columns with nothing interleaved." },
+      { "qk_norm_rope_gate_kv_store", pQkNormRopeGateKv, (int)(sizeof(pQkNormRopeGateKv)/sizeof(pQkNormRopeGateKv[0])),
+        oQkNormRopeGateKv, (int)(sizeof(oQkNormRopeGateKv)/sizeof(oQkNormRopeGateKv[0])),
+        "qk_norm_rope_gate followed by kv_store, in one launch: each k head's block also writes "
+        "its rotated k and its v into the paged cache at the token's slot. The `k` kv_store "
+        "reads is `k_out`, so the tail adds only `v`, `slot_mapping` and `kv_cache`." },
       { "gdn_gated_rmsnorm", pGatedNorm, (int)(sizeof(pGatedNorm)/sizeof(pGatedNorm[0])),
         oGatedNorm, (int)(sizeof(oGatedNorm)/sizeof(oGatedNorm[0])),
         "o = x * rsqrt(mean_channels(x^2) + eps) * w * act(z). `act` is \"silu\" or "
@@ -1023,6 +1097,23 @@ static const RadConstraint cKvStore[] = {
     { "kv_dtype",   RAD_C_IN, 0, "bf16" },
 };
 
+/* qk_norm_rope_gate, the positional form of libr4d's cQkNormRopeGate = { C_IN("q_dtype",
+ * "bf16"), C_LE("head_dim", 256), C_DIV("head_dim", 32) }. The Kv variants keep libr4d's
+ * shape; the fp8 cache arm has no libr3d row (no native E4M3 path), so only the bf16 pair
+ * is spelled. */
+static const RadConstraint cQkNormRopeGate[] = {
+    { "q_dtype",  RAD_C_IN, 0, "bf16" },
+    { "head_dim", RAD_C_LE, 256, nullptr },
+    { "head_dim", RAD_C_DIV, 32, nullptr },
+};
+static const RadConstraint cQkNormRopeGateKvBf16[] = {
+    { "q_dtype",    RAD_C_IN, 0, "bf16" },
+    { "head_dim",   RAD_C_LE, 256, nullptr },
+    { "head_dim",   RAD_C_DIV, 32, nullptr },
+    { "block_size", RAD_C_GE, 1, nullptr },
+    { "kv_dtype",   RAD_C_IN, 0, "bf16" },
+};
+
 /* libr3d is the only device library on RDNA3, so no in-plugin arbitration; the value only
  * needs to sit above a future fallback row. */
 enum { R3D_PRIO_ONLY = 1000 };
@@ -1191,6 +1282,8 @@ extern "C" int r3d_rad_act_mul(const RadArgs*, RadStream);
 extern "C" int r3d_rad_cast(const RadArgs*, RadStream);
 extern "C" int r3d_rad_rope(const RadArgs*, RadStream);
 extern "C" int r3d_rad_rope_table(const RadArgs*, RadStream);
+extern "C" int r3d_rad_qk_norm_rope_gate(const RadArgs*, RadStream);
+extern "C" int r3d_rad_qk_norm_rope_gate_kv_store(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt(const RadArgs*, RadStream);
 extern "C" int r3d_rad_logits_gemm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q(const RadArgs*, RadStream);
@@ -1356,6 +1449,29 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cRopeTable, 1, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_rope_table },
+
+{ "qk_norm_rope_gate", "qk_norm_rope_gate", "attn",
+  "the gated-attention QKV preamble in one pass: split [q|gate] per head, QK RMS norm over "
+  "the head, partial NeoX RoPE from the shared cos/sin table and the gate copy; byte-identical "
+  "to the rmsnorm+rope ops it replaces (r3d_qk_norm_rope_gate.hip header for the anchors)",
+  "head_dim 64, 128 or 256; rotary_dim even and <= head_dim; NeoX style; n_head may be 0, "
+  "which is the K-only form and serves an input with no gate interleaved",
+  "bf16 in and out; the norm output is rounded to bf16 before the rotation, as the unfused "
+  "reference does by storing it; f32 or bf16 cos/sin and gains, i32 or i64 positions",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cQkNormRopeGate, 3, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_qk_norm_rope_gate },
+
+{ "qk_norm_rope_gate_kv_store_bf16", "qk_norm_rope_gate_kv_store", "attn",
+  "qk_norm_rope_gate, and kv_store into a bf16 paged cache from the same launch -- the two "
+  "bytes per k-head element that kv_store_bf16 would copy, written from the block that "
+  "already holds them",
+  "qk_norm_rope_gate's shapes; cache exactly [n_blocks, kv_heads, block_size, 2*head_dim] "
+  "and one slot a row; a negative or out-of-range slot stores nothing",
+  "bf16 in and out, bf16 cache, i32 slot mapping",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cQkNormRopeGateKvBf16, 5, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_qk_norm_rope_gate_kv_store },
 
 { "gemm_nt_bf16", "gemm_nt", "gemm",
   "dense bf16 GEMM, 64x64 output tile per workgroup, K in 16-wide LDS slices",

@@ -60,6 +60,7 @@ set_source_files_properties(src/r3d_logit_rerank.hip PROPERTIES COMPILE_OPTIONS 
 set_source_files_properties(src/r3d_sample_ngram.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
 set_source_files_properties(src/r3d_gemm_w2a8.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
 set_source_files_properties(src/r3d_logit_rerank_e4m3.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
+set_source_files_properties(src/r3d_qk_norm_rope_gate.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-mno-wavefrontsize64")
 
 rad_add_plugin(libr3d kernels
   SOURCES     src/r3d_rows.cpp
@@ -72,6 +73,7 @@ rad_add_plugin(libr3d kernels
               src/r3d_band.hip src/r3d_more.hip src/r3d_gdn.hip src/r3d_dump.hip
               src/r3d_dflash_conv.hip src/r3d_dflash_select.hip src/r3d_logit_rerank.hip src/r3d_sample_ngram.hip
               src/r3d_gemm_w2a8.hip src/r3d_logit_rerank_e4m3.hip
+              src/r3d_qk_norm_rope_gate.hip
   GPU_TARGETS ${R3D_GPU_TARGETS}
   INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
