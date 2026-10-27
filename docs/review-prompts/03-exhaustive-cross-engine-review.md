@@ -74,17 +74,15 @@ The following information has been verified by the project maintainer. Accept it
 - There are no warp-shuffle capabilities beyond those documented in the project's `docs/isa/` corpus.
 - The instruction documentation bundled under `docs/isa/` is the authoritative basis for evaluating translated instruction-level proposals.
 
-### Performance and workload
-
 ### Correctness law: bit-exactness
 
 libr3d kernels are gated on matching the engine's reference outputs under the project's established precision laws, and reduction-tree shapes are part of that contract. Any proposal that changes summation order, reduction-tree topology, rounding, or scale-application placement is a **precision-visible change** and must be explicitly flagged as such in its `risks` with the specific values/accumulation order that change. Proposals that preserve instruction-level reduction order are strongly preferred.
 
-### Performance and workload
+### Performance ground truth
 
 - Decode is memory-bandwidth-bound.
-- Deep-context KV attention currently achieves approximately **171 GB/s effective bandwidth**.
-- A previous microbenchmark on an RX 7900 XTX reported that hipfire's quantized GEMV approach achieved approximately **2.5–3.5× the effective GB/s of the earlier libr3d implementation** on comparable MXFP4/Q8x shapes. Status update: libr3d's Q8x path has since been promoted default-on in-engine; establish the gap against the *current* shipped kernel, not the pre-promotion implementation the microbenchmark measured.
+- Deep-context KV attention achieves approximately **215-217 GB/s effective bandwidth** on the shipped serving arm (rebaselined at Q25 against build v142; the older 171 GB/s ledger datum predates the Q11 fragment-softmax promotion - do not cite 171 as current). The practical card ceiling for this access class is roughly 500 GB/s.
+- A previous microbenchmark on an RX 7900 XTX reported that hipfire's quantized GEMV approach achieved approximately **2.5-3.5x the effective GB/s of the earlier libr3d implementation** on comparable MXFP4/Q8x shapes. Status update: libr3d's Q8x path has since been promoted default-on in-engine; establish the gap against the *current* shipped kernel, not the pre-promotion implementation the microbenchmark measured. Re-attribution is booked as queue row Q35 - if you cannot pin the current gap from recorded evidence, report it as unattributed, not as an established multi-fold deficit.
 - Treat this result as an important lead, not as proof that the current implementation still has the same gap. Establish the exact comparison, measurement conditions, and correspondence to the current source from available evidence. Do not silently dismiss the result because other optimizations have since been implemented.
 
 ### Supported dtype universe
@@ -254,7 +252,7 @@ Investigate:
 
 Account for the already optimized attention variants and their recorded performance. In particular, compare any proposed split-KV or WMMA refinement against the existing path applicable to that geometry.
 
-Do not infer that 171 GB/s proves a particular bottleneck. Explain which code structure could cause the inefficiency and what existing evidence supports that hypothesis.
+Do not infer that any single bandwidth figure (including the 215-217 GB/s serving datum) proves a particular bottleneck. Explain which code structure could cause the inefficiency and what existing evidence supports that hypothesis.
 
 ### D. Fused kernels and inter-kernel data movement
 
@@ -334,6 +332,46 @@ Do not assume that code compiling for another AMD generation establishes correct
 ---
 
 ## 5. Method: establish the gap before proposing the fix
+
+**Step 0 — Portfolio gap attribution (mandatory before the per-technique audit).**
+
+Before auditing any individual technique, establish where the largest unexplained
+performance gaps actually are, and let that choose what you audit:
+
+1. Separate performance layers: serving throughput, time per generated token,
+   isolated kernel latency, and effective memory bandwidth are different
+   quantities. Do not assume a serving-level gap originates in a GPU kernel;
+   if the gap is serving-only, review the engine-to-kernel contract and
+   dispatch path instead.
+2. Establish baseline freshness: extract the most recent recorded results from
+   `docs/COVERAGE.md` and `docs/REVIEW_QUEUE.md`, identify the exact
+   implementation revision and dispatch path behind every number, and label
+   historical results as historical. A stale number is a research task, not a
+   gap.
+3. Build a gap matrix: for each workload that matters (dtype, dimensions, batch
+   or token count, context length, cache regime), record the current libr3d
+   arm, the donor implementation, recorded timings on both sides, and
+   comparability limits. Never present results from different workloads as a
+   direct speed comparison. The matrix covers only the closed dtype universe
+   in section 2.
+4. Explain structural causes before local fixes: data movement volume, useful
+   versus wasted traffic, packed-data utilisation, work distribution,
+   independent work in flight, register pressure and occupancy, reduction and
+   launch overhead, and dispatch decisions. Mark each candidate explanation
+   plausible or contradicted by the evidence.
+5. Unexplained multiplicative gaps between comparable implementations take
+   precedence over speculative single-instruction savings.
+6. Where recorded evidence is insufficient, do not guess: specify the missing
+   measurement as an explicit worker-side investigation task — the comparison,
+   the controls, the expected observations, and how each possible outcome
+   would be interpreted. The worker's bench protocol laws (COVERAGE window 7:
+   alternating A/B runs, weights rotated past the 96 MB L2, boot-log/arm
+   gating, no live-server contention) apply to every task you specify.
+7. Rank the final backlog by expected practical impact. Structural findings
+   (algorithm, layout, dispatch, fusion, scheduling) may rank above any ISA
+   item; do not reorder to keep ISA work first.
+
+This stays read-only: Step 0 specifies measurements, it does not run them.
 
 For every promising technique, use this sequence.
 
