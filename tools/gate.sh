@@ -74,6 +74,8 @@ stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
     [ -n "${R3D_ATT_FS:-}" ] && envs+=(-e R3D_ATT_FS="$R3D_ATT_FS")
     [ -n "${R3D_RMS_VEC:-}" ] && envs+=(-e R3D_RMS_VEC="$R3D_RMS_VEC")
     [ -n "${R3D_DEBUG_RMS:-}" ] && envs+=(-e R3D_DEBUG_RMS="$R3D_DEBUG_RMS")
+    [ -n "${R3D_SPLIT_POLICY:-}" ] && envs+=(-e R3D_SPLIT_POLICY="$R3D_SPLIT_POLICY")
+    [ -n "${R3D_SPLIT_CU:-}" ] && envs+=(-e R3D_SPLIT_CU="$R3D_SPLIT_CU")
     local out rc; out=$(mktemp); rc=0
     docker run --rm "${DEVS[@]}" "${envs[@]}" --shm-size=4g -v "$SCRATCH":/scratch -v "$REPO/$BUILD":/build:ro \
         --entrypoint /bin/bash "$IMG" -c "
