@@ -62,6 +62,10 @@ int main(int argc, char** argv) {
                                                           // an exact f32 integer-scaled sum, so
                                                           // any surviving diff is structural,
                                                           // never addition-order rounding
+    const bool onehot = getenv("Q53_ONEHOT") != nullptr; // q row = e_0 (one 1.0 at d=0),
+                                                          // K[j][0] = 2^(j%4), rest zero: S(j) is
+                                                          // exactly one K element -- m per split
+                                                          // pins the Q/K addressing map itself
     auto gen = [exact]() {
         if (exact) {
             static const float pw[] = {1.f, 2.f, 4.f, 8.f, -1.f, -2.f, -4.f, -8.f};
@@ -70,8 +74,23 @@ int main(int argc, char** argv) {
         double f; do f = rndu(-2.0, 2.0); while (f == 0.0f);
         return f;
     };
-    for (auto& v : hq)  v = f32_bf16((float)gen());
-    for (auto& v : hkv) v = f32_bf16((float)gen());
+    if (onehot) {
+        for (size_t i = 0; i < hq.size(); i++)
+            hq[i] = ((i % (size_t)HD) == 0) ? f32_bf16(1.f) : f32_bf16(0.f);
+        for (int b = 0; b < NB; b++)
+            for (int v = 0; v < KVH; v++)
+                for (int sl = 0; sl < BS; sl++) {
+                    size_t base = (((size_t)b * KVH + v) * BS + sl) * SLOTW;
+                    static const int p2[4] = {1, 2, 4, 8};
+                    for (int d = 0; d < SLOTW; d++)
+                        hkv[base + d] = (d == 0) ? f32_bf16((float)p2[(b * BS + sl) % 4])
+                                                 : f32_bf16(0.f);   /* V all zeros: P.0 == 0 */
+                }
+        for (auto& v : hq) { (void)v; }
+    } else {
+        for (auto& v : hq)  v = f32_bf16((float)gen());
+        for (auto& v : hkv) v = f32_bf16((float)gen());
+    }
     std::vector<int32_t> hbt(NB), hsu(1, CTX), hcu(2);
     for (int i = 0; i < NB; i++) hbt[i] = i;
     hcu[0] = 0; hcu[1] = rows;
