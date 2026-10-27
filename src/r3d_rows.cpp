@@ -1552,7 +1552,7 @@ static const RadKernelInfo kRows[] = {
   "f32 out, f32 partials and merge",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ATTN_DECODE,
   cAttnDecodeH64, 5, &tAttnSplit, 1, nullptr,
-  nullptr, nullptr, r3d_rad_attn_paged_decode, r3d_attn_paged_decode_scratch },
+  nullptr, nullptr, r3d_rad_attn_paged_decode, r3d_rad_attn_decode_scratch },
 
 { "attn_paged_decode_bf16kv_h256", "attn_paged", "attn",
   "split-KV decode attention, head_dim 256: as attn_paged_decode_bf16kv_h128 on the "
@@ -1563,7 +1563,7 @@ static const RadKernelInfo kRows[] = {
   "f32 partials and merge",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ATTN_DECODE,
   cAttnDecodeH256, 5, &tAttnSplit, 1, nullptr,
-  nullptr, nullptr, r3d_rad_attn_paged_decode, r3d_attn_paged_decode_scratch },
+  nullptr, nullptr, r3d_rad_attn_paged_decode, r3d_rad_attn_decode_scratch },
 
 /* ---- the sampling chain. The candidate-width cap on the cand-plane rows mirrors
  * libr4d's: the engine's declare-time bound is the buffer width, and 4096 covers it.
