@@ -161,8 +161,8 @@ int main(int argc, char** argv) {
             mk((char*)gy.data + L.y_off * 2, RAD_BF16, 2, { L.m, L.n }, { yp, 1 }),
         };
         if (!L.gain) t[1].data = nullptr;
-        RadParam pv[] = { RAD_INT("n", L.n) };
-        RadArgs a{}; a.p = pv; a.n_p = 1; a.t = t; a.n_t = 3;
+        RadParam pv[] = { RAD_INT("n", L.n), RAD_F64("wadd", L.wadd), RAD_F64("mult", L.mult) };
+        RadArgs a{}; a.p = pv; a.n_p = 3; a.t = t; a.n_t = 3;
         const int rc = entry(&a, (RadStream)0);
         die("sync", hipDeviceSynchronize());
 
