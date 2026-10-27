@@ -56,6 +56,7 @@ stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
     [ -n "${R3D_MXFP4_Q8X:-}" ] && envs+=(-e R3D_MXFP4_Q8X="$R3D_MXFP4_Q8X")
     [ -n "${R3D_Q8X_NT:-}" ] && envs+=(-e R3D_Q8X_NT="$R3D_Q8X_NT")
     [ -n "${R3D_Q8X_DPP:-}" ] && envs+=(-e R3D_Q8X_DPP="$R3D_Q8X_DPP")
+    [ -n "${R3D_Q8X_LMAP:-}" ] && envs+=(-e R3D_Q8X_LMAP="$R3D_Q8X_LMAP")
     [ -n "${R3D_DEBUG_DFLASH:-}" ] && envs+=(-e R3D_DEBUG_DFLASH="$R3D_DEBUG_DFLASH")
     [ -n "${R3D_HD256:-}" ] && envs+=(-e R3D_HD256="$R3D_HD256")
     [ -n "${R3D_HD256_PAD:-}" ] && envs+=(-e R3D_HD256_PAD="$R3D_HD256_PAD")

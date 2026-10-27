@@ -1065,6 +1065,147 @@ __global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_kernel(
     }
 }
 
+/* Q44 (REVIEW_QUEUE, desk probe window 53): the LANE-MAP arm -- fold-topology
+ * removal. Lane t OWNS one full 32-code group per iteration (iteration = eight
+ * 136B blocks = 32 groups = 1024 codes): 2x16B weight loads + its own scale byte,
+ * the int dot completes IN-LANE through 8 chained sudot4 (EXACT under integer
+ * associativity -- no fold_i32), SG/AS/sc are indexed by the lane's own g
+ * (per-lane scale containment), and acc[m] += c runs with ZERO cross-lane ops in
+ * the K walk. The single 5-op full-wave butterfly at row end (the shipped DPP-kit
+ * shapes 0x161/162/164/168 + xor-16 tail under the same dpp lever, verbatim
+ * shfl chain at dpp=0) is the only cross-lane traffic in the kernel. Same
+ * (group -> bytes, scale) address algebra as the shipped walk, byte-for-byte:
+ * block(g>>2), header byte (g&3), codes at +8+(g&3)*32 == the shipped quad map
+ * (g = 8*it + q reads back exactly the shipped sp/hi8/lo8 addresses).
+ * PRECISION CLASS: tolerance, NOT bit-identity -- the f32 tree differs (per-lane
+ * iteration-outer accumulation + row-end butterfly vs the shipped per-iteration
+ * fold tree). The probe measured the shipped tree is unreproducible while the
+ * folds are deleted (window 53 report §6.1), so the gates are rel_l2/KLD class.
+ * RAGGED-K: the entry gate promises K%256==0, so groups beyond nfull*32 number
+ * {0,8,16,24} -- the peel below lets every lane own at most one extra group with
+ * the same in-lane math, fold-free. The peel predicate (g < ngrp) is LANE-
+ * DIVERGENT but guards pure in-lane work only; the tail reduce sits OUTSIDE it
+ * at full exec -- the window-46 saveexec/DPP poison cannot bite (probe ISA: zero
+ * saveexec regions over every fold leg, both forms). */
+template <int MT>
+__global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_lm_kernel(
+    const uint8_t* __restrict__ S, const int8_t* __restrict__ X, const float* __restrict__ SG,
+    const float* __restrict__ AS, uint16_t* __restrict__ Y,
+    int M, int N, int K, int64_t y_pitch, int64_t as_pitch, int nt, int dpp)
+{
+    const int r = blockIdx.x;
+    const int t = threadIdx.x;
+    const int nfull = K >> 10;                 /* full 1024-code iterations */
+    const int ngrp  = K >> 5;                  /* total 32-code groups on the row */
+    const int live  = M < MT ? M : MT;
+    const uint8_t* crow = S + (int64_t)r * ((int64_t)(K >> 7) * 136);
+
+    float acc[MT];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) acc[m] = 0.0f;
+
+    const int wb = t >> 2;                     /* owned 136B block within the 8-span */
+    const int ws = (t & 3) * 32;               /* owned sub-block byte offset */
+    for (int it = 0; it < nfull; ++it) {
+        const uint8_t* blk = crow + ((int64_t)it << 3) * 136;
+        const uint8_t* wp = blk + wb * 136 + 8 + ws;
+        uint4 wa, wbv;
+        if (nt) {                              /* 4x b64 NT: same hint as shipped */
+            const uint64_t r0 = __builtin_nontemporal_load((const uint64_t*)wp);
+            const uint64_t r1 = __builtin_nontemporal_load((const uint64_t*)(wp + 8));
+            const uint64_t r2 = __builtin_nontemporal_load((const uint64_t*)(wp + 16));
+            const uint64_t r3 = __builtin_nontemporal_load((const uint64_t*)(wp + 24));
+            wa = make_uint4((uint32_t)r0, (uint32_t)(r0 >> 32), (uint32_t)r1, (uint32_t)(r1 >> 32));
+            wbv = make_uint4((uint32_t)r2, (uint32_t)(r2 >> 32), (uint32_t)r3, (uint32_t)(r3 >> 32));
+        } else {
+            wa = *(const uint4*)wp;
+            wbv = *(const uint4*)(wp + 16);
+        }
+        const int g = (it << 5) + t;           /* the LANE owns the 32-group */
+        const float sc = r3d_e8m0_sc(blk[wb * 136 + (t & 3)]);
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+            if (m >= live) break;              /* block-uniform: every lane skips */
+            const int8_t* xp = X + (int64_t)m * K + ((int64_t)it << 10) + t * 32;
+            const uint4 xa = *(const uint4*)xp;
+            const uint4 xb = *(const uint4*)(xp + 16);
+            int32_t p = __builtin_amdgcn_sudot4(1, (int)xa.x, 1, (int)wa.x, 0, 0);
+            p = __builtin_amdgcn_sudot4(1, (int)xa.y, 1, (int)wa.y, p, 0);
+            p = __builtin_amdgcn_sudot4(1, (int)xa.z, 1, (int)wa.z, p, 0);
+            p = __builtin_amdgcn_sudot4(1, (int)xa.w, 1, (int)wa.w, p, 0);
+            p = __builtin_amdgcn_sudot4(1, (int)xb.x, 1, (int)wbv.x, p, 0);
+            p = __builtin_amdgcn_sudot4(1, (int)xb.y, 1, (int)wbv.y, p, 0);
+            p = __builtin_amdgcn_sudot4(1, (int)xb.z, 1, (int)wbv.z, p, 0);
+            p = __builtin_amdgcn_sudot4(1, (int)xb.w, 1, (int)wbv.w, p, 0);
+            float c = (float)p * SG[(int64_t)m * (K >> 5) + g]
+                            * AS[(int64_t)m * as_pitch + (g >> 2)] * sc * 0.5f;
+            acc[m] += c;                       /* per-lane containment: NO fold */
+        }
+    }
+    /* ragged-K peel (K%1024 tail): the entry gate promises K%256==0, so at most
+     * 24 groups remain -- each lane owns none or exactly one, fold-free. */
+    for (int g = (nfull << 5) + t; g < ngrp; g += 32) {
+        const uint8_t* blk = crow + (int64_t)(g >> 2) * 136;
+        const uint8_t* wp = blk + 8 + ((g & 3) << 5);
+        uint4 wa, wbv;
+        if (nt) {
+            const uint64_t r0 = __builtin_nontemporal_load((const uint64_t*)wp);
+            const uint64_t r1 = __builtin_nontemporal_load((const uint64_t*)(wp + 8));
+            const uint64_t r2 = __builtin_nontemporal_load((const uint64_t*)(wp + 16));
+            const uint64_t r3 = __builtin_nontemporal_load((const uint64_t*)(wp + 24));
+            wa = make_uint4((uint32_t)r0, (uint32_t)(r0 >> 32), (uint32_t)r1, (uint32_t)(r1 >> 32));
+            wbv = make_uint4((uint32_t)r2, (uint32_t)(r2 >> 32), (uint32_t)r3, (uint32_t)(r3 >> 32));
+        } else {
+            wa = *(const uint4*)wp;
+            wbv = *(const uint4*)(wp + 16);
+        }
+        const float sc = r3d_e8m0_sc(blk[g & 3]);
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+            if (m >= live) break;
+            const int8_t* xp = X + (int64_t)m * K + ((int64_t)g << 5);
+            const uint4 xa = *(const uint4*)xp;
+            const uint4 xb = *(const uint4*)(xp + 16);
+            int32_t p = __builtin_amdgcn_sudot4(1, (int)xa.x, 1, (int)wa.x, 0, 0);
+            p = __builtin_amdgcn_sudot4(1, (int)xa.y, 1, (int)wa.y, p, 0);
+            p = __builtin_amdgcn_sudot4(1, (int)xa.z, 1, (int)wa.z, p, 0);
+            p = __builtin_amdgcn_sudot4(1, (int)xa.w, 1, (int)wa.w, p, 0);
+            p = __builtin_amdgcn_sudot4(1, (int)xb.x, 1, (int)wbv.x, p, 0);
+            p = __builtin_amdgcn_sudot4(1, (int)xb.y, 1, (int)wbv.y, p, 0);
+            p = __builtin_amdgcn_sudot4(1, (int)xb.z, 1, (int)wbv.z, p, 0);
+            p = __builtin_amdgcn_sudot4(1, (int)xb.w, 1, (int)wbv.w, p, 0);
+            float c = (float)p * SG[(int64_t)m * (K >> 5) + g]
+                            * AS[(int64_t)m * as_pitch + (g >> 2)] * sc * 0.5f;
+            acc[m] += c;
+        }
+    }
+    /* single tail reduce: full-wave butterfly at row end, OUTSIDE every predicate
+     * (store-after-fold, never fold-under-guard). */
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+        float v = acc[m];
+        if (dpp) {
+            v += __uint_as_float(__builtin_amdgcn_update_dpp(
+                __float_as_uint(v), __float_as_uint(v), 0x161, 0xf, 0xf, 0));
+            v += __uint_as_float(__builtin_amdgcn_update_dpp(
+                __float_as_uint(v), __float_as_uint(v), 0x162, 0xf, 0xf, 0));
+            v += __uint_as_float(__builtin_amdgcn_update_dpp(
+                __float_as_uint(v), __float_as_uint(v), 0x164, 0xf, 0xf, 0));
+            v += __uint_as_float(__builtin_amdgcn_update_dpp(
+                __float_as_uint(v), __float_as_uint(v), 0x168, 0xf, 0xf, 0));
+            v += dpp >= 2 ? __uint_as_float(q8x_perm_x16(__float_as_uint(v)))
+                          : __shfl_xor(v, 16);
+        } else {
+            v += __shfl_xor(v, 1);
+            v += __shfl_xor(v, 2);
+            v += __shfl_xor(v, 4);
+            v += __shfl_xor(v, 8);
+            v += __shfl_xor(v, 16);
+        }
+        if (t == 0 && m < live) Y[(int64_t)m * y_pitch + r] = f32_to_bf16_m4(v);
+    }
+}
+
 } /* anonymous namespace */
 
 #else  /* non-RDNA3: host-visible no-op, the launcher never dispatches it */
@@ -1091,6 +1232,10 @@ template <int MT>
 __global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_kernel(
     const uint8_t*, const int8_t*, const float*, const float*, uint16_t*,
     int, int, int, int64_t, int64_t, int, int, int) {}
+template <int MT>
+__global__ __launch_bounds__(32, 16) void gemm_nt_mxfp4_gemv_q8x_lm_kernel(
+    const uint8_t*, const int8_t*, const float*, const float*, uint16_t*,
+    int, int, int, int64_t, int64_t, int, int) {}
 } /* anonymous namespace */
 
 #endif
@@ -1478,6 +1623,17 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
                 if (e && !std::strcmp(e, "0")) return 0;
                 if (e && !std::strcmp(e, "2")) return 2;
                 return 1; }();
+            /* Q44 (REVIEW_QUEUE): R3D_Q8X_LMAP is the three-state lane-map lever.
+             * 0 (DEFAULT, unset or any other spelling) = shipped walk verbatim --
+             * the withdrawal arm, byte-identical dispatch to pre-Q44.
+             * 1 = lane-map walk at the VERIFY BAND (mt 4..8) only; M=1/2 decode
+             *     legs stay on the shipped walk (the serve-binding path is not
+             *     risked in round one; the probe expects it flat anyway).
+             * 2 = lane-map at every mt (bench arm; adjudicate only if 1 wins). */
+            static const int q8x_lmap = []{
+                const char* e = getenv("R3D_Q8X_LMAP");
+                return (e && e[0] == '1') ? 1 : (e && e[0] == '2') ? 2 : 0; }();
+            const bool lm_arm = q8x_lmap == 2 || (q8x_lmap == 1 && mt >= 4);
             const unsigned pgrid = (unsigned)((P.M * (P.K >> 5) + 7) / 8);
             hipLaunchKernelGGL(m4_act_i8_kernel, dim3(pgrid), dim3(256), 0, stream,
                                P.A, q8x_x8, q8x_sg, (int)P.M, (int)P.K, P.a_pitch);
@@ -1487,20 +1643,35 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
                                    q8x_x8, q8x_sg, P.AS, (uint16_t*)Y->data,           \
                                    (int)P.M, (int)P.N, (int)P.K, P.y_pitch, P.as_pitch,\
                                    q8x_nt, q8x_pf, q8x_dpp)
+            #define R3D_M4_Q8X_LM(MT_)                                                 \
+                hipLaunchKernelGGL((gemm_nt_mxfp4_gemv_q8x_lm_kernel<MT_>),            \
+                                   dim3((unsigned)P.N), dim3(32), 0, stream, plane,    \
+                                   q8x_x8, q8x_sg, P.AS, (uint16_t*)Y->data,           \
+                                   (int)P.M, (int)P.N, (int)P.K, P.y_pitch, P.as_pitch,\
+                                   q8x_nt, q8x_dpp)
             switch (mt) {
-                case 1: R3D_M4_Q8X(1); break;
-                case 2: R3D_M4_Q8X(2); break;
-                case 4: R3D_M4_Q8X(4); break;
-                default: R3D_M4_Q8X(8); break;
+                case 1: if (lm_arm) { R3D_M4_Q8X_LM(1); } else { R3D_M4_Q8X(1); } break;
+                case 2: if (lm_arm) { R3D_M4_Q8X_LM(2); } else { R3D_M4_Q8X(2); } break;
+                case 4: if (lm_arm) { R3D_M4_Q8X_LM(4); } else { R3D_M4_Q8X(4); } break;
+                default: if (lm_arm) { R3D_M4_Q8X_LM(8); } else { R3D_M4_Q8X(8); } break;
             }
             #undef R3D_M4_Q8X
+            #undef R3D_M4_Q8X_LM
             const hipError_t le = hipGetLastError();
             if (le == hipSuccess) {
                 if (getenv("R3D_DEBUG_GEMM")) {
-                    static bool once = false;
-                    if (!once) { once = true;
-                        fprintf(stderr, "libr3d: mxfp4 q8x dot4 arm launched (mt=%d pf=%d dpp=%d)\n",
-                                mt, q8x_pf, q8x_dpp); }
+                    /* one line per DISTINCT (mt, walk) tuple -- a static-bool-once
+                     * proves one arm per process and lets a silently-never-
+                     * dispatched lever look bit-exact (window-16 law). */
+                    static unsigned q8x_seen = 0;
+                    const unsigned key = 1u << (mt + (lm_arm ? 16 : 0));
+                    if (!(q8x_seen & key)) {
+                        q8x_seen |= key;
+                        fprintf(stderr, "libr3d: mxfp4 q8x %s arm launched (mt=%d pf=%d "
+                                        "dpp=%d lmap=%d)\n",
+                                lm_arm ? "lane-map" : "dot4", mt,
+                                lm_arm ? 0 : q8x_pf, q8x_dpp, q8x_lmap);
+                    }
                 }
                 return RAD_OK;
             }
