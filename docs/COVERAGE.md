@@ -3535,3 +3535,48 @@ v149 serve on the hd256 model 16Q/4KV, spec3, 1281 positions):
   after parsing the raw A/B lines; the mean recompute and all bookkeeping in
   this entry were completed by its successor session, same artifacts verified
   on disk.
+
+## WINDOW 42 (2026-10-27, AWST ~12:15-12:55) — Q33 BUILT, ADJUDICATED FLAT, SHIPPED DARK (v152; v151 STAYS SERVE ARTIFACT)
+- BUILD 3874404: R3D_BF16_DPP 0/1/2 three-state lever on the gemv_nt_bf16
+  butterfly (r3d_gemm_bf16.hip): 0 = verbatim shfl chain (default, SHIPPED
+  DARK), 1 = shfl-16 + DPP16 ROW_XMASK 8/4/2/1 (Q22 arm class), 2 = Q24
+  permlanex16-16 + DPP 8/4/2/1. Q33's transfer pattern followed the Q24 law
+  end-to-end: probe BEFORE A/B, same-binary adjudication, dark default.
+- PROBES (new tools, stay in tree): tools/q33_probe.hip — three-way lane-exact
+  (shfl vs LDS oracle vs fold) on x16, on the four row sites 8/4/2/1, and on
+  the EXACT shipped descending butterfly fold at lever 0/1/2: PROBE-BITEXACT,
+  2.68e8 lane-ops per site-class, zero mismatches. tools/bench_bf16_gemv.cpp —
+  dlopen r3d_rad_gemm_nt M==1 driver, random bf16 [1,2) operands, nonzero +
+  FNV yhash + dpp= liveness per leg.
+- IDENTITY: bench arms def/1/2 yhash byte-identical (1a57ce8883dc8c65) at
+  8192x16384 rot2 — fold == shfl end-to-end, as the probe predicts. Carve
+  census of gemv_nt_bf16_kernel: v_permlanex16_b32=1, v_mov_b32_dpp=4,
+  ds_bpermute=6 (lever-0 arm coexists in the object — dark ship keeps it).
+- A/B (same binary, card exclusive, 3 interleaved rounds x 4 shapes, lever0
+  median vs lever2 median, ms): 16384^2 0.628/0.628; 8192x16384 0.334/0.334;
+  4096^2 0.078/0.077; 4096x151936 (logits class) 1.384/1.383. FULL OVERLAP
+  at every shape (all |delta|<=1.3% median, interleaved ranges overlap) ->
+  WITHDRAW per the row's own expectation band (mxfp4 class, not w2a8 class).
+  MECHANISM OF FLATNESS: bf16 GEMV streams 790-900 GB/s in this regime; the
+  wavefronts stall on loads and hide the DS-pipe tail completely. w2a8's
+  +3..10% came from a q8 row streaming HALF the bytes per fold — the fold was
+  exposed there. Schedule-transfer law again: winning folds do not migrate
+  across rows with different bytes-per-fold ratios (cf. Q20-P2 donor depth).
+- GATES: battery 7/7 OK; ALL SEVEN default fingerprints ZERO-DIFF vs v151
+  (dark ship is byte-behavioural-identical, no registration delta); lever-2
+  full+kernels legs zero-diff vs default (bit-identity law visible in the
+  fingerprints). Artifacts cat:~/scratch/r3d/q33_gates.log, q33_probe.out,
+  q33_gemv.asm, q33_arm_*.txt, build_v152.log.
+- SERVE UNTOUCHED: v152 NOT promoted (zero benefit = zero mount risk).
+  spec9g stop/start mid-script for the exclusive A/B per the standing q24
+  grant; survived the cycle clean: restarts=0, health=200, v151 mount
+  verified after restore.
+- LESSONS: (1) -w silences FORMAT CHECKS: the first bench build printed heap
+  pointers as yhash (printf arg list missing yhash while the format string
+  had it — skew started AFTER t_med/gbs so A/B timings stayed valid, the
+  identity leg aborted itself by FAILing). Rebuilt -Wall (0 warnings), rerun
+  IDENTITY-OK. Bench builds carry -Wall from now on (noted in the tool
+  header). (2) ssh-nohup without setsid hangs the session after the payload
+  lands — background watcher pattern instead. (3) The Q24 probe->arms->census
+  ->battery->A/B gate script shape transfers cleanly to fold items
+  (q33_gates.sh is the template).
