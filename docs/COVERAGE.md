@@ -3422,3 +3422,58 @@ v149 serve on the hd256 model 16Q/4KV, spec3, 1281 positions):
 - Session arms verified at the serve level: OFF ran ZERO 256 WMMA paths
   (tile=0 slice=0), ON ran the tile, gfx1100 adoption asserted per boot,
   spec9g restored healthy after the window (qwen35, in_flight 0).
+
+## Window 38 (2026-10-27) — hd256 ACCEPTED: lever default ON + the m3 engine wiring, v150 promoted (serve artifact)
+- OPERATOR DECISION (this window, "we can accept that for now so lets promote
+  it"): hd256 rides by default on the w35 KLD pair evidence (mean 2.557e-2 /
+  top-1 0.969 = the fragment-class drift ~240x floor, established at m2, NOT
+  moved by m3) + the w37 split numerics (band flat SPL 1..64, fold==plain,
+  SPL=64==SPL=13 bit-exact). The drawer item "hd256 accept" CLOSES; RDNA3.5
+  guard remains the sole drawer resident.
+- CODE (6da5f6a, b81a502, decl-scope fix): R3D_HD256 flips to the q8x value law
+  -- unset/"1" = ON, literal "0" = OFF; R3D_NO_WMMA stays the family kill.
+  SINGLE-LAW function r3d_hd256_on() (wmma TU tail) is the one read for all
+  four claim sites: prefill tile launcher, decode launcher, arena hook, decode
+  mirror -- structurally cannot disagree (r3d_mxfp4_q8x_off() precedent).
+  THE M3 ENGINE WIRING THE ACCEPT NEEDED, which w37 left unwired (the slice arm
+  was gated+benched but UNREACHABLE from the engine: no 256 path through the
+  mirror, no band row, and the arena hook would have carved KV budget for
+  nothing): head_dim 256 joins the attn_paged decode mirror in paged.hip
+  (lever + bf16-KV conditional), and attn_paged_decode_bf16kv_h256 registers as
+  a band row beside h128/h64 (bf16 cache only, m2 law). Per the w37 live-band
+  law the mirror, not the row, is what the serve routes through.
+- GATE HISTORY (two self-inflicted compile catches, both caught by the build):
+  (1) the band-row patch FUZZY-MATCHED against the identical table tails and
+  corrupted the NEIGHBOURING h64 row's scratch-provider symbol; the
+  "Non-exact match" patch warning is a stop sign for registry-table edits --
+  re-anchor on a unique line before applying. (2) extern "C" at block scope is
+  illegal C++ (language linkage must be file scope). v150 compiled clean.
+- v150 CEREMONY (card exclusive, spec9g stopped; cat:~/scratch/r3d/
+  v150_promote.log + v150pg_*):
+  P0 FATBIN-IDENTICAL v150 vs v149 (17,056,248 B cmp): the flip + wiring is
+  host-only at the device level -- ALL w37 kernel evidence transfers verbatim
+  (rsk256 28/28 flat band, KLD pair, bench 3.79-5.66x).
+  P1 battery 7/7 OK, DEFAULT env (lever ON by law). Fingerprints vs v148: the
+  ONLY diffs are registration accounting (declared rows 56->57 -- the h256 row
+  itself -- every pack; reached rows unchanged, numeric columns byte-equal).
+  The booked "difflines=0" expectation was wrong on principle: adding a band
+  row MUST move the declared-row counter; the gate is zero NUMERIC-column diff.
+  P2 repro both arms REPRO256 PASS through the ENGINE ENTRY (r3d_rad_attn_paged,
+  the exact path the engine takes): default arm's 256 decode cases print the
+  decode ENTRY's arena DBG (x2; repro passes scratch=0, so the row correctly
+  falls back to the tile arm) and its 256 hashes SPLIT from the off arm
+  (5d9f88ca.../ec824fd1... tile vs 84a325c7.../72f43ecc... v1); off arm prints
+  ZERO decode-entry lines at 256; 128 controls match between arms. MIRROR
+  ROUTING PROVEN at the engine path.
+  P3 A/B liveness (runner law re-earned: bench mode "dev" is DEVICE ENUMERATION
+  -- the first pass ran empty and the RESULT-line assertion caught it; rerun
+  with mode "bench"): BENCH_HD=256 rows=1 ctx=8192 QH16/KVH2, 3 interleaved
+  rounds -- slice arm 442/468/471 us (slice-launch DBG=1 EVERY round) vs v1
+  scalar 30334/30334/30331 us (DBG=0): 68.6x versus the scalar one-block
+  disease m3 exists to cure, spreads DISJOINT, gbs_kv 35.6-37.9. (The m3
+  3.79-5.66x datum is slice-vs-plain-tile -- different baseline, consistent.)
+- SERVE: spec9g recreated on v150 (served /rhome/kernels/libr3d.so md5 ==
+  build tree 16d7a071...; boot prints "attn_paged -> attn_paged_decode_bf16kv_h256";
+  gfx1100 rank 0; restarts 0; chat probe live). v148 serve kept stopped as
+  spec9g_v148_rollback. LINEAGE: v148 SUPERSEDED; v150 is the serve/drafter-
+  mount artifact; v146/v147/v149 never promoted.
