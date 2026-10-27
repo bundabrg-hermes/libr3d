@@ -32,7 +32,8 @@
 
  * Serve geometry this tile is built for (MiniCPM5-2B): head_dim 128, 16 q heads / 2 kv
  * heads (gqa 8), block_size 16, bf16 cache. head_dim 64 compiles and runs on the same
- * template; head_dim 256 rides a fitted carve behind R3D_HD256 (default OFF; issue #11
+ * template; head_dim 256 rides a fitted carve behind R3D_HD256 (default ON since the
+ * 2026-10-27 accept, q8x value law; issue #11
  * milestone 2 -- dynamic LDS, S pitch kBN+1 / P pitch kBN+2 by default (pad A/B under
  * R3D_HD256_PAD), one block/CU). q-f32 or
  * kv-f32 caches, head_dim outside the instantiated set, and every refused shape
@@ -214,17 +215,21 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
     }
     if (!allowed) return RAD_E_UNSUPPORTED;
     if (P.qdt != RAD_BF16) return RAD_E_UNSUPPORTED;
-    /* R3D_HD256 lever (issue #11 milestone 2, default OFF). Unset: the shipped law
-     * holds unchanged -- head_dim outside {64,128} refuses here and v1 serves it,
-     * byte-identically to c7b2531. Set: head_dim 256 joins the WMMA families on the
-     * fitted tile (r3d_attn_wmma_body.inc's Carve<256>). The kill switch R3D_NO_WMMA
+    /* R3D_HD256 lever (issue #11; ACCEPTED 2026-10-27: default ON, q8x value law).
+     * Unset or "1": head_dim 256 joins the WMMA families on the fitted tile
+     * (r3d_attn_wmma_body.inc's Carve<256>), and the m3 split-KV decode arm is wired
+     * to it. Literal "0": the shipped law holds unchanged -- head_dim outside
+     * {64,128} refuses here and v1 serves it, byte-identically to c7b2531. The kill
+     * switch R3D_NO_WMMA
      * withdraws this path too (it zeroes `allowed` above, one switch for every WMMA
      * row), and R3D_ATTN_V2/V3 refuse 256 (v2/v3 instantiate 64/128 only -- the
      * refusal lands on v1 inside the entry, never on the engine). fp8 KV at 256
      * stays v1: no 256-fp8 instantiation exists, and refusing a dtype the entry
-     * backstops is the ordinary contract. */
-    static int hd256 = -1;
-    if (hd256 < 0) hd256 = getenv("R3D_HD256") ? 1 : 0;
+     * backstops is the ordinary contract. Accept evidence: COVERAGE windows 35/37/38
+     * (fragment-class drift accepted by the operator; split-KV decode 3.8-5.7x,
+     * numeric band flat across SPL 1..64). */
+    extern "C" int r3d_hd256_on(void);   /* the single law, defined at file tail */
+    const int hd256 = r3d_hd256_on();
     if (P.head_dim != 64 && P.head_dim != 128 && !(hd256 && P.head_dim == 256))
         return RAD_E_UNSUPPORTED;
 
@@ -375,4 +380,16 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
            grid.x, grid.y, grid.z, (int)le, hipGetErrorString(le));
 #endif
     return le == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* R3D_HD256 single law (accept 2026-10-27, q8x value rule): unset or "1" = ON,
+ * literal "0" = OFF. ONE read for all four claim sites -- this launcher, the
+ * decode launcher, the decode arena hook, and the attn_paged decode mirror --
+ * so the tile, the slice arm, the arena request, and the entry's routing can
+ * never disagree about the lever state (r3d_mxfp4_q8x_off() precedent). */
+extern "C" int r3d_hd256_on(void) {
+    static const int on = []{
+        const char* e = getenv("R3D_HD256");
+        return e && !std::strcmp(e, "0") ? 0 : 1; }();
+    return on;
 }

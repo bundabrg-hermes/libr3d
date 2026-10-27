@@ -3,7 +3,8 @@
 // of the same libr3d.so the serve loads. Forked from the Phase C bench_r3d.hip with
 // the single generalization issue #11 milestone 3 needs: head_dim is an env lever
 // (BENCH_HD, default 128 -> every v148-era command reproduces verbatim; BENCH_HD=256
-// + R3D_HD256=1 drives the new slice arm). Shapes: bf16 KV, page block 16, arbitrary
+// rides the new slice arm -- default ON since the 2026-10-27 accept, R3D_HD256=0
+// withdraws to scalar). Shapes: bf16 KV, page block 16, arbitrary
 // QH/KVH GQA, rows 1..8 (decode + speculative verify band), n_seq 1 + cu_seqlens as
 // serve passes them. GB/s accounting: KV bytes streamed once per kv-head group by
 // the fold arm = ctx * kvh * 2(K+V) * hd * 2 B (the plain arm streams gqa times that

@@ -1078,7 +1078,8 @@ static const RadTunable tAttnSplit = { "splits", kSplits, 5, 0,
  * speculative verify -- libr4d's decode-band bound, same spelling), window 0 (the row
  * serves a full KV walk; windowed decode stays with the tile), bf16 q, bf16/fp8-e4m3
  * cache. head_dim is one row per value, libr4d's convention: each is exactly a WMMA
- * template instantiation, and no IN set exists for integer keys. */
+ * template instantiation, and no IN set exists for integer keys. head_dim 256
+ * (accept 2026-10-27) is bf16-cache only: the 256 family has no fp8 instantiation. */
 static const RadConstraint cAttnDecodeH128[] = {
     RAD_CLE("q_len", 8),
     RAD_CEQ("window", 0),
@@ -1092,6 +1093,13 @@ static const RadConstraint cAttnDecodeH64[] = {
     RAD_CEQ("head_dim", 64),
     RAD_CIN("q_dtype", "bf16"),
     RAD_CIN("kv_dtype", "bf16 fp8_e4m3"),
+};
+static const RadConstraint cAttnDecodeH256[] = {
+    RAD_CLE("q_len", 8),
+    RAD_CEQ("window", 0),
+    RAD_CEQ("head_dim", 256),
+    RAD_CIN("q_dtype", "bf16"),
+    RAD_CIN("kv_dtype", "bf16"),   /* no 256-fp8 instantiation (issue #11 law) */
 };
 
 /* rope: neox and gptj over [M] positions, plus imrope over [3, M] component-major positions
@@ -1544,7 +1552,18 @@ static const RadKernelInfo kRows[] = {
   "f32 out, f32 partials and merge",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ATTN_DECODE,
   cAttnDecodeH64, 5, &tAttnSplit, 1, nullptr,
-  nullptr, nullptr, r3d_rad_attn_paged_decode, r3d_rad_attn_decode_scratch },
+  nullptr, nullptr, r3d_rad_attn_paged_decode, r3d_attn_paged_decode_scratch },
+
+{ "attn_paged_decode_bf16kv_h256", "attn_paged", "attn",
+  "split-KV decode attention, head_dim 256: as attn_paged_decode_bf16kv_h128 on the "
+  "m2 fitted body at SPLITK=1 (issue #11 m3); bf16 cache only -- no 256-fp8 arm",
+  "decode and speculative verify (q_len <= 8), window 0, head_dim 256, any gqa, any "
+  "block size, ragged batches via cu_seqlens, unmapped block table entries skipped",
+  "bf16 query, bf16 kv cache with optional per-(seq,head) descales, bf16 or f32 out, "
+  "f32 partials and merge",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ATTN_DECODE,
+  cAttnDecodeH256, 5, &tAttnSplit, 1, nullptr,
+  nullptr, nullptr, r3d_rad_attn_paged_decode, r3d_attn_paged_decode_scratch },
 
 /* ---- the sampling chain. The candidate-width cap on the cand-plane rows mirrors
  * libr4d's: the engine's declare-time bound is the buffer width, and 4096 covers it.

@@ -389,15 +389,18 @@ static int r3d_attn_paged_impl(const RadArgs* a, RadStream s) {
      * the tile below), so this route can only ever change which launch runs,
      * never the math. The dtype/head_dim mirror here is for shapes the band
      * itself refuses (windowed, f32 cache, other head_dims): they keep the
-     * direct path with no extra fill. The mirror deliberately does NOT include
-     * head_dim 256: the split-K row has no 256 instantiation (issue #11 m2
-     * desk-sized it only), so a 256 decode shape takes the WMMA offer below --
-     * the plain tile if R3D_HD256 is on, v1 otherwise -- without a detour
-     * through an entry that could only hand it back. rows <= 8*n_seq is the
+     * direct path with no extra fill. head_dim 256 joins the mirror iff the
+     * R3D_HD256 lever is on (default ON since the 2026-10-27 accept): issue #11
+     * m3 wired the 256 slice arm into the decode entry, so a 256 bf16-cache
+     * decode shape rides split-KV there; with R3D_HD256=0 -- or fp8 KV at 256,
+     * which has no instantiation -- the shape takes the WMMA offer below (the
+     * plain tile or v1) exactly as it did at v148. rows <= 8*n_seq is the
      * per-step bound that survives cu_seqlens (q_len_uniform is 0 whenever the
      * engine passes it). */
+    extern "C" int r3d_hd256_on(void);   /* the single law, r3d_attn_paged_wmma.hip */
+    const int d256_mirror = r3d_hd256_on() && P.head_dim == 256 && P.kvdt == RAD_BF16;
     if (P.window == 0 && P.n_seq > 0 && P.rows <= 8 * P.n_seq &&
-        (P.head_dim == 64 || P.head_dim == 128) &&
+        (P.head_dim == 64 || P.head_dim == 128 || d256_mirror) &&
         P.qdt == RAD_BF16 && (P.kvdt == RAD_BF16 || P.kvdt == RAD_F8E4M3))
         return r3d_rad_attn_paged_decode(a, s);
 

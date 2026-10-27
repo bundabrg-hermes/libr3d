@@ -11,8 +11,9 @@
 // this adds the bf16-oracle rounding margin the attn_oracle_sweep law carries) AND no
 // >0.1% outliers (bit-diff > 16 on a live element).
 //
-// Arms are process-scoped env (the .so reads levers once): run once with R3D_HD256
-// unset (v1 scalar arm) and once with R3D_HD256=1 (tile arm) -- the per-case FNV
+// Arms are process-scoped env (the .so reads levers once): run once with R3D_HD256=0
+// (v1 scalar arm) and once unset (tile arm -- default ON since the 2026-10-27 accept)
+// -- the per-case FNV
 // hashes MUST differ between arms on every 256 case (a tile that secretly ran v1
 // prints the same hash), MUST match between arms on the 128 control cases (the lever
 // may not perturb the shipped geometry), and every run prints its DEVICE line: a run
@@ -25,8 +26,8 @@
 // Build/run (radiance-dev, on the card; RAM-cheap: plain hipcc of one small TU):
 //   hipcc -O1 -std=c++20 -I/opt/radiance/include/radiance -w tools/repro_attn256.hip \
 //     -o /tmp/ra256 -ldl
-//   LIBR3D_SO=/work/build_v117/radiance_home/kernels/libr3d.so /tmp/ra256            # v1 arm
-//   R3D_HD256=1 LIBR3D_SO=/work/build_v117/radiance_home/kernels/libr3d.so /tmp/ra256 # tile arm
+//   LIBR3D_SO=/work/build_v117/radiance_home/kernels/libr3d.so /tmp/ra256            # tile arm (default)
+//   R3D_HD256=0 LIBR3D_SO=/work/build_v117/radiance_home/kernels/libr3d.so /tmp/ra256 # v1 arm
 #include <hip/hip_runtime.h>
 #include <dlfcn.h>
 #include <cmath>
@@ -302,7 +303,7 @@ int main(int argc, char** argv) {
     const int c6[]  = { 8192 };
     const int c7[]  = { 1024 };
 
-    // 256-class cases (tile iff R3D_HD256; v1 otherwise -- hashes split the arms):
+    // 256-class cases (tile iff the lever is on -- default; v1 otherwise -- hashes split the arms):
     run_case(256, 1,   c1, 1, 0, 1, entry, "decode-r1");
     run_case(256, 4,   c2, 1, 0, 2, entry, "verify-r4-neg");   // spec-3 band, signed descales
     run_case(256, 70,  c3, 1, 0, 0, entry, "tile-edge");       // straddles the 64-row tile

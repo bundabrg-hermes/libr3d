@@ -67,6 +67,11 @@
 #include "rad_plugin.h"
 #include "r3d_attn.h"
 
+/* r3d_attn_paged_wmma.hip: the single R3D_HD256 law (q8x value rule, accept
+ * 2026-10-27) -- shared by the prefill launcher, this file's launcher AND the
+ * decode arena hook so the three can never disagree about the lever state. */
+extern "C" int r3d_hd256_on(void);
+
 namespace {
 
 /* dtype-widening helpers: bit-identical to the v1 kernel's and the prefill tile's (same
@@ -253,11 +258,12 @@ extern "C" int64_t r3d_rad_attn_decode_scratch(const RadArgs* a) {
     const int64_t D        = rad_args_geti_or(a, "head_dim", 0);
     if (n_head > 0 && max_seqs > 0) {
         if (D != 64 && D != 128) {
-            /* 256 claims an arena ONLY behind the R3D_HD256 lever: unset, the
-             * decode row never launches a 256 split, and asking the engine to
-             * carve an arena the model class cannot use would cost real KV
-             * budget for nothing (issue #11 m3). */
-            if (D != 256 || !getenv("R3D_HD256")) return 0;
+            /* 256 claims an arena ONLY while the R3D_HD256 lever is on (it is by
+             * default since the 2026-10-27 accept): with R3D_HD256=0 the decode row
+             * never launches a 256 split, and asking the engine to carve an arena
+             * the model class cannot use would cost real KV budget for nothing
+             * (issue #11 m3). Same law as both launchers -- r3d_hd256_on(). */
+            if (D != 256 || !r3d_hd256_on()) return 0;
         }
         int64_t mc = rad_args_geti_or(a, "max_ctx", 0);
         if (mc <= 0) return 0;
@@ -328,10 +334,12 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
      * D-generic, see the body's m3 note), merged by the same D-generic merge kernel.
      * v2/v3 and fp8 KV at 256 have no instantiation (the prefill launcher's law,
      * mirrored here): those shapes keep d256=0, take tile_or_v1, and land on the m2
-     * tile or v1 exactly as before this row changed. Lever unset: every stock shape
-     * sees the identical gate it saw at v148. */
-    static int hd256 = -1;
-    if (hd256 < 0) hd256 = getenv("R3D_HD256") ? 1 : 0;
+     * tile or v1 exactly as before this row changed. R3D_HD256=0 (the withdrawal,
+     * q8x value law): every shape sees the identical gate it saw at v148. Accepted
+     * 2026-10-27: the lever defaults ON -- the engine reaches this entry for 256
+     * decode shapes through the decode mirror (r3d_attn_paged.hip) and the
+     * attn_paged_decode_bf16kv_h256 band row (r3d_rows.cpp). */
+    const int hd256 = r3d_hd256_on();
     const int d256 = hd256 && P.head_dim == 256 && !v2 && P.kvdt == RAD_BF16;
     const int wmma_ok = allowed && P.qdt == RAD_BF16
                      && (P.kvdt == RAD_BF16 || P.kvdt == RAD_F8E4M3)
