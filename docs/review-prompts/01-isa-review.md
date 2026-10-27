@@ -29,8 +29,9 @@ narrative chapters). Prefer it. The official manual is AMD document 69267,
 **Ground truth (verified on hardware, do not "correct" these):**
 - gfx1100 has `v_dot4_i32_iu8` / `v_sudot4` (verified working). It has **no**
   AGPR/accvgpr accumulators; WMMA on RDNA3 uses plain VGPRs.
-- Decode is memory-bandwidth-bound; deep-context KV attention currently runs
-  ~171 GB/s effective.
+- Decode is memory-bandwidth-bound; deep-context KV attention runs
+  ~215-217 GB/s effective on the shipped serving arm (v142-era rebaseline,
+  queue row Q25; practical ceiling ~500 GB/s).
 - Dtype universe is closed: {bf16, f32, fp8a8 (128-block scales), i8a8,
   mxfp4a8 (E8M0/32-block), w2a8}. Proposals for dtypes outside this set are
   phantom work.

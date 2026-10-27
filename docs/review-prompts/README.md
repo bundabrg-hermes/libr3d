@@ -13,6 +13,16 @@ validation.
 | 2 | `02-cross-engine-review.md` | Do proven kernels in other inference engines do the same job with a better structure? |
 | 3 | `03-exhaustive-cross-engine-review.md` | Broadest evidence-grounded backlog: is any family prematurely considered exhausted? (superset of pass 2; budget-capped output) |
 
+Scope policy (adopted 2026-10-27 on reviewer meta-review, endorsed by the
+maintainer after checking the submission record): pass 1 is a kernel-FINISHING
+tool, not a discovery engine. History supports this - the largest wins of the
+last week (Q30 env vars, the spill census, the Q1 barrier-idiom family) came
+from pass 2 donors, third-party triage, and measurement attribution, while
+recent pure-ISA pass-1 rounds returned flat-to-modest results (with Q32 the
+standing counterexample). Do not run further pass-1 rounds to choose the next
+major optimization; use the Step 0 gap-attribution stage in pass 3 for that,
+and spend pass 1 only polishing kernels already selected for work.
+
 Usage:
 
 1. Give the model this repo (clone or file access to the GitHub fork

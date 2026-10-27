@@ -44,8 +44,9 @@ explicitly if so.
 - gfx1100 has `v_dot4_i32_iu8` / `v_sudot4` (verified working). No
   AGPR/accvgpr accumulators; RDNA3 WMMA uses plain VGPRs. No CDNA matrix
   cores, no warp shuffles beyond what `docs/isa/` lists.
-- Decode is memory-bandwidth-bound; deep-context KV attention currently runs
-  ~171 GB/s effective.
+- Decode is memory-bandwidth-bound; deep-context KV attention runs
+  ~215-217 GB/s effective on the shipped serving arm (v142-era rebaseline,
+  queue row Q25; practical ceiling ~500 GB/s).
 - Dtype universe is closed: {bf16, f32, fp8a8 (128-block scales), i8a8,
   mxfp4a8 (E8M0/32-block), w2a8}. Donor kernels for other quant formats
   (e.g. NVFP4, MXFP8) are accepted only as *structural* ideas, not formats.
