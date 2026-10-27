@@ -46,17 +46,17 @@ __device__ __host__ inline float bf16_hi_f(uint16_t h) {
 static uint32_t rng_s = 0xC0FFEEu;
 static uint32_t xrnd() { rng_s ^= rng_s << 13; rng_s ^= rng_s >> 17; rng_s ^= rng_s << 5; return rng_s; }
 
-struct Res { int n_nan_split; int n_both_nan; double max_abs; double rel_l2_num; double rel_l2_den;
+struct Res { int n_nan_split; int n_both_nan; int n_nan_payload; double max_abs; double rel_l2_num; double rel_l2_den;
              int n_bit_exact; long n; };
 static Res cmp(const std::vector<uint16_t>& a, const std::vector<uint16_t>& b) {
-    Res r{0,0,0.0,0.0,0.0,0,(long)a.size()};
+    Res r{0,0,0,0.0,0.0,0.0,0,(long)a.size()};
     double sa = 0.0;
     for (size_t i = 0; i < a.size(); ++i) {
         float x = bf16_hi_f(a[i]), y = bf16_hi_f(b[i]);
         if (a[i] == b[i]) ++r.n_bit_exact;
         bool nx = std::isnan(x), ny = std::isnan(y);
         if (nx != ny) { ++r.n_nan_split; continue; }
-        if (nx && ny) { ++r.n_both_nan; continue; }
+        if (nx && ny) { ++r.n_both_nan; if (a[i] != b[i]) ++r.n_nan_payload; continue; }
         double d = std::fabs((double)x - (double)y);
         if (d > r.max_abs) r.max_abs = d;
         r.rel_l2_num += d * d; sa += (double)x * x;
@@ -129,6 +129,7 @@ int main(int argc, char** argv) {
             ck(hipMalloc(&dS, plane), "S"); ck(hipMalloc(&dX, hX.size()), "X");
             ck(hipMalloc(&dSG, hSG.size() * 4), "SG"); ck(hipMalloc(&dAS, hAS.size() * 4), "AS");
             ck(hipMalloc(&dYa, (size_t)yp * M * 2), "Ya"); ck(hipMalloc(&dYb, (size_t)yp * M * 2), "Yb");
+            ck(hipMemset(dYa, 0, (size_t)yp * M * 2), "msa"); ck(hipMemset(dYb, 0, (size_t)yp * M * 2), "msb");
             ck(hipMemcpy(dS, hS.data(), plane, hipMemcpyHostToDevice), "cpS");
             ck(hipMemcpy(dX, hX.data(), hX.size(), hipMemcpyHostToDevice), "cpX");
             ck(hipMemcpy(dSG, hSG.data(), hSG.size() * 4, hipMemcpyHostToDevice), "cpSG");
@@ -145,9 +146,9 @@ int main(int argc, char** argv) {
                 ck(hipMemcpy(Yb.data(), dYb, Yb.size() * 2, hipMemcpyDeviceToHost), "cpYb");
                 Res r = cmp(Ya, Yb);
                 double rl2 = r.rel_l2_den > 0 ? r.rel_l2_num / r.rel_l2_den : r.rel_l2_num;
-                printf("MODE=%d K=%d M=%d mt=%d nt=%d dpp=%d | bitexact=%ld/%ld maxabs=%.6g rel_l2=%.3g nan_split=%d both_nan=%d\n",
+                printf("MODE=%d K=%d M=%d mt=%d nt=%d dpp=%d | bitexact=%ld/%ld maxabs=%.6g rel_l2=%.3g nan_split=%d both_nan=%d nanpayload=%d\n",
                        mode, K, M, mt, nt, dpp, (long)r.n_bit_exact, r.n, r.max_abs, rl2,
-                       r.n_nan_split, r.n_both_nan);
+                       r.n_nan_split, r.n_both_nan, r.n_nan_payload);
                 if (r.n_nan_split) { fprintf(stderr, "HARD FAIL (NaN split)\n"); ++fails; }
                 if (mode == 2 && (long)r.n_bit_exact != r.n) {
                     fprintf(stderr, "INT-EXACT WITNESS FAIL: mode-2 outputs not bit-identical\n");
