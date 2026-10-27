@@ -21,6 +21,11 @@ Requires: llvm-objdump, llvm-readelf, c++filt on PATH.
 """
 import os, re, sys, struct, subprocess, tempfile
 
+# Window-52 drift repair: R3D_LLVM_BIN=<dir> overrides the llvm tool dir;
+# default is the system PATH (previously an implicit ROCm-10.1 pin).
+LLVM = os.environ.get("R3D_LLVM_BIN", "").strip()
+def _tool(nm): return (LLVM + "/" + nm) if LLVM else nm
+
 def carve(path, outdir, gfx):
     data = open(path, "rb").read()
     sec = subprocess.run(["objcopy", "-O", "binary", "--only-section=.hip_fatbin",
@@ -41,8 +46,9 @@ def carve(path, outdir, gfx):
         end = offs[j + 1] if j + 1 < len(offs) else len(sec)
         p = os.path.join(outdir, f"co_{j:02d}.bin")
         open(p, "wb").write(sec[off:end])
-        n = subprocess.run(["llvm-readelf", "--notes", p], capture_output=True, text=True).stdout
-        tgt = re.search(r"\.target:\s+(\S+)", n)
+        n = subprocess.run([_tool("llvm-readelf"), "--notes", p], capture_output=True, text=True).stdout
+        # Match BOTH target-note forms: ROCm-era ".target:" and current "amdhsa.target:".
+        tgt = re.search(r"(?:amdhsa\.target|\.target):\s+(\S+)", n)
         if tgt and gfx in tgt.group(1):
             names[p] = n
     return names
@@ -84,7 +90,7 @@ def main():
         tot_f = tot_b = 0
         exposed = 0
         for p in sorted(objs):
-            s = subprocess.run(["llvm-objdump", "-d", "--mcpu=" + gfx, p],
+            s = subprocess.run([_tool("llvm-objdump"), "-d", "--mcpu=" + gfx, p],
                                capture_output=True, text=True).stdout
             fp = os.path.join(td, os.path.basename(p) + ".s")
             open(fp, "w").write(s)
