@@ -3391,3 +3391,34 @@ the row-count assertion (81/round) caught the empty run. Fixed with SWEEP_ROUND 
 
 KLD accept-evidence pair (teacher-forced, differential law, v149 serve on
 qwen35-9b-mxfp4 = the hd256 serve geometry 16Q/4KV): see next entry.
+
+KLD accept-evidence pair, window 35 continued (teacher-forced, differential law,
+v149 serve on the hd256 model 16Q/4KV, spec3, 1281 positions):
+- Boot arithmetic: flashnext's deploy took the host's third-serve headroom
+  (avail 3.3 GB, serve wants ~4.5 with the engine's default 4.0 GiB
+  --host-headroom-mib). The guard aborted clean; the session ran with the
+  knob at 256 over a TEMPORARY 8 GB swapfile (removed after -- host back as
+  found). PORT LAW (new): llama-swap silently owns 9009/9010 here; a serve
+  whose bind fails into /dev/null still prints its card line, so the m2-era
+  log-grep check cannot tell whose /health you are answering -- v149 flow
+  binds 9013 with a pre-flight port guard and a post-boot identity check
+  (health body must carry radiance's in_flight field).
+- Differential ON vs OFF: mean 2.557e-2, p99 0.359, top-1 0.969 -- same FAIL
+  class as m2's tile-only measurement (9.79e-3, 0.979); the exact value is
+  not cross-session comparable (each session scores its own fresh free-run
+  trajectory, and the drift is tail-dominated: prose components sit at the
+  floor -- prose-long 0.0018 -- while math/code carry 0.04-0.08 means).
+  Nothing about it is decode-split attributable: FORCED SCORING IS PREFILL-
+  ONLY (the slice arm is never invoked by the score pass; slice launch-proof
+  = 0 with tile = 1 is the instrument's design, not a defect -- the proof
+  lines are static-once per process, so tile=1 is the expected positive).
+- Decode-split serve-level attribution is therefore structurally unavailable
+  from this instrument, and the kernel-level numerics ARE the attribution:
+  flat band across SPL=1..64, fold==plain, SPL=64==SPL=13 bit-exact on the
+  inert-slice path, and the host re-merge strictly below the device arm.
+  The accept decision for the hd256 FAMILY (fragment-rounding class, ~240x
+  floor, established m2) remains the operator drawer item it always was --
+  milestone 3 does not move it and this run did not need to.
+- Session arms verified at the serve level: OFF ran ZERO 256 WMMA paths
+  (tile=0 slice=0), ON ran the tile, gfx1100 adoption asserted per boot,
+  spec9g restored healthy after the window (qwen35, in_flight 0).
