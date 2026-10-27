@@ -1,0 +1,14 @@
+lane 24 fa=3f0f3300 fb=3f323400 gmax=3f7f0500 rmax=3f7f0500 gsum=4185d1d8 rsum=4185d1d8
+lane 25 fa=3e7eac00 fb=3f690300 gmax=3f7f0500 rmax=3f7f0500 gsum=4185d1d8 rsum=4185d1d8
+lane 26 fa=3e9df000 fb=3ea47a00 gmax=3f7f0500 rmax=3f7f0500 gsum=4185d1d8 rsum=4185d1d8
+lane 27 fa=3d28a000 fb=3e955400 gmax=3f7f0500 rmax=3f7f0500 gsum=4185d1d8 rsum=4185d1d8
+lane 28 fa=3e980000 fb=3f1f7300 gmax=3f7f0500 rmax=3f7f0500 gsum=4185d1d8 rsum=4185d1d8
+lane 29 fa=3f52c900 fb=3f0d7600 gmax=3f7f0500 rmax=3f7f0500 gsum=4185d1d8 rsum=4185d1d8
+lane 30 fa=3f4b5800 fb=3e83b200 gmax=3f7f0500 rmax=3f7f0500 gsum=4185d1d8 rsum=4185d1d8
+lane 31 fa=3f1c8d00 fb=3f15f800 gmax=3f7f0500 rmax=3f7f0500 gsum=4185d1d8 rsum=4185d1d8
+seed 7: max-fail=0 sum-fail=0 comp-fail=0
+lane-ops=268435456 per shape (rowmax 3way raw; rowsum chain-vs-chain RAW=informational; rowsum+composed 3way finite)
+rowsum raw-bit chain-vs-chain mismatches (NOT gated, sNaN operand-order law): 0
+PROBE-BITEXACT
+FAIL lane= 7 it=54 a=3421d24f g=7fe71ff7 r=7fe71ff7 o=fffbd957
+got!=ref=0 got!=ora=4008 ref!=ora=4008
