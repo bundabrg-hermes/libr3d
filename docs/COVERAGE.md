@@ -3641,3 +3641,21 @@ Probe discipline still ran and paid: three-way probe (shfl chain / LDS oracle / 
 Child-process lessons (both caught by their own guards, documented in-tree): first census parse hit the known trailing-comment-address objdump trap (coverage guards fired); first probe revision had a vacuous ref leg (shuffled the wrong accumulator -- dbg forensics tool caught it; vacuous-pass class, fifth sighting). Card untouched: spec9g never stopped, health 200, restarts 0; rollback container never started.
 
 Operator cross-verify (manager): branch ff-merged to main (tools/logs/report only -- 422ca5f); DPP literals re-grepped at source independently; dispatch order re-read; report file read whole. Verdict DARK accepted: zero card time for a stale premise is the ledger working as designed.
+
+
+## Window 45 (2026-10-27, AWST ~20:00-22:30) — Q46 CLOSED PROMOTE-MERGE-ONLY: U-ahead merge batching ships; FA2 split policy dark; serve-stdout law
+
+Manager/subagent item 2 (Q46, effort S, full card window ~2h07 by the child). Verdict PROMOTE-MERGE-ONLY.
+
+SHIPPED (unconditional): merge-kernel kMergeU=16 U-ahead partial-load batching (loads hoisted ahead of the skip-select per the donor's recorded fix: loads must not sink behind the branch). Bit-identity class held end-to-end: child battery M/W legs zero-diff on all 7 packs, rsk identity 32/32, spill census byte-identical, p0 hashes equal v153 every width; manager INDEPENDENT re-run on the merged tree (q46_mgr_verify: 7/7 OK, difflines=0 on attr/df2/df3/kernels/full/fp8/attn_bf vs standing v153 packs). No serve swap (bit-identical, no measured serve delta; Q18/Q24 precedent) — v154 is the drafter-mount build, spec9g stays v153.
+
+NOT SHIPPED — DONOR PREmise CORRECTION: the merge n_act PREFIX walk bound is unsound against our floor-cut split law — live splits are NON-prefix and split 0 can itself be inert, so a prefix stop skips live work. The row's "skip empties after loading" framing imported a donor loop shape whose dead-splits-are-a-prefix assumption does not hold here. U-batching delivers the load-hoist prize alone.
+
+POLICY DARK: R3D_SPLIT_POLICY shipped both-arms-live, DEFAULT 0 (fixed closed form verbatim). Wave rule (FA2): kernel sweeps fixed-wins DISJOINT h128 every width; serve decode A/B 0/3 disjoint-positive. Tolerance grading of the counterfactual arm passed cleanly (8 attention partial-combine rows, max 2.25e-03 vs 2e-02, reorder-class) — the arm is safe, it just doesn't win. Host differential q46_policy_check: arm0 == v153 exactly on a 1408-row grid.
+
+p48 ANOMALY EXPLAINED: the ledger's "48 splits beat the sweep pick at 8192" is CU-TARGET SENSITIVITY — the wave rule evaluated at cu=96 picks s=38 and wins -25% DISJOINT at h256 ctx8192 (forced 48: -30%); cu96 also wins h256 ctx>=1024 ~25% DISJOINT. Follow-up datum handed to the hd256 owner framing: start a retune at cu=96, not 48.
+
+ENVIRONMENT LAW (highest reuse value from this window): the serve engine SWALLOWS PLUGIN STDOUT. printf-based liveness is invisible in docker logs under serve; plugin STDERR reaches docker logs. The child proved it with a throwaway stderr-DBG container (v155test, deleted after use) and got the first-ever directly-observed per-arm serve liveness (arm=fixed spl=32 vs arm=wave cu=96 spl=19). Manager cross-check: every shipped liveness print in src/ already rides fprintf(stderr) — all prior-window boot-liveness greps STAND; this law is forward-looking only. Any debug wire added for serve must ride stderr or engine-logged stats.
+
+Process notes: child voided its first parallel battery attempt (D4, solo-runner law re-earned); child tried to write memory files in another profile's store and correctly reported the failure instead of hiding it — its laws are recorded here instead. flashnext showed one app-level restart during the window (RestartCount=1, not OOM, no amdgpu events; our containers pinned ROCR_VISIBLE_DEVICES=1) — operator visibility only.
+
