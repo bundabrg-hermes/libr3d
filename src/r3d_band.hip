@@ -223,7 +223,8 @@ __global__ __launch_bounds__(kThreads) void gated_quant_fp8_kernel(
  * Gates: bf16 dtypes; pow-2 group 16..256; n % g == 0; 16B bases; row pitches
  * % 8; mul additionally n >= 2048 and no broadcast (Q32's small-row carve).
  * Anything else rides the untouched scalar kernels above. Kill-switches
- * R3D_VEC_GATE / R3D_VEC_MUL (default 0 = scalar verbatim until adjudication);
+ * R3D_VEC_GATE / R3D_VEC_MUL (default ON per the Q49 card-session adjudication,
+ * serve +23%; explicit =0 = scalar verbatim withdrawal arms);
  * R3D_DEBUG_VEC names the arm each launch rode. */
 __device__ __forceinline__ uint32_t r3d_mul_pair_bf16(uint32_t a, uint32_t b) {
     const float u0 = r3d_bf16_to_f32((uint16_t)(a & 0xffffu)), v0 = r3d_bf16_to_f32((uint16_t)(b & 0xffffu));
@@ -515,7 +516,7 @@ static int r3d_gated_quant_fp8_impl(const RadArgs* a, RadStream s) {
     if (ob) { if (row2_pitch(ob, n, &op)) return RAD_E_STRIDE; }
     /* Q49 lever: vec arm gates -- see r3d_mul_impl for the family law. */
     static const int vec_gate = []{ const char* e = std::getenv("R3D_VEC_GATE");
-                                   return e && std::atoi(e) != 0 ? 1 : 0; }();
+                                   return (e && std::atoi(e) == 0) ? 0 : 1; }();
     const uint32_t cpg = (uint32_t)(g / 8);
     const bool pow2 = g >= 16 && g <= 256 && (g & (g - 1)) == 0;
     const bool vec_ok = vec_gate && gu->dtype == RAD_BF16
@@ -601,7 +602,7 @@ static int r3d_mul_impl(const RadArgs* a, RadStream s) {
     else if (row2_pitch(B, n, &bp)) return RAD_E_STRIDE;
     /* Q49 lever: the mul arm (mode 1) only -- add() below stays verbatim. */
     static const int vec_mul = []{ const char* e = std::getenv("R3D_VEC_MUL");
-                                  return e && std::atoi(e) != 0 ? 1 : 0; }();
+                                  return (e && std::atoi(e) == 0) ? 0 : 1; }();
     const bool vec_ok = vec_mul && !bcast
         && A->dtype == RAD_BF16 && B->dtype == RAD_BF16 && Y->dtype == RAD_BF16
         && n >= 2048 && (n % 8) == 0
