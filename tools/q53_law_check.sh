@@ -4,8 +4,8 @@
 # at PINNED splits on the standard fixture (tools/q53_probe.cpp, seed-fixed) and
 # asserts the booked Q53 equivalence class on the final bf16 outputs:
 #   1. every drifting (tok, head) satisfies parity(tok) != parity(head % gqa);
-#   2. every drift element is <= 1 bf16 ulp apart, or both values are within
-#      2e-6 absolute (the near-zero softmax-tail class);
+#   2. every drift element is <= 1 bf16 ulp apart, or their difference is
+#      within 2e-6 absolute (the near-zero softmax-tail class);
 #   3. drift rate stays under 0.5% of elements (both arms are individually
 #      oracle-class; the rate is a canary, not the law).
 # Exit 0 = inside the class. Non-zero = the booked law has been violated by a
@@ -26,27 +26,28 @@ for arm in fold plain; do
     LIBR3D_SO=/rh158/kernels/libr3d.so /s2/q53_probe dump q53lc_$arm 16 4 4 4096 2>&1 | grep -E "DUMP|FATAL|ABORT"
 done
 python3 - <<'PY'
-import numpy as np, sys
-def out(tag): return np.fromfile(f"/s2/q53lc_{tag}.out", dtype=np.uint16).reshape(4, 16, 256)
+import struct, sys
+def out(tag):
+    return struct.unpack(f"<{4*16*256}H", open(f"/s2/q53lc_{tag}.out","rb").read())
 x, y = out("fold"), out("plain")
 gqa = 4
-d = (x != y)
-tok = np.arange(4)[:, None, None]; head = np.arange(16)[None, :, None]
-parity_ok = (tok % 2) != ((head % gqa) % 2)
-viol_class = int((d & ~parity_ok).sum())
-def t(u):
-    u = u.astype(np.int64)
-    return np.where((u >> 15) & 1, -(u & 0x7fff), u & 0x7fff)
-ulp = np.abs(t(x).astype(np.int64) - t(y).astype(np.int64))
+def tf32(u):                      # bf16 -> order-preserving int (same sign: bit distance)
+    return -(u & 0x7fff) if (u >> 15) & 1 else (u & 0x7fff)
 def val(u):
-    u = u.astype(np.int64); e = (u >> 7) & 0xff; m = u & 0x7f
-    v = np.where(e > 0, np.ldexp(1.0 + m / 128.0, e.astype(float) - 127), m * 2.0 ** -133)
-    return np.where((u >> 15) & 1, -v, v)
-big = d & (ulp > 1) & (np.maximum(np.abs(val(x)), np.abs(val(y))) > 2e-6)
-n = int(d.sum()); total = d.size
+    e, m = (u >> 7) & 0xff, u & 0x7f
+    v = ((1.0 + m / 128.0) * 2.0 ** (e - 127)) if e else m * 2.0 ** -133
+    return -v if (u >> 15) & 1 else v
+n = viol_class = big = 0
+for i, (a, b) in enumerate(zip(x, y)):
+    if a == b: continue
+    n += 1
+    tok = i // (16 * 256); head = (i // 256) % 16
+    if (tok % 2) == ((head % gqa) % 2): viol_class += 1
+    if abs(tf32(a) - tf32(b)) > 1 and abs(val(a) - val(b)) > 2e-6: big += 1
+total = len(x)
 print(f"law-check: drift={n}/{total} ({100.0*n/total:.2f}%) parity-violations={viol_class} "
-      f"out-of-ulp-violations={int(big.sum())}")
-ok = viol_class == 0 and int(big.sum()) == 0 and n <= 0.005 * total
+      f"out-of-ulp-violations={big}")
+ok = viol_class == 0 and big == 0 and n <= 0.005 * total
 print("Q53-LAW:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)
 PY

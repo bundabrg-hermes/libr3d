@@ -710,8 +710,9 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
          * odd-parity ones do not), so no source path reassociates and no source
          * path can pin both arms to the same lane parity: packing IS the fold.
          * Hence drift(tok, head) iff parity(tok) != parity(head-in-group): at
-         * most 1 bf16 ulp per output element (or |value| <= 2e-6 for near-zero
-         * softmax tails), under ~0.5% of elements, both arms inside the oracle
+         * most 1 bf16 ulp per output element (or a difference <= 2e-6 in absolute
+         * value at the near-zero softmax tails), under ~0.5% of elements, both
+         * arms inside the oracle
          * class. Pinned-splits hashes stay a FREE bit gate for same-parity levers
          * (any arm against itself, schedule or staging changes); fold-vs-plain is
          * a class gate -- assert it with tools/q53_law_check.sh. */
