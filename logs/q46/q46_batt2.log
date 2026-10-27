@@ -1,0 +1,51 @@
+== leg v154 (R3D_SPLIT_POLICY='<default>') 10:43:42 ==
+v154 kernels OK
+v154 full OK
+v154 attr OK
+v154 df2 OK
+v154 df3 OK
+v154 fp8 OK
+v154 attn_bf OK
+[v154] liveness: 
+[v154] NOTE: no arm line in any pack log -> battery never dispatched decode_splits for this leg (blind-pack law w19)
+== leg v154w (R3D_SPLIT_POLICY='0') 10:47:33 ==
+v154w kernels OK
+v154w full OK
+v154w attr OK
+v154w df2 OK
+v154w df3 OK
+v154w fp8 OK
+v154w attn_bf OK
+[v154w] liveness:       2 DBG attn-decode split-policy arm=fixed cu=48 units=24 tiles_kv=128 fold=0 s=8       1 DBG attn-decode split-policy arm=fixed cu=48 units=24 tiles_kv=8192 fold=0 s=8 
+== leg v154p (R3D_SPLIT_POLICY='1') 10:51:32 ==
+v154p kernels OK
+v154p full OK
+v154p attr OK
+v154p df2 OK
+v154p df3 OK
+v154p fp8 OK
+v154p attn_bf OK
+[v154p] liveness:       2 DBG attn-decode split-policy arm=wave cu=48 units=24 tiles_kv=128 fold=0 s=2       1 DBG attn-decode split-policy arm=wave cu=48 units=24 tiles_kv=8192 fold=0 s=2 
+-- fingerprint diffs vs v153 standing packs --
+kernels vs v154: difflines=0 attn-touching=0
+kernels vs v154w: difflines=0 attn-touching=0
+kernels vs v154p: difflines=0 attn-touching=0
+full vs v154: difflines=0 attn-touching=0
+full vs v154w: difflines=0 attn-touching=0
+full vs v154p: difflines=16 attn-touching=8
+attr vs v154: difflines=0 attn-touching=0
+attr vs v154w: difflines=0 attn-touching=0
+attr vs v154p: difflines=0 attn-touching=0
+df2 vs v154: difflines=0 attn-touching=0
+df2 vs v154w: difflines=0 attn-touching=0
+df2 vs v154p: difflines=0 attn-touching=0
+df3 vs v154: difflines=0 attn-touching=0
+df3 vs v154w: difflines=0 attn-touching=0
+df3 vs v154p: difflines=0 attn-touching=0
+fp8 vs v154: difflines=0 attn-touching=0
+fp8 vs v154w: difflines=0 attn-touching=0
+fp8 vs v154p: difflines=0 attn-touching=0
+attn_bf vs v154: difflines=0 attn-touching=0
+attn_bf vs v154w: difflines=0 attn-touching=0
+attn_bf vs v154p: difflines=16 attn-touching=8
+== ALL DONE 10:55:24 ==

@@ -1,0 +1,193 @@
+1 device(s) [0:gfx1100]
+== build harnesses (project correctness flags, -Wall) 11:03:18 ==
+harness builds OK
+-- leg 1: rsk merge-identity matrix --
+rsk RUNFAIL q46logs/rsk_128_1_300_v153_p0
+rsk RUNFAIL q46logs/rsk_128_1_300_v153_p1
+rsk RUNFAIL q46logs/rsk_128_1_300_v154_p0
+rsk RUNFAIL q46logs/rsk_128_1_300_v154_p1
+rsk RUNFAIL q46logs/rsk_128_1_4096_v153_p0
+rsk RUNFAIL q46logs/rsk_128_1_4096_v153_p1
+rsk RUNFAIL q46logs/rsk_128_1_4096_v154_p0
+rsk RUNFAIL q46logs/rsk_128_1_4096_v154_p1
+rsk RUNFAIL q46logs/rsk_128_2_300_v153_p0
+rsk RUNFAIL q46logs/rsk_128_2_300_v153_p1
+rsk RUNFAIL q46logs/rsk_128_2_300_v154_p0
+rsk RUNFAIL q46logs/rsk_128_2_300_v154_p1
+rsk RUNFAIL q46logs/rsk_128_2_4096_v153_p0
+rsk RUNFAIL q46logs/rsk_128_2_4096_v153_p1
+rsk RUNFAIL q46logs/rsk_128_2_4096_v154_p0
+rsk RUNFAIL q46logs/rsk_128_2_4096_v154_p1
+rsk RUNFAIL q46logs/rsk_128_4_300_v153_p0
+rsk RUNFAIL q46logs/rsk_128_4_300_v153_p1
+rsk RUNFAIL q46logs/rsk_128_4_300_v154_p0
+rsk RUNFAIL q46logs/rsk_128_4_300_v154_p1
+rsk RUNFAIL q46logs/rsk_128_4_4096_v153_p0
+rsk RUNFAIL q46logs/rsk_128_4_4096_v153_p1
+rsk RUNFAIL q46logs/rsk_128_4_4096_v154_p0
+rsk RUNFAIL q46logs/rsk_128_4_4096_v154_p1
+rsk RUNFAIL q46logs/rsk_128_8_300_v153_p0
+rsk RUNFAIL q46logs/rsk_128_8_300_v153_p1
+rsk RUNFAIL q46logs/rsk_128_8_300_v154_p0
+rsk RUNFAIL q46logs/rsk_128_8_300_v154_p1
+rsk RUNFAIL q46logs/rsk_128_8_4096_v153_p0
+rsk RUNFAIL q46logs/rsk_128_8_4096_v153_p1
+rsk RUNFAIL q46logs/rsk_128_8_4096_v154_p0
+rsk RUNFAIL q46logs/rsk_128_8_4096_v154_p1
+rsk RUNFAIL q46logs/rsk_128_16_300_v153_p0
+rsk RUNFAIL q46logs/rsk_128_16_300_v153_p1
+rsk RUNFAIL q46logs/rsk_128_16_300_v154_p0
+rsk RUNFAIL q46logs/rsk_128_16_300_v154_p1
+rsk RUNFAIL q46logs/rsk_128_16_4096_v153_p0
+rsk RUNFAIL q46logs/rsk_128_16_4096_v153_p1
+rsk RUNFAIL q46logs/rsk_128_16_4096_v154_p0
+rsk RUNFAIL q46logs/rsk_128_16_4096_v154_p1
+rsk RUNFAIL q46logs/rsk_128_32_300_v153_p0
+rsk RUNFAIL q46logs/rsk_128_32_300_v153_p1
+rsk RUNFAIL q46logs/rsk_128_32_300_v154_p0
+rsk RUNFAIL q46logs/rsk_128_32_300_v154_p1
+rsk RUNFAIL q46logs/rsk_128_32_4096_v153_p0
+rsk RUNFAIL q46logs/rsk_128_32_4096_v153_p1
+rsk RUNFAIL q46logs/rsk_128_32_4096_v154_p0
+rsk RUNFAIL q46logs/rsk_128_32_4096_v154_p1
+rsk RUNFAIL q46logs/rsk_128_48_300_v153_p0
+rsk RUNFAIL q46logs/rsk_128_48_300_v153_p1
+rsk RUNFAIL q46logs/rsk_128_48_300_v154_p0
+rsk RUNFAIL q46logs/rsk_128_48_300_v154_p1
+rsk RUNFAIL q46logs/rsk_128_48_4096_v153_p0
+rsk RUNFAIL q46logs/rsk_128_48_4096_v153_p1
+rsk RUNFAIL q46logs/rsk_128_48_4096_v154_p0
+rsk RUNFAIL q46logs/rsk_128_48_4096_v154_p1
+rsk RUNFAIL q46logs/rsk_128_64_300_v153_p0
+rsk RUNFAIL q46logs/rsk_128_64_300_v153_p1
+rsk RUNFAIL q46logs/rsk_128_64_300_v154_p0
+rsk RUNFAIL q46logs/rsk_128_64_300_v154_p1
+rsk RUNFAIL q46logs/rsk_128_64_4096_v153_p0
+rsk RUNFAIL q46logs/rsk_128_64_4096_v153_p1
+rsk RUNFAIL q46logs/rsk_128_64_4096_v154_p0
+rsk RUNFAIL q46logs/rsk_128_64_4096_v154_p1
+rsk RUNFAIL q46logs/rsk_256_1_300_v153_p0
+rsk RUNFAIL q46logs/rsk_256_1_300_v153_p1
+rsk RUNFAIL q46logs/rsk_256_1_300_v154_p0
+rsk RUNFAIL q46logs/rsk_256_1_300_v154_p1
+rsk RUNFAIL q46logs/rsk_256_1_4096_v153_p0
+rsk RUNFAIL q46logs/rsk_256_1_4096_v153_p1
+rsk RUNFAIL q46logs/rsk_256_1_4096_v154_p0
+rsk RUNFAIL q46logs/rsk_256_1_4096_v154_p1
+rsk RUNFAIL q46logs/rsk_256_2_300_v153_p0
+rsk RUNFAIL q46logs/rsk_256_2_300_v153_p1
+rsk RUNFAIL q46logs/rsk_256_2_300_v154_p0
+rsk RUNFAIL q46logs/rsk_256_2_300_v154_p1
+rsk RUNFAIL q46logs/rsk_256_2_4096_v153_p0
+rsk RUNFAIL q46logs/rsk_256_2_4096_v153_p1
+rsk RUNFAIL q46logs/rsk_256_2_4096_v154_p0
+rsk RUNFAIL q46logs/rsk_256_2_4096_v154_p1
+rsk RUNFAIL q46logs/rsk_256_4_300_v153_p0
+rsk RUNFAIL q46logs/rsk_256_4_300_v153_p1
+rsk RUNFAIL q46logs/rsk_256_4_300_v154_p0
+rsk RUNFAIL q46logs/rsk_256_4_300_v154_p1
+rsk RUNFAIL q46logs/rsk_256_4_4096_v153_p0
+rsk RUNFAIL q46logs/rsk_256_4_4096_v153_p1
+rsk RUNFAIL q46logs/rsk_256_4_4096_v154_p0
+rsk RUNFAIL q46logs/rsk_256_4_4096_v154_p1
+rsk RUNFAIL q46logs/rsk_256_8_300_v153_p0
+rsk RUNFAIL q46logs/rsk_256_8_300_v153_p1
+rsk RUNFAIL q46logs/rsk_256_8_300_v154_p0
+rsk RUNFAIL q46logs/rsk_256_8_300_v154_p1
+rsk RUNFAIL q46logs/rsk_256_8_4096_v153_p0
+rsk RUNFAIL q46logs/rsk_256_8_4096_v153_p1
+rsk RUNFAIL q46logs/rsk_256_8_4096_v154_p0
+rsk RUNFAIL q46logs/rsk_256_8_4096_v154_p1
+rsk RUNFAIL q46logs/rsk_256_16_300_v153_p0
+rsk RUNFAIL q46logs/rsk_256_16_300_v153_p1
+rsk RUNFAIL q46logs/rsk_256_16_300_v154_p0
+rsk RUNFAIL q46logs/rsk_256_16_300_v154_p1
+rsk RUNFAIL q46logs/rsk_256_16_4096_v153_p0
+rsk RUNFAIL q46logs/rsk_256_16_4096_v153_p1
+rsk RUNFAIL q46logs/rsk_256_16_4096_v154_p0
+rsk RUNFAIL q46logs/rsk_256_16_4096_v154_p1
+rsk RUNFAIL q46logs/rsk_256_32_300_v153_p0
+rsk RUNFAIL q46logs/rsk_256_32_300_v153_p1
+rsk RUNFAIL q46logs/rsk_256_32_300_v154_p0
+rsk RUNFAIL q46logs/rsk_256_32_300_v154_p1
+rsk RUNFAIL q46logs/rsk_256_32_4096_v153_p0
+rsk RUNFAIL q46logs/rsk_256_32_4096_v153_p1
+rsk RUNFAIL q46logs/rsk_256_32_4096_v154_p0
+rsk RUNFAIL q46logs/rsk_256_32_4096_v154_p1
+rsk RUNFAIL q46logs/rsk_256_48_300_v153_p0
+rsk RUNFAIL q46logs/rsk_256_48_300_v153_p1
+rsk RUNFAIL q46logs/rsk_256_48_300_v154_p0
+rsk RUNFAIL q46logs/rsk_256_48_300_v154_p1
+rsk RUNFAIL q46logs/rsk_256_48_4096_v153_p0
+rsk RUNFAIL q46logs/rsk_256_48_4096_v153_p1
+rsk RUNFAIL q46logs/rsk_256_48_4096_v154_p0
+rsk RUNFAIL q46logs/rsk_256_48_4096_v154_p1
+rsk RUNFAIL q46logs/rsk_256_64_300_v153_p0
+rsk RUNFAIL q46logs/rsk_256_64_300_v153_p1
+rsk RUNFAIL q46logs/rsk_256_64_300_v154_p0
+rsk RUNFAIL q46logs/rsk_256_64_300_v154_p1
+rsk RUNFAIL q46logs/rsk_256_64_4096_v153_p0
+rsk RUNFAIL q46logs/rsk_256_64_4096_v153_p1
+rsk RUNFAIL q46logs/rsk_256_64_4096_v154_p0
+rsk RUNFAIL q46logs/rsk_256_64_4096_v154_p1
+rsk-diff-format-sample:
+/work/tools/q46_id.sh: line 51: ./q46bin/rsk: No such file or directory
+rsk hd=128 spl=1 ctx=300: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=128 spl=1 ctx=4096: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=128 spl=2 ctx=300: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=128 spl=2 ctx=4096: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=128 spl=4 ctx=300: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=128 spl=4 ctx=4096: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=128 spl=8 ctx=300: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=128 spl=8 ctx=4096: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=128 spl=16 ctx=300: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=128 spl=16 ctx=4096: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=128 spl=32 ctx=300: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=128 spl=32 ctx=4096: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=128 spl=48 ctx=300: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=128 spl=48 ctx=4096: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=128 spl=64 ctx=300: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=128 spl=64 ctx=4096: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=256 spl=1 ctx=300: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=256 spl=1 ctx=4096: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=256 spl=2 ctx=300: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=256 spl=2 ctx=4096: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=256 spl=4 ctx=300: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=256 spl=4 ctx=4096: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=256 spl=8 ctx=300: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=256 spl=8 ctx=4096: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=256 spl=16 ctx=300: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=256 spl=16 ctx=4096: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=256 spl=32 ctx=300: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=256 spl=32 ctx=4096: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=256 spl=48 ctx=300: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=256 spl=48 ctx=4096: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=256 spl=64 ctx=300: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+rsk hd=256 spl=64 ctx=4096: v153-vs-v154 difflines=0 policy0-vs-1 difflines=0
+-- leg 2: natural-split parity sweep (policy arms race) --
+par ctx=512 v153 p0: ARM-LINE-MISSING spl=16 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=512 rel_l2=0.001866 rel_max=0.00115096 nonfinite=0 yhash=f8a9242124083188 PASS
+par ctx=512 v154 p0: split-policy arm=fixed spl=16 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=512 rel_l2=0.001866 rel_max=0.00115096 nonfinite=0 yhash=f8a9242124083188 PASS
+par ctx=512 v153 p1: ARM-LINE-MISSING spl=16 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=512 rel_l2=0.001866 rel_max=0.00115096 nonfinite=0 yhash=f8a9242124083188 PASS
+par ctx=512 v154 p1: split-policy arm=wave spl=5 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=512 rel_l2=0.001970 rel_max=0.00125308 nonfinite=0 yhash=cd047e819221c2d9 PASS
+par ctx=1024 v153 p0: ARM-LINE-MISSING spl=16 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=1024 rel_l2=0.001948 rel_max=0.000940518 nonfinite=0 yhash=53c8ea0fc174f641 PASS
+par ctx=1024 v154 p0: split-policy arm=fixed spl=16 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=1024 rel_l2=0.001948 rel_max=0.000940518 nonfinite=0 yhash=53c8ea0fc174f641 PASS
+par ctx=1024 v153 p1: ARM-LINE-MISSING spl=16 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=1024 rel_l2=0.001948 rel_max=0.000940518 nonfinite=0 yhash=53c8ea0fc174f641 PASS
+par ctx=1024 v154 p1: split-policy arm=wave spl=5 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=1024 rel_l2=0.002057 rel_max=0.000940518 nonfinite=0 yhash=39dbbe8b4049ce8d PASS
+par ctx=2048 v153 p0: ARM-LINE-MISSING spl=16 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=2048 rel_l2=0.002005 rel_max=0.000595567 nonfinite=0 yhash=45945a81959690b6 PASS
+par ctx=2048 v154 p0: split-policy arm=fixed spl=16 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=2048 rel_l2=0.002005 rel_max=0.000595567 nonfinite=0 yhash=45945a81959690b6 PASS
+par ctx=2048 v153 p1: ARM-LINE-MISSING spl=16 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=2048 rel_l2=0.002005 rel_max=0.000595567 nonfinite=0 yhash=45945a81959690b6 PASS
+par ctx=2048 v154 p1: split-policy arm=wave spl=5 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=2048 rel_l2=0.002132 rel_max=0.000698737 nonfinite=0 yhash=6c58478625fa898f PASS
+par ctx=4096 v153 p0: ARM-LINE-MISSING spl=16 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=4096 rel_l2=0.002078 rel_max=0.000447015 nonfinite=0 yhash=c25641dd97834202 PASS
+par ctx=4096 v154 p0: split-policy arm=fixed spl=16 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=4096 rel_l2=0.002078 rel_max=0.000447015 nonfinite=0 yhash=c25641dd97834202 PASS
+par ctx=4096 v153 p1: ARM-LINE-MISSING spl=16 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=4096 rel_l2=0.002078 rel_max=0.000447015 nonfinite=0 yhash=c25641dd97834202 PASS
+par ctx=4096 v154 p1: split-policy arm=wave spl=5 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=4096 rel_l2=0.002211 rel_max=0.000529547 nonfinite=0 yhash=4825e550a006f1e6 PASS
+par ctx=8192 v153 p0: ARM-LINE-MISSING spl=16 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=8192 rel_l2=0.002125 rel_max=0.000322001 nonfinite=0 yhash=fcd8c14301cd1406 PASS
+par ctx=8192 v154 p0: split-policy arm=fixed spl=16 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=8192 rel_l2=0.002125 rel_max=0.000322001 nonfinite=0 yhash=fcd8c14301cd1406 PASS
+par ctx=8192 v153 p1: ARM-LINE-MISSING spl=16 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=8192 rel_l2=0.002125 rel_max=0.000322001 nonfinite=0 yhash=fcd8c14301cd1406 PASS
+par ctx=8192 v154 p1: split-policy arm=wave spl=5 PARITY arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=8192 rel_l2=0.002221 rel_max=0.00032921 nonfinite=0 yhash=a8773fca24561149 PASS
+-- h256 natural parity at 8192 (p48 anomaly shape) --
+par256 ctx=8192 p0 none: spl=64 PARITY arm=r3d hd=256 qh=16 kvh=2 rows=1 ctx=8192 rel_l2=0.001989 rel_max=0.000289719 nonfinite=0 yhash=5638acff9d586b4e PASS
+par256 ctx=8192 p0 force48: spl=48 PARITY arm=r3d hd=256 qh=16 kvh=2 rows=1 ctx=8192 rel_l2=0.002016 rel_max=0.000304449 nonfinite=0 yhash=2e55b6260e588659 PASS
+par256 ctx=8192 p1 none: spl=19 PARITY arm=r3d hd=256 qh=16 kvh=2 rows=1 ctx=8192 rel_l2=0.002079 rel_max=0.000274462 nonfinite=0 yhash=9ed1f9fc4f92da46 PASS
+par256 ctx=8192 p1 force48: spl=48 PARITY arm=r3d hd=256 qh=16 kvh=2 rows=1 ctx=8192 rel_l2=0.002016 rel_max=0.000304449 nonfinite=0 yhash=2e55b6260e588659 PASS
+== ALL DONE 11:03:29 ==

@@ -1,0 +1,4 @@
+h=128 n= 1 tk= 32 fold=1  fixed= 1 wave= 1
+h=128 n= 1 tk=128 fold=1  fixed= 1 wave= 1
+h=128 n= 1 tk=256 fold=1  fixed= 1 wave= 1
+grid rows=1408 fails=0 PASS

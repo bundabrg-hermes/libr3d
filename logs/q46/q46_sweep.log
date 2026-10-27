@@ -1,0 +1,43 @@
+1 device(s) [0:gfx1100]
+== sweep start 11:10:19 ==
+r1 ctx=1024 p0 split-policy arm=fixed cu=48 s=16 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=1024 sets=8 reps=15 med_us=113.1 min_us=112.6 max_us=113.8 kv_MB=4.2 gbs_kv=37.1
+r1 ctx=1024 p1cu48 split-policy arm=wave cu=48 s=5 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=1024 sets=8 reps=15 med_us=171.7 min_us=171.0 max_us=172.4 kv_MB=4.2 gbs_kv=24.4
+r1 ctx=1024 p1cu96 split-policy arm=wave cu=96 s=10 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=1024 sets=8 reps=15 med_us=132.1 min_us=131.4 max_us=137.2 kv_MB=4.2 gbs_kv=31.7
+r1 ctx=4096 p0 split-policy arm=fixed cu=48 s=16 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=4096 sets=8 reps=15 med_us=223.4 min_us=222.0 max_us=234.9 kv_MB=16.8 gbs_kv=75.1
+r1 ctx=4096 p1cu48 split-policy arm=wave cu=48 s=5 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=4096 sets=8 reps=15 med_us=435.1 min_us=396.1 max_us=445.9 kv_MB=16.8 gbs_kv=38.6
+r1 ctx=4096 p1cu96 split-policy arm=wave cu=96 s=10 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=4096 sets=8 reps=15 med_us=280.6 min_us=278.0 max_us=282.4 kv_MB=16.8 gbs_kv=59.8
+r1 ctx=8192 p0 split-policy arm=fixed cu=48 s=16 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=8192 sets=8 reps=15 med_us=368.0 min_us=345.6 max_us=379.5 kv_MB=33.6 gbs_kv=91.2
+r1 ctx=8192 p1cu48 split-policy arm=wave cu=48 s=5 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=8192 sets=8 reps=15 med_us=734.0 min_us=367.9 max_us=807.8 kv_MB=33.6 gbs_kv=45.7
+r1 ctx=8192 p1cu96 split-policy arm=wave cu=96 s=10 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=8192 sets=8 reps=15 med_us=482.8 min_us=426.2 max_us=493.4 kv_MB=33.6 gbs_kv=69.5
+r2 ctx=1024 p0 split-policy arm=fixed cu=48 s=16 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=1024 sets=8 reps=15 med_us=113.3 min_us=112.7 max_us=114.0 kv_MB=4.2 gbs_kv=37.0
+r2 ctx=1024 p1cu48 split-policy arm=wave cu=48 s=5 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=1024 sets=8 reps=15 med_us=172.1 min_us=171.6 max_us=172.9 kv_MB=4.2 gbs_kv=24.4
+r2 ctx=1024 p1cu96 split-policy arm=wave cu=96 s=10 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=1024 sets=8 reps=15 med_us=134.9 min_us=131.6 max_us=137.3 kv_MB=4.2 gbs_kv=31.1
+r2 ctx=4096 p0 split-policy arm=fixed cu=48 s=16 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=4096 sets=8 reps=15 med_us=223.5 min_us=222.0 max_us=236.0 kv_MB=16.8 gbs_kv=75.1
+r2 ctx=4096 p1cu48 split-policy arm=wave cu=48 s=5 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=4096 sets=8 reps=15 med_us=435.7 min_us=402.1 max_us=446.6 kv_MB=16.8 gbs_kv=38.5
+r2 ctx=4096 p1cu96 split-policy arm=wave cu=96 s=10 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=4096 sets=8 reps=15 med_us=280.2 min_us=278.3 max_us=292.2 kv_MB=16.8 gbs_kv=59.9
+r2 ctx=8192 p0 split-policy arm=fixed cu=48 s=16 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=8192 sets=8 reps=15 med_us=368.5 min_us=332.1 max_us=378.0 kv_MB=33.6 gbs_kv=91.0
+r2 ctx=8192 p1cu48 split-policy arm=wave cu=48 s=5 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=8192 sets=8 reps=15 med_us=733.0 min_us=367.3 max_us=808.9 kv_MB=33.6 gbs_kv=45.8
+r2 ctx=8192 p1cu96 split-policy arm=wave cu=96 s=10 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=8192 sets=8 reps=15 med_us=483.6 min_us=408.3 max_us=492.4 kv_MB=33.6 gbs_kv=69.4
+r3 ctx=1024 p0 split-policy arm=fixed cu=48 s=16 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=1024 sets=8 reps=15 med_us=113.3 min_us=112.8 max_us=113.8 kv_MB=4.2 gbs_kv=37.0
+r3 ctx=1024 p1cu48 split-policy arm=wave cu=48 s=5 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=1024 sets=8 reps=15 med_us=171.8 min_us=171.3 max_us=173.0 kv_MB=4.2 gbs_kv=24.4
+r3 ctx=1024 p1cu96 split-policy arm=wave cu=96 s=10 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=1024 sets=8 reps=15 med_us=132.2 min_us=131.5 max_us=136.9 kv_MB=4.2 gbs_kv=31.7
+r3 ctx=4096 p0 split-policy arm=fixed cu=48 s=16 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=4096 sets=8 reps=15 med_us=223.9 min_us=222.7 max_us=235.3 kv_MB=16.8 gbs_kv=74.9
+r3 ctx=4096 p1cu48 split-policy arm=wave cu=48 s=5 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=4096 sets=8 reps=15 med_us=435.5 min_us=399.9 max_us=446.4 kv_MB=16.8 gbs_kv=38.5
+r3 ctx=4096 p1cu96 split-policy arm=wave cu=96 s=10 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=4096 sets=8 reps=15 med_us=280.5 min_us=279.7 max_us=291.1 kv_MB=16.8 gbs_kv=59.8
+r3 ctx=8192 p0 split-policy arm=fixed cu=48 s=16 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=8192 sets=8 reps=15 med_us=368.6 min_us=355.4 max_us=378.9 kv_MB=33.6 gbs_kv=91.0
+r3 ctx=8192 p1cu48 split-policy arm=wave cu=48 s=5 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=8192 sets=8 reps=15 med_us=735.6 min_us=366.7 max_us=809.3 kv_MB=33.6 gbs_kv=45.6
+r3 ctx=8192 p1cu96 split-policy arm=wave cu=96 s=10 RESULT arm=r3d hd=128 qh=32 kvh=8 rows=1 ctx=8192 sets=8 reps=15 med_us=483.8 min_us=419.1 max_us=491.6 kv_MB=33.6 gbs_kv=69.4
+-- p48 retune datum: h256 16Q/2KV rows1 ctx8192 --
+r1 h256 p0 s=64 RESULT arm=r3d hd=256 qh=16 kvh=2 rows=1 ctx=8192 sets=8 reps=15 med_us=464.5 min_us=404.5 max_us=473.8 kv_MB=16.8 gbs_kv=36.1
+r1 h256 p1 s=19 RESULT arm=r3d hd=256 qh=16 kvh=2 rows=1 ctx=8192 sets=8 reps=15 med_us=529.4 min_us=423.2 max_us=539.5 kv_MB=16.8 gbs_kv=31.7
+r1 h256 cu96 s=38 RESULT arm=r3d hd=256 qh=16 kvh=2 rows=1 ctx=8192 sets=8 reps=15 med_us=346.4 min_us=319.5 max_us=356.7 kv_MB=16.8 gbs_kv=48.4
+r1 h256 f48 s=48 RESULT arm=r3d hd=256 qh=16 kvh=2 rows=1 ctx=8192 sets=8 reps=15 med_us=322.3 min_us=319.6 max_us=328.1 kv_MB=16.8 gbs_kv=52.1
+r2 h256 p0 s=64 RESULT arm=r3d hd=256 qh=16 kvh=2 rows=1 ctx=8192 sets=8 reps=15 med_us=463.2 min_us=411.5 max_us=475.2 kv_MB=16.8 gbs_kv=36.2
+r2 h256 p1 s=19 RESULT arm=r3d hd=256 qh=16 kvh=2 rows=1 ctx=8192 sets=8 reps=15 med_us=530.3 min_us=432.9 max_us=540.3 kv_MB=16.8 gbs_kv=31.6
+r2 h256 cu96 s=38 RESULT arm=r3d hd=256 qh=16 kvh=2 rows=1 ctx=8192 sets=8 reps=15 med_us=346.5 min_us=335.7 max_us=356.2 kv_MB=16.8 gbs_kv=48.4
+r2 h256 f48 s=48 RESULT arm=r3d hd=256 qh=16 kvh=2 rows=1 ctx=8192 sets=8 reps=15 med_us=321.9 min_us=320.5 max_us=328.4 kv_MB=16.8 gbs_kv=52.1
+r3 h256 p0 s=64 RESULT arm=r3d hd=256 qh=16 kvh=2 rows=1 ctx=8192 sets=8 reps=15 med_us=463.3 min_us=406.1 max_us=471.1 kv_MB=16.8 gbs_kv=36.2
+r3 h256 p1 s=19 RESULT arm=r3d hd=256 qh=16 kvh=2 rows=1 ctx=8192 sets=8 reps=15 med_us=529.4 min_us=437.0 max_us=543.4 kv_MB=16.8 gbs_kv=31.7
+r3 h256 cu96 s=38 RESULT arm=r3d hd=256 qh=16 kvh=2 rows=1 ctx=8192 sets=8 reps=15 med_us=346.1 min_us=343.1 max_us=356.3 kv_MB=16.8 gbs_kv=48.5
+r3 h256 f48 s=48 RESULT arm=r3d hd=256 qh=16 kvh=2 rows=1 ctx=8192 sets=8 reps=15 med_us=321.7 min_us=319.5 max_us=327.2 kv_MB=16.8 gbs_kv=52.2
+== ALL DONE 11:10:25 ==
