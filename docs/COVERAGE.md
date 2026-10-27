@@ -3673,3 +3673,17 @@ Session B finished the tail. FORENSICS (the window's keepers):
 5. SERVE PREMISE CORRECTION: stderr liveness shows spec9g's serving model dispatches ONLY the fused GDN recurrent row — the non-fused gdn_recurrent_update this item rebuilt is dead code on the live path. Any future GDN decode item must start from a fused-vs-nonfused dispatch audit (rewrites Q20-era "24 live layers" framing for the non-fused arms).
 Ceremony clean (census 280/280 byte-identical v153-vs-v155, battery 7/7 zero-diff + one phantom leg self-caught via fixture-mispair check, third sighting of that class). Nothing shipped to main; assets dark on branch card/q43-gdn-barrierfree. Serve: spec9g v153 health 200 on port 9008.
 
+
+
+## Window 47 (2026-10-27, AWST ~02:40-03:05) — Q35 CLOSED: hipfire gap retired (bus-parity; residual = format-intrinsic 2.125x), Q38 gate GO, Q44 fold tax measured
+
+Manager/subagent item 4 (Q35, measurement-only, 49 calls / 18 min — the output-hygiene law fully paid off after the 41M-token death last window).
+
+HEADLINE: the shipped mxfp4 q8x GEMV at M=1 runs at the SAME-SHAPE bf16 GEMV rate at every cold leg (575/669/769/821 vs 592/645/768/851 GB/s bus bytes; harness anchored to Q33's 856 datum within 1%). The kernel is DRAM-bound at its own shape ceiling and the fold kit is fully hidden by load stall. hipfire's recorded 720-860 GB/s is therefore bus-PARITY with us; the surviving 2.1-2.7x on the useful-weight axis is EXACTLY the i8-expanded plane's 2.125x byte amplification — format-intrinsic (e2m1 lattice not affine-u4), and the single lever that attacks it is Q38's native-nibble plane. Q38 GO with kernel-level projection 1.8-2.1x at M=1 serving shapes; the row's "prize was latency" carve-out lands on M>=4 and cache-fit regimes.
+
+DATUM FOR Q44: fold tax is linear per MT on v153 (ds_bpermute 12*MT, permlane 2*MT, DPP 8*MT) and measured-exposed at M=4 (191-214 GB/s). Q44's desk-probe-first gate now has hard numbers; its expected win band (MT 4..8) is where the bytes stop binding.
+
+SIDE FINDING (w2a8 owner): q8c walks the packed plane at 69-123 GB/s — ALU/fold-bound at every shape; the plane is cheap (0.2734 B/param), the walk is expensive. A future verify-band item for w2a8 has the same shape as Q44-for-q8x.
+
+No code shipped (branch card/q35-attribution, tools/logs only). Serve never left v153 except during timed legs; closed health 200 on 9008.
+
