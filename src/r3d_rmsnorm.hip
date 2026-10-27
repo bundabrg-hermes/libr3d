@@ -18,6 +18,9 @@
  * libr4d does via rad_ptr_aligned.
  */
 
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <hip/hip_runtime.h>
 #include "r3d_dump.h"
 
@@ -44,6 +47,17 @@ __device__ __forceinline__ uint16_t r3d_f32_to_bf16(float f) {
     const uint32_t u = __float_as_uint(f);
     if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 0x0040u);
     return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+/* Q32: the store chain for the two bf16s packed in `pair`, per-element order
+ * verbatim from the scalar kernel below: (x * s) * (g + wadd) * mult, one RTNE
+ * narrowing per element. A pure function of the inputs -- same expression, same
+ * f32 associativity, so the two kernels agree element-for-element given the same s. */
+__device__ __forceinline__ uint32_t r3d_scale_pair(uint32_t pair, float s,
+                                                   float g0, float g1,
+                                                   float wadd, float mult) {
+    const float y0 = r3d_bf16_to_f32((uint16_t)pair)         * s * (g0 + wadd) * mult;
+    const float y1 = r3d_bf16_to_f32((uint16_t)(pair >> 16)) * s * (g1 + wadd) * mult;
+    return (uint32_t)r3d_f32_to_bf16(y0) | ((uint32_t)r3d_f32_to_bf16(y1) << 16);
 }
 
 __device__ __forceinline__ float r3d_wave_sum(float v) {
@@ -95,6 +109,66 @@ __global__ __launch_bounds__(kThreads) void rmsnorm_kernel(
                       : WF32 ? ((const float*)w)[i]
                              : r3d_bf16_to_f32(((const uint16_t*)w)[i]);
         yr[i] = r3d_f32_to_bf16(r3d_bf16_to_f32(xr[i]) * s * (g + wadd) * mult);
+    }
+}
+
+/* Q32: the 128-bit vectorisation the header earmarked at :17 -- 8 contiguous bf16
+ * per thread as ONE uint4 (gfx11's global_load/store_b128), for rows the entry
+ * gates in below (n >= 2048, n % 8 == 0, 16B-aligned base AND row pitch % 8 == 0).
+ * The per-element store chain is the scalar kernel's verbatim (same f32 op order,
+ * same single RTNE narrowing, -ffp-contract=off), so the ONLY arithmetic delta is
+ * the sum-of-squares reassociation: thread ownership is 8-wide chunks instead of
+ * stride-kThreads elements. Head dims (128/256), ragged and misaligned rows stay
+ * on the untouched scalar kernel above; nothing here can perturb them. */
+template <bool WF32>
+__global__ __launch_bounds__(kThreads) void rmsnorm_kernel_vec(
+    const uint16_t* __restrict__ x, const void* __restrict__ w, uint16_t* __restrict__ y,
+    uint32_t n, float eps, float wadd, float mult, uint32_t x_ld, uint32_t y_ld) {
+    __shared__ float lds[kWaves];
+    const uint32_t m = blockIdx.x;
+    const uint4* __restrict__ xr = (const uint4*)(x + (size_t)m * x_ld);
+    uint4* __restrict__ yr = (uint4*)(y + (size_t)m * y_ld);
+    const uint32_t nv = n / 8;
+
+    float ss = 0.0f;
+    for (uint32_t v = threadIdx.x; v < nv; v += kThreads) {
+        const uint4 u = xr[v];
+        const float a = r3d_bf16_to_f32((uint16_t)u.x), b = r3d_bf16_to_f32((uint16_t)(u.x >> 16));
+        const float c = r3d_bf16_to_f32((uint16_t)u.y), d = r3d_bf16_to_f32((uint16_t)(u.y >> 16));
+        const float e = r3d_bf16_to_f32((uint16_t)u.z), f = r3d_bf16_to_f32((uint16_t)(u.z >> 16));
+        const float g = r3d_bf16_to_f32((uint16_t)u.w), h = r3d_bf16_to_f32((uint16_t)(u.w >> 16));
+        ss += ((a*a + b*b) + (c*c + d*d)) + ((e*e + f*f) + (g*g + h*h));
+    }
+    ss = r3d_block_sum(ss, lds);
+    const float s = rsqrtf(ss / (float)n + eps);
+
+    for (uint32_t v = threadIdx.x; v < nv; v += kThreads) {
+        const uint4 u = xr[v];
+        uint4 o;
+        if (!w) {
+            o.x = r3d_scale_pair(u.x, s, 1.0f, 1.0f, wadd, mult);   /* g == 1 verbatim: */
+            o.y = r3d_scale_pair(u.y, s, 1.0f, 1.0f, wadd, mult);   /* the scalar path  */
+            o.z = r3d_scale_pair(u.z, s, 1.0f, 1.0f, wadd, mult);   /* adds (1 + wadd)  */
+            o.w = r3d_scale_pair(u.w, s, 1.0f, 1.0f, wadd, mult);   /* as (g + wadd)   */
+        } else if (WF32) {
+            const float4* __restrict__ wr = (const float4*)((const float*)w + (size_t)v * 8);
+            const float4 wa = wr[0], wb = wr[1];
+            o.x = r3d_scale_pair(u.x, s, wa.x, wa.y, wadd, mult);
+            o.y = r3d_scale_pair(u.y, s, wa.z, wa.w, wadd, mult);
+            o.z = r3d_scale_pair(u.z, s, wb.x, wb.y, wadd, mult);
+            o.w = r3d_scale_pair(u.w, s, wb.z, wb.w, wadd, mult);
+        } else {
+            const uint4 wv = ((const uint4*)w)[v];
+            o.x = r3d_scale_pair(u.x, s, r3d_bf16_to_f32((uint16_t)wv.x),
+                                 r3d_bf16_to_f32((uint16_t)(wv.x >> 16)), wadd, mult);
+            o.y = r3d_scale_pair(u.y, s, r3d_bf16_to_f32((uint16_t)wv.y),
+                                 r3d_bf16_to_f32((uint16_t)(wv.y >> 16)), wadd, mult);
+            o.z = r3d_scale_pair(u.z, s, r3d_bf16_to_f32((uint16_t)wv.z),
+                                 r3d_bf16_to_f32((uint16_t)(wv.z >> 16)), wadd, mult);
+            o.w = r3d_scale_pair(u.w, s, r3d_bf16_to_f32((uint16_t)wv.w),
+                                 r3d_bf16_to_f32((uint16_t)(wv.w >> 16)), wadd, mult);
+        }
+        yr[v] = o;
     }
 }
 
@@ -159,13 +233,43 @@ static int r3d_rmsnorm_impl(const RadArgs* a, RadStream s) {
     if ((int64_t)(M - 1) + n > (int64_t)0x7fffffffLL) return RAD_E_SHAPE;
 
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
-    if (w && w->dtype == RAD_F32)
-        hipLaunchKernelGGL((rmsnorm_kernel<true>), dim3((uint32_t)M), dim3(kThreads), 0, stream,
-                           (const uint16_t*)x->data, w->data, (uint16_t*)y->data,
-                           (uint32_t)n, (float)eps, (float)wadd, (float)mult, x_ld, y_ld);
-    else
-        hipLaunchKernelGGL((rmsnorm_kernel<false>), dim3((uint32_t)M), dim3(kThreads), 0, stream,
-                           (const uint16_t*)x->data, w ? w->data : nullptr, (uint16_t*)y->data,
-                           (uint32_t)n, (float)eps, (float)wadd, (float)mult, x_ld, y_ld);
+
+    /* Q32 lever (two-state, the R3D_BF16_DPP law; shipped DARK: 0 = the scalar
+     * kernel verbatim). The vector arm takes only rows the b128 walk can serve
+     * unchanged: n >= 2048 (head dims 128/256 and every small row stay scalar
+     * by geometry), n % 8 == 0, both row pitches a multiple of 8 (every row
+     * base then inherits the base alignment), and 16B-aligned x/y/w bases.
+     * Any miss falls to the untouched scalar kernel -- refuse, never approximate. */
+    static const int rms_vec = []{
+        const char* e = getenv("R3D_RMS_VEC");
+        return e && atoi(e) != 0 ? 1 : 0;
+    }();
+    const bool vec_ok = rms_vec && n >= 2048 && (n % 8) == 0
+                     && (x_ld % 8u) == 0 && (y_ld % 8u) == 0
+                     && (((uintptr_t)x->data & 15u) | ((uintptr_t)y->data & 15u)
+                         | (w ? (uintptr_t)w->data & 15u : 0u)) == 0;
+    if (getenv("R3D_DEBUG_RMS"))
+        fprintf(stderr, "[r3d] rmsnorm arm=%s n=%u M=%lld w=%d\n",
+                vec_ok ? "vec" : "scalar", (uint32_t)n, (long long)M, w ? 1 : 0);
+
+    if (w && w->dtype == RAD_F32) {
+        if (vec_ok)
+            hipLaunchKernelGGL((rmsnorm_kernel_vec<true>), dim3((uint32_t)M), dim3(kThreads), 0, stream,
+                               (const uint16_t*)x->data, w->data, (uint16_t*)y->data,
+                               (uint32_t)n, (float)eps, (float)wadd, (float)mult, x_ld, y_ld);
+        else
+            hipLaunchKernelGGL((rmsnorm_kernel<true>), dim3((uint32_t)M), dim3(kThreads), 0, stream,
+                               (const uint16_t*)x->data, w->data, (uint16_t*)y->data,
+                               (uint32_t)n, (float)eps, (float)wadd, (float)mult, x_ld, y_ld);
+    } else {
+        if (vec_ok)
+            hipLaunchKernelGGL((rmsnorm_kernel_vec<false>), dim3((uint32_t)M), dim3(kThreads), 0, stream,
+                               (const uint16_t*)x->data, w ? w->data : nullptr, (uint16_t*)y->data,
+                               (uint32_t)n, (float)eps, (float)wadd, (float)mult, x_ld, y_ld);
+        else
+            hipLaunchKernelGGL((rmsnorm_kernel<false>), dim3((uint32_t)M), dim3(kThreads), 0, stream,
+                               (const uint16_t*)x->data, w ? w->data : nullptr, (uint16_t*)y->data,
+                               (uint32_t)n, (float)eps, (float)wadd, (float)mult, x_ld, y_ld);
+    }
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
