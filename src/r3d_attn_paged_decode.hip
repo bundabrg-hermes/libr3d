@@ -143,7 +143,7 @@ using bf16 = roCW::bfloat16_t;
         * the launcher's gcnArchName gate never dispatches it on such a chip. */
 
 namespace {
-template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0, int SB = 0, int FS = 0>
+template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0, int SB = 0, int FS = 0, int SBZ = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams) {}
 template <int D, int KVDT, int SPLITK>
 __global__ __launch_bounds__(kT) void attn_paged_wmma_kernel2(R3dAttnParams) {}
@@ -647,12 +647,21 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
      * lose a step to a driver limit, never cost the engine one. No FS slot: fragment-
      * side softmax is not yet instantiated for 256 (same law as the m2 tile). The
      * merge kernel needs no dynamic LDS, so it launches with 0 as always. */
+    /* Q45a lever: R3D_ATTN256_STAGEBAR (env, default 0). 0 = shipped full-drain
+     * staging barriers verbatim (withdrawal arm, byte-identical); 1 = lgkmcnt-scoped
+     * variant at the 0x4c00-class staging sites of the DBUF branch (see
+     * r3d_attn_wmma_body.inc). Doubles only the DBUF=1 h256 instantiations. */
     #define R3D_DK_L256(DB, PAD, FD)                                                                     \
+        do {                                                                                             \
+            if (DB && FD && stagebar256) { R3D_DK_L256_S(DB, PAD, FD, 1); }                                 \
+            else                         { R3D_DK_L256_S(DB, PAD, FD, 0); }                                 \
+        } while (0)
+    #define R3D_DK_L256_S(DB, PAD, FD, SB)                                                               \
         do {                                                                                             \
             static int attr = -1;                                                                        \
             if (attr < 0)                                                                                \
                 attr = hipFuncSetAttribute(                                                              \
-                           (const void*)&(attn_paged_wmma_kernel<256, RAD_BF16, 1, DB, FD, PAD, 0, 0, 0>),\
+                           (const void*)&(attn_paged_wmma_kernel<256, RAD_BF16, 1, DB, FD, PAD, 0, 0, 0, SB>),\
                            hipFuncAttributeMaxDynamicSharedMemorySize,                                   \
                            r3d_attn256_smem(PAD)) == hipSuccess ? 1 : 0;                                 \
             if (!attr) return tile_or_v1();                                                              \
@@ -665,7 +674,12 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
                        (long long)gx, (long long)P.n_seq, (long long)gz,                                 \
                        (long long)P.q_heads, (long long)P.rows, (long long)need);                        \
             }                                                                                            \
-            hipLaunchKernelGGL((attn_paged_wmma_kernel<256, RAD_BF16, 1, DB, FD, PAD, 0, 0, 0>),         \
+            if (!r3d_256_arm_logged) {                                                                   \
+                r3d_256_arm_logged = 1;                                                                  \
+                fprintf(stderr, "DBG attn-decode hd256 arm launched pad=%d dbuf=%d fold=%d "             \
+                        "stagebar=%d\n", PAD, DB, FD, SB);                                               \
+            }                                                                                            \
+            hipLaunchKernelGGL((attn_paged_wmma_kernel<256, RAD_BF16, 1, DB, FD, PAD, 0, 0, 0, SB>),     \
                                dim3((unsigned)gx, (unsigned)P.n_seq, (unsigned)gz),                      \
                                dim3(kThreads), r3d_attn256_smem(PAD), stream, P);                        \
             hipError_t e0 = hipGetLastError();                                                           \
@@ -678,6 +692,10 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
     if (d256) {
         static int pad256 = -1;
         if (pad256 < 0) pad256 = getenv("R3D_HD256_PAD") ? atoi(getenv("R3D_HD256_PAD")) : 1;
+        static int stagebar256 = -1;   /* Q45a: unset/0 = shipped arm verbatim */
+        if (stagebar256 < 0) { const char* e = getenv("R3D_ATTN256_STAGEBAR");
+                               stagebar256 = (e && atoi(e) != 0) ? 1 : 0; }
+        static int r3d_256_arm_logged = 0;  /* Q45a liveness (stderr law, window 45) */
         /* FD/DB/PAD reach the template as literals (two-level dispatch: the runtime
          * gates pick which of the eight instantiations to emit). */
         if (use_fold) {

@@ -291,7 +291,31 @@ __device__ __forceinline__ void st_kv_regs(const uint4* src, bf16* KVp) {
  * crossing it both ways, capping the live range of the staged in-flight batch. */
 __device__ __forceinline__ void r3d_attn_sched_stop() { __builtin_amdgcn_sched_barrier(0); }
 
-template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0, int SB = 0, int FS = 0>
+/* Q45a (R3D_ATTN256_STAGEBAR): lgkmcnt-scoped staging barrier. gfx1100 S_BARRIER
+ * (ISA p.254) "do[es] not wait for any counters to go to zero before issuing" --
+ * the full vmcnt(0)+lgkmcnt(0) drain the compiler pins on llvm.amdgcn.s.barrier is
+ * fence habit, not a hardware requirement. Where a staging barrier's cross-lane
+ * dependency is LDS-only (ds_store is lgkmcnt-counted) AND the guarded window
+ * carries no global store (the touched sites' shipped lowering carries NO vscnt;
+ * publish sites keep the compiler's full triple -- Q31 store law), the minimal
+ * sufficient lowering is the Strata donor form: s_waitcnt lgkmcnt(0) for staging
+ * visibility + s_barrier for wave-correct arrival; the in-flight global prefetch
+ * stays in flight and lands behind the NEXT staging barrier's own vmcnt gate
+ * (present in the shipped lowering). Inline asm = codegen contract (Q42 law):
+ * re-prove the ISA site census after every toolchain bump. */
+__device__ __forceinline__ void r3d_stagebar_scoped() {
+    __asm__ __volatile__("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+}
+
+/* barrier selector: SBZ=0 -> shipped __syncthreads() verbatim (withdrawal arm);
+ * SBZ=1 -> scoped form at the Q45a-named staging sites only. Compile-time constant
+ * in every instantiation: no runtime branch, no register cost. */
+template <int SBZ>
+__device__ __forceinline__ void r3d_stage_bar() {
+    if (SBZ) r3d_stagebar_scoped(); else __syncthreads();
+}
+
+template <int D, int KVDT, int SPLITK, int DBUF = 0, int FOLD = 0, int PAD = 0, int F8ST = 0, int SB = 0, int FS = 0, int SBZ = 0>
 __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams P) {
     static_assert(FS == 0 || DBUF == 1, "fragment-side softmax rides the DBUF schedule only");
     constexpr int DSH = r3d_dlog2(D), DM1 = D - 1;
@@ -599,7 +623,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             } else {
             roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP,      a0, C::kSP, roCW::mem_row_major);
             roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP + 16, a1, C::kSP, roCW::mem_row_major);
-            __syncthreads();                                   /* K(t)'s fragments have left */
+            r3d_stage_bar<SBZ>();  /* K(t)'s fragments have left. Q45a NAMED SITE: the 0x4c00-class staging barrier -- the drain here swallows the 16 b128 K/V register prefetch; cross-lane dep at this barrier is the 8 preceding LDS staging stores only, and the shipped lowering carries no vscnt. The only such site in the current binary; the vscnt-bearing 0xc7b4/0xd234-class barriers stay compiler-emitted verbatim (Q31 store law). */
             if (tid < kBM && tid < valid) {
                 const int64_t rowpos = rowpos_of(tid);
                 const float* srow = Ssp + tid * C::kSP;
@@ -622,7 +646,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                     LSP[tid] += sum;
                 }
             }
-            __syncthreads();                                   /* CBc reads complete */
+            __syncthreads();                                   /* CBc reads complete [Q45a-site2:OFF] */
             }
             st_kv_regs<D, PAD>(kx, KVp);                            /* K(t+1) -> LDS */
             address_tile(t + 2, RBc, CBc);                     /* refill the freed slot */
@@ -631,7 +655,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             __syncthreads();
         }
 
-        /* pass two, pipelined */
+        /* pass two, pipelined */   /* [Q45a-site3 pass1 close:OFF] */
         address_tile(et0, RBc, CBc);
         address_tile(et0 + 1, RBn, CBn);
         __syncthreads();
@@ -675,7 +699,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             } else {
             roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP,      a0, C::kSP, roCW::mem_row_major);
             roCW::store_matrix_sync(Ssp + (w * 16) * C::kSP + 16, a1, C::kSP, roCW::mem_row_major);
-            __syncthreads();                                   /* b1: K(t)'s fragments left; S visible */
+            __syncthreads();                                   /* b1: K(t)'s fragments left; S visible [Q45a-site4:OFF] */
             for (int e = tid; e < kBM * kBN; e += kThreads) {  /* S -> P, all four waves */
                 const int r = e >> 5, jj = e & 31;
                 float pv = 0.0f;
@@ -689,7 +713,7 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
             st_kv_regs<D, PAD>(vc, KVp);                            /* V(t) -> LDS (K(t) dead per b1) */
             ld_kv_regs<D, KVDT>(vc, RBn, P, D, kvvec);         /* V(t+1) in flight */
             if (SB) r3d_attn_sched_stop();                     /* Q23: cap the in-flight window */
-            __syncthreads();                                   /* b2: Psp + V(t) visible */
+            __syncthreads();                                   /* b2: Psp + V(t) visible [Q45a-site5:OFF] */
             for (int jk = 0; jk < kBN / 16; ++jk) {
                 roCW::fragment<roCW::matrix_a, 16, 16, 16, bf16, roCW::row_major> fap;
                 roCW::load_matrix_sync(fap, Psp + (w * 16) * C::kPP + jk * 16, C::kPP,
@@ -702,12 +726,12 @@ __global__ __launch_bounds__(kThreads) void attn_paged_wmma_kernel(R3dAttnParams
                     roCW::mma_sync(oa[d0], fap, fbv, oa[d0]);
                 }
             }
-            __syncthreads();                                   /* b3: V(t)'s fragments left */
+            __syncthreads();                                   /* b3: V(t)'s fragments left [Q45a-site6:OFF] */
             st_kv_regs<D, PAD>(kx, KVp);                            /* K(t+1) -> LDS */
             address_tile(t + 2, RBc, CBc);
             { int64_t* tmp = RBc; RBc = RBn; RBn = tmp; }
             { unsigned char* tmp = CBc; CBc = CBn; CBn = tmp; }
-            __syncthreads();                                   /* b4: K(t+1)+addressing visible */
+            __syncthreads();                                   /* b4: K(t+1)+addressing visible [Q45a-site7:OFF] */
         }
     } else {
     /* ================= pass one: per-row running max m and exp-sum l ================= */
