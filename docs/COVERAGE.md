@@ -3735,3 +3735,11 @@ Consequence booked into the launcher comment and this chronicle: cross-arm pinne
 
 Manager verification: diff is comment-only in src (20 lines, all comment), tools additions only; merged; battery waived per same-binary law.
 
+
+
+## Window 52 (2026-10-27, AWST ~07:15-07:25) — Q34 CLOSED codegen-noop: LLVM already emits the fusions; census-tool drift noted
+
+Manager/subagent item 9 (Q34, desk-only, 32 calls / 6 min). v_add3_u32 present x8 per store iteration (RTNE narrow fused, zero v_add_u32 anywhere); the pair-pack is strength-reduced (and+or, equal cost) rather than the literal lshl_or; v153 and v158 vec-symbols sha1-identical; NaN island intact under saveexec complement masks. No card. The reviewer row's conditional design ("bench only if NOT emitted") retired it exactly as intended.
+
+TOOL DRIFT: q31/q48 census tools pin a ROCm path that no longer exists on cat, and current llvm-readelf renamed the target note; object-selection regexes now match zero (guards will raise, not silently pass). Fix scheduled as a prerequisite in the next desk window.
+
