@@ -3785,3 +3785,13 @@ NaN-SIGN COMMUTE LAW (new drift class): RDNA v_mul propagates the FIRST NaN oper
 
 Promotion: defaults flipped (explicit =0 stays verbatim withdrawal), v161 (md5 be50cd43) live on spec9g, R3D_DEBUG_VEC liveness naming arm=vec on the live graph, decode probe median 80.70 tok/s (from 71.88 pre-Q49 same rig, and the child's paired A/B measured +23% inside the session). Two promotions this delegation session (v160, v161) — the queue's 'bench-order' thesis earned its keep: Q44 band fix first, then the band's neighbor elementwise ops.
 
+
+
+## Window 57 (2026-10-27, AWST ~11:05-11:25) — Q50 ATTRIBUTED with a closed budget (Little 185 x tail 1.50 = measured); Q54 spawned; counters alive only in the dev container
+
+Manager/subagent item 14 (Q50, 71 calls / 15 min): the fp8a8 skinny-B shortfall is two stacked multipliers with no residual: per-group load->use serialization (no bwin prefetch window in sk staging; Little's-law MLP ceiling ~185 GB/s vs measured 188) times an exact grid tail (128 blocks over 96 CUs at 1 blk/CU = 1.50). Sector over-fetch, LDS-pipe, and DRAM were excluded with numbers, and the row's own premise numbers held. The cure is the repo's own bwin lineage plus launch rebalance -> Q54 spawned with a bench-first gate.
+
+Second target delivered too: the post-Q44 verify-band residual is walk load->fold dependency latency (chain ~ MT, SQ duty ~0.5, zero LDS conflicts) -- the same MLP fix-class, and it revives Q47's NCOLS amortization as an attributed lever rather than a guess.
+
+Counter-availability ledger (operator note): rocprofv3 1.4.1 works only inside radiance-dev:v1.11.0 (host has no counters), and on this SDK the wait-class/GL2C/TCP/GRBM counters are dead zeros (GRBM_COUNT=0 is the tell) -- the alive set (SQ_BUSY_CYCLES/SQ_WAVES/SQC_LDS_BANK_CONFLICT/Wavefronts + dispatch metadata) was sufficient for this attribution; a vmcnt-vs-lgkmcnt split needs an SDK upgrade.
+
