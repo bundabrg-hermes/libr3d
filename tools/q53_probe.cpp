@@ -90,6 +90,15 @@ int main(int argc, char** argv) {
     } else {
         for (auto& v : hq)  v = f32_bf16((float)gen());
         for (auto& v : hkv) v = f32_bf16((float)gen());
+        if (getenv("Q53_DUPROWS")) {
+            // every token carries token 0's Q row: then S(tok,h,j) is IDENTICAL data
+            // for tok=0,1,2,3 while the arms place those tokens on tile rows of
+            // different parity -> any m drift between same-head tokens of one arm is
+            // a row-parity artifact, no fold-vs-plain comparison needed
+            for (int t = 1; t < rows; t++)
+                for (size_t i = 0; i < (size_t)QH * HD; i++)
+                    hq[(size_t)t * ROWW + i] = hq[i];
+        }
     }
     std::vector<int32_t> hbt(NB), hsu(1, CTX), hcu(2);
     for (int i = 0; i < NB; i++) hbt[i] = i;
