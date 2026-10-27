@@ -67,7 +67,7 @@ if not objs:
     sys.exit("GUARD: 0 gfx1100 objects selected -- target-note form or fatbin "
              "layout drift; check the llvm-readelf --notes output form.")
 rows = []
-lab = re.compile(r"^([0-9a-f]+) <(.+)>:$")
+lab = re.compile(r"^([0-9a-fA-F]+) <(.+)>:$")  # window-52: current llvm prints UPPER-CASE hex
 full_out = None
 if "--full" in sys.argv:
     full_out = open(sys.argv[sys.argv.index("--full") + 1], "w")
@@ -81,7 +81,7 @@ for obj in objs:
         if m:
             if cur: rows.append(acc)
             cur = m.group(2)
-            acc = {"name": cur, "n": 0, "lastaddr": 0, "backbranch": 0}
+            acc = {"name": cur, "n": 0, "lastaddr": 0, "backbranch": 0, "base": int(m.group(1), 16)}
             acc.update({k: 0 for k in CLASSES})
             continue
         if acc is None or line[:1] != "\t": continue
@@ -93,14 +93,15 @@ for obj in objs:
         body = am.group(1) + " " + am.group(2)
         for k, rx in CLASSES.items():
             if rx.search(body): acc[k] += 1
-        cm = re.search(r"//\s*([0-9a-f]+):", line)
+        cm = re.search(r"//\s*([0-9a-fA-F]+):", line)
         addr = int(cm.group(1), 16) if cm else acc["lastaddr"] + 4
         acc["lastaddr"] = addr
         if body.startswith("s_cbranch"):
-            tm = re.search(r"<([^>+]+)\+0x([0-9a-f]+)>", line)
+            tm = re.search(r"<([^>+]+)\+0x([0-9a-fA-F]+)>", line)
             if tm:
                 if tm.group(1) == acc["name"]:
-                    if int(tm.group(2), 16) <= addr: acc["backbranch"] += 1
+                    # window-52: comment offsets are SYMBOL-RELATIVE
+                    if int(tm.group(2), 16) <= addr - acc["base"]: acc["backbranch"] += 1
             else:
                 tm = re.search(r"//\s*[0-9a-f]+:\s*[0-9a-f]+\s+(0x[0-9a-f]+)", line)
                 if tm and int(tm.group(1), 16) <= addr: acc["backbranch"] += 1

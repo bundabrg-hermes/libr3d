@@ -54,7 +54,7 @@ def carve(path, outdir, gfx):
     return names
 
 STORE = re.compile(r"\b(?:buffer_store|global_store|flat_store)")  # NOT scratch_store
-HDR = re.compile(r"^[0-9a-f]+ <(.+)>:")
+HDR = re.compile(r"^[0-9a-fA-F]+ <(.+)>:")  # window-52: UPPER-CASE hex from current llvm
 
 def census_asm(path):
     """Yield (func, barriers, [(line, pending_stores), ...]) per kernel function."""
