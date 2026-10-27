@@ -3701,3 +3701,17 @@ THREE V_PERM EMIT LAWS (card-pinned, each was silently-wrong before, now in skil
 
 KNOCK-ONS: Q47 synergy premise dead (no winning plane), parked on its own merits. Q44 unaffected (VALU-tax target). Q50 (counter-based attribution) is now the honest next measurement for the q8x family. Process notes: serve container create-template had drifted (dev-dump Cmd=/bin/bash → exit-0 restart loops) — child rebuilt from live inspect; runner scripts must be serial with distinct container names (double-script race cost one serve round, adjudicated by the clean r4 pair).
 
+
+
+## Window 49 (2026-10-27, AWST ~05:10-05:40) — Q39 CLOSED DARK: GQA packing shipped a week before booking; geometry correction (serve is h256 QH16/KVH4); Q53 spawned (fold FNV-comment contradiction)
+
+Manager/subagent item 6 (Q39, effort-M row closed in a 92-call/23-min premise window — the paper-first + timebox clauses made effort-M cheap because the build was correctly never started).
+
+The row's lever — packed GQA rows on the KV-head grid — is exactly the shipped FOLD=1 arm (d3d1276, 2026-10-20, default-ON, R3D_NO_GQA withdrawal lever exists). Serve liveness under the live engine names the packed arm EVERY decode step (arm=fold D=256 spl=32 grid(4,1,32)); fold-vs-withdrawal measures +50..+239% DISJOINT on 8/8 shapes — the row's prize, already booked a week before booking. The row's own precedent-check quoted a comment from the WMMA launcher without reading the launcher's dispatch, and anchored on the prefill grid line.
+
+GEOMETRY CORRECTION, queue-wide: spec9g's serving model is head_dim 256, QH16/KVH4, gqa=4 (live /graph). Several queue rows' h128 framing predates the v150 hd256 acceptance; where a row says "h128 serve path", read "h256 slice arm". The 215-217 gbs_kv datum is the FOLDED arm — under roofline on reduced bytes — which sharpens Q40's register-pressure framing rather than the bytes framing.
+
+Q53 SPAWNED: at pinned splits, fold vs plain is NOT bit-identical — deterministic, exhaustive-64/64 parity-shaped LSB drift (parity(tok) != parity(head-in-group)), slice-kernel m/l/O origin, schedule-independent. The launcher comment promising 'hashes must match bit for bit at pinned splits' is FALSE as written; every future attention item leans on that claim as a free FNV gate, so the law must be pinned or the order made actually-pinned.
+
+PASS-3 STALENESS AUDIT (pattern, on record): two QFN-pass-3 rows this mode (Q48, Q39) re-booked mechanisms shipped ~1 week pre-booking; the failure shape is citing source COMMENTS without reading the DISPATCH code. Weight freshness claims from comment-only reviewers accordingly; their numbers/citations otherwise verify exact.
+
