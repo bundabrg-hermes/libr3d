@@ -3715,3 +3715,13 @@ Q53 SPAWNED: at pinned splits, fold vs plain is NOT bit-identical — determinis
 
 PASS-3 STALENESS AUDIT (pattern, on record): two QFN-pass-3 rows this mode (Q48, Q39) re-booked mechanisms shipped ~1 week pre-booking; the failure shape is citing source COMMENTS without reading the DISPATCH code. Weight freshness claims from comment-only reviewers accordingly; their numbers/citations otherwise verify exact.
 
+
+
+## Window 50 (2026-10-27, AWST ~05:45-06:40) — Q52 FIXED+MERGED: ragged-V barrier race root-caused; the LIVE fused arm carries it too (benign only by V=128 geometry); v158 drafter build
+
+Manager/subagent item 7 (Q52, bug-surface, 173 calls / 44 min). Root cause: readout-RMS __syncthreads pair inside if(own)/else — wave-uniform only when V%32==0 — at ragged V the boundary wave runs both pairs, arrivals skew, thread-0's serial s_orow read races the tail wave's stores, uninitialized-LDS poisons s_sc, whole rows scale wrong. The predication family from window 46 (saveexec/EXEC) again produced the failure: this time inside SHIPPED code, found by determinism probing rather than any fold attempt.
+
+Escalation-grade finding: the serve-dispatched FUSED conv-recurrent kernel carries the byte-identical construct and drifts empirically at V=33/40/48 via the real launcher ABI (BG_V bench lever, now in main as the ragged-width drive tool). Live risk today is zero ONLY because the served model is V=128 — a future head_v%32!=0 model would have shipped silent row-scale poisoning. Fixed in both kernels (barriers hoisted to wave-uniform level); in-contract outputs FNV byte-identical pre/post through the launcher ABI; child battery 7/7 zero-diff + manager independent re-run on the merged tree (all packs difflines=0 — see ship below); census: only never-dispatched sb0 fallback resources changed.
+
+Promotion: merged to main (91c31ea). NO serve swap (fix inert at V=128; next mount bump carries it; v158 = drafter build). Audit grep-pattern booked for future code review: syncthreads inside V-derived divergent branches.
+
