@@ -82,6 +82,18 @@ int main(int argc, char** argv) {
     auto entry = (int (*)(const RadArgs*, RadStream))dlsym(dl, "r3d_rad_rmsnorm");
     if (!entry) { printf("dlsym r3d_rad_rmsnorm: %s\n", dlerror()); return 1; }
 
+    // HARD device assertion (libr3d law): an unpinned arm produces phantom
+    // passes on the wrong card, never a result. gfx1100 only, loudly.
+    {
+        hipDeviceProp_t prop;
+        die("getprops", hipGetDeviceProperties(&prop, 0));
+        printf("DEV name=%s arch=%s\n", prop.name, prop.gcnArchName);
+        if (!strstr(prop.gcnArchName, "gfx1100")) {
+            printf("PROBE-FAIL: not the XTX (arch=%s) -- ROCR pin is wrong\n", prop.gcnArchName);
+            return 4;
+        }
+    }
+
     static const Leg legs[] = {
         // name              n     m  gain wadd mult  xoff yoff woff xpitch ypitch
         { "head128_none",    128,  8,   0, 0.f, 1.f,   0, 0, 0, 0, 0 },
