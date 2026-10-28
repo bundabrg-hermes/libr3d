@@ -1,0 +1,97 @@
+
+=== M=14 K=16384 N=16384 rot=4 ===
+  base   med=  1.447 ms  spread 1.446..1.448  n=3
+  SK1    med=  4.223 ms  spread 4.213..4.240  n=3  -191.8%  LOSS (spreads disjoint)
+  SK2    med=  2.978 ms  spread 2.953..2.988  n=3  -105.8%  LOSS (spreads disjoint)
+  SK4    med=  2.545 ms  spread 2.534..2.546  n=3   -75.9%  LOSS (spreads disjoint)
+  SK8V   med=  1.449 ms  spread 1.409..1.451  n=3    -0.1%  overlap
+  SKW1   med=  2.769 ms  spread 2.735..2.818  n=3   -91.4%  LOSS (spreads disjoint)
+  SKW2   med=  2.357 ms  spread 2.351..2.372  n=3   -62.9%  LOSS (spreads disjoint)
+  SKW4   med=  2.275 ms  spread 2.274..2.296  n=3   -57.2%  LOSS (spreads disjoint)
+  SKW8   med=  1.030 ms  spread 1.019..1.033  n=3   +28.8%  WIN  (spreads disjoint)
+  TILE   med=  1.430 ms  spread 1.430..1.432  n=3    +1.2%  WIN  (spreads disjoint)
+
+=== M=14 K=16384 N=16384 rot=1 ===
+  base   med=  1.447 ms  spread 1.446..1.450  n=3
+  SK1    med=  4.210 ms  spread 4.207..4.220  n=3  -190.9%  LOSS (spreads disjoint)
+  SK2    med=  2.946 ms  spread 2.913..2.948  n=3  -103.6%  LOSS (spreads disjoint)
+  SK4    med=  2.534 ms  spread 2.524..2.556  n=3   -75.1%  LOSS (spreads disjoint)
+  SK8V   med=  1.445 ms  spread 1.416..1.454  n=3    +0.1%  overlap
+  SKW1   med=  2.789 ms  spread 2.730..2.798  n=3   -92.7%  LOSS (spreads disjoint)
+  SKW2   med=  2.365 ms  spread 2.331..2.376  n=3   -63.4%  LOSS (spreads disjoint)
+  SKW4   med=  2.300 ms  spread 2.255..2.300  n=3   -58.9%  LOSS (spreads disjoint)
+  SKW8   med=  1.031 ms  spread 1.005..1.050  n=3   +28.7%  WIN  (spreads disjoint)
+  TILE   med=  1.426 ms  spread 1.424..1.428  n=3    +1.5%  WIN  (spreads disjoint)
+
+=== M=4 K=16384 N=16384 rot=4 ===
+  base   med=  1.294 ms  spread 1.289..1.294  n=3
+  GEMV   med=  1.293 ms  spread 1.290..1.299  n=3    +0.1%  overlap
+  SK1    med=  2.563 ms  spread 2.555..2.606  n=3   -98.1%  LOSS (spreads disjoint)
+  SK2    med=  2.290 ms  spread 2.279..2.290  n=3   -77.0%  LOSS (spreads disjoint)
+  SK4    med=  2.170 ms  spread 2.163..2.177  n=3   -67.7%  LOSS (spreads disjoint)
+  SK8V   med=  1.309 ms  spread 1.275..1.310  n=3    -1.2%  overlap
+  SKW1   med=  2.060 ms  spread 1.784..2.174  n=3   -59.2%  LOSS (spreads disjoint)
+  SKW2   med=  1.292 ms  spread 1.277..1.330  n=3    +0.2%  overlap
+  SKW4   med=  1.237 ms  spread 1.215..1.238  n=3    +4.4%  WIN  (spreads disjoint)
+  SKW8   med=  0.811 ms  spread 0.800..0.821  n=3   +37.3%  WIN  (spreads disjoint)
+  TILE   med=  1.272 ms  spread 1.269..1.279  n=3    +1.7%  WIN  (spreads disjoint)
+
+=== M=32 K=16384 N=16384 rot=4 ===
+  base   med=  1.916 ms  spread 1.907..1.953  n=3
+  SK1    med=  6.781 ms  spread 6.733..6.802  n=3  -253.9%  LOSS (spreads disjoint)
+  SK2    med=  4.361 ms  spread 4.331..4.377  n=3  -127.6%  LOSS (spreads disjoint)
+  SK4    med=  3.769 ms  spread 3.763..3.935  n=3   -96.7%  LOSS (spreads disjoint)
+  SK8V   med=  1.914 ms  spread 1.870..1.934  n=3    +0.1%  overlap
+  SKW1   med=  4.887 ms  spread 4.845..4.981  n=3  -155.1%  LOSS (spreads disjoint)
+  SKW2   med=  3.894 ms  spread 3.891..3.917  n=3  -103.2%  LOSS (spreads disjoint)
+  SKW4   med=  3.778 ms  spread 3.771..3.782  n=3   -97.2%  LOSS (spreads disjoint)
+  SKW8   med=  1.746 ms  spread 1.745..1.752  n=3    +8.9%  WIN  (spreads disjoint)
+  TILE   med=  1.953 ms  spread 1.941..1.975  n=3    -1.9%  overlap
+
+=== M=14 K=8192 N=28672 rot=4 ===
+  base   med=  1.464 ms  spread 1.461..1.472  n=3
+  SK1    med=  3.158 ms  spread 3.148..3.160  n=3  -115.7%  LOSS (spreads disjoint)
+  SK2    med=  2.150 ms  spread 2.121..2.158  n=3   -46.9%  LOSS (spreads disjoint)
+  SK4    med=  1.849 ms  spread 1.832..1.935  n=3   -26.3%  LOSS (spreads disjoint)
+  SK8V   med=  1.460 ms  spread 1.446..1.468  n=3    +0.3%  overlap
+  SKW1   med=  2.083 ms  spread 2.060..2.147  n=3   -42.3%  LOSS (spreads disjoint)
+  SKW2   med=  1.767 ms  spread 1.755..1.778  n=3   -20.7%  LOSS (spreads disjoint)
+  SKW4   med=  1.597 ms  spread 1.594..1.606  n=3    -9.1%  LOSS (spreads disjoint)
+  SKW8   med=  1.026 ms  spread 1.007..1.029  n=3   +29.9%  WIN  (spreads disjoint)
+  TILE   med=  1.482 ms  spread 1.482..1.492  n=3    -1.2%  LOSS (spreads disjoint)
+
+=== M=14 K=14336 N=4096 rot=4 ===
+  base   med=  0.843 ms  spread 0.837..0.848  n=3
+  SK1    med=  1.291 ms  spread 1.291..1.292  n=3   -53.1%  LOSS (spreads disjoint)
+  SK2    med=  1.068 ms  spread 1.064..1.068  n=3   -26.7%  LOSS (spreads disjoint)
+  SK4    med=  0.914 ms  spread 0.912..0.917  n=3    -8.4%  LOSS (spreads disjoint)
+  SK8V   med=  0.853 ms  spread 0.853..0.864  n=3    -1.2%  LOSS (spreads disjoint)
+  SKW1   med=  0.947 ms  spread 0.940..0.969  n=3   -12.3%  LOSS (spreads disjoint)
+  SKW2   med=  0.808 ms  spread 0.801..0.818  n=3    +4.2%  WIN  (spreads disjoint)
+  SKW4   med=  0.733 ms  spread 0.731..0.736  n=3   +13.0%  WIN  (spreads disjoint)
+  SKW8   med=  0.645 ms  spread 0.645..0.646  n=3   +23.5%  WIN  (spreads disjoint)
+  TILE   med=  0.842 ms  spread 0.834..0.850  n=3    +0.1%  overlap
+
+=== M=14 K=14336 N=4096 rot=1 ===
+  base   med=  0.624 ms  spread 0.622..0.672  n=3
+  SK1    med=  1.069 ms  spread 1.066..1.089  n=3   -71.3%  LOSS (spreads disjoint)
+  SK2    med=  0.842 ms  spread 0.842..0.850  n=3   -34.9%  LOSS (spreads disjoint)
+  SK4    med=  0.721 ms  spread 0.720..0.721  n=3   -15.5%  LOSS (spreads disjoint)
+  SK8V   med=  0.624 ms  spread 0.624..0.625  n=3    +0.0%  overlap
+  SKW1   med=  0.833 ms  spread 0.832..0.849  n=3   -33.5%  LOSS (spreads disjoint)
+  SKW2   med=  0.618 ms  spread 0.616..0.628  n=3    +1.0%  overlap
+  SKW4   med=  0.503 ms  spread 0.501..0.507  n=3   +19.4%  WIN  (spreads disjoint)
+  SKW8   med=  0.414 ms  spread 0.413..0.423  n=3   +33.7%  WIN  (spreads disjoint)
+  TILE   med=  0.613 ms  spread 0.613..0.614  n=3    +1.8%  WIN  (spreads disjoint)
+
+=== M=14 K=8192 N=8192 rot=1 ===
+  base   med=  0.422 ms  spread 0.421..0.424  n=3
+  SK1    med=  0.833 ms  spread 0.828..0.843  n=3   -97.4%  LOSS (spreads disjoint)
+  SK2    med=  0.554 ms  spread 0.551..0.558  n=3   -31.3%  LOSS (spreads disjoint)
+  SK4    med=  0.459 ms  spread 0.455..0.459  n=3    -8.8%  LOSS (spreads disjoint)
+  SK8V   med=  0.412 ms  spread 0.412..0.428  n=3    +2.4%  overlap
+  SKW1   med=  0.592 ms  spread 0.574..0.595  n=3   -40.3%  LOSS (spreads disjoint)
+  SKW2   med=  0.422 ms  spread 0.422..0.423  n=3    +0.0%  overlap
+  SKW4   med=  0.356 ms  spread 0.356..0.357  n=3   +15.6%  WIN  (spreads disjoint)
+  SKW8   med=  0.292 ms  spread 0.290..0.296  n=3   +30.8%  WIN  (spreads disjoint)
+  TILE   med=  0.397 ms  spread 0.397..0.397  n=3    +5.9%  WIN  (spreads disjoint)

@@ -1,0 +1,1029 @@
+5a8e5923fe3b612167463dafbb3d483d  /home/brendan/scratch/r3d/q54/bench_fp8_skinny
+LEG s1_m14_r4 r=1 rc=0 ab=10 exp=10 rev=0
+ORACLE NaN outputs 0/229376 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=16384 N=16384: ROW==oracle 229293/229376 rel_l2=4.63e-05 | SKINNY==oracle 229293/229376 rel_l2=4.63e-05
+ANAT SKINNY nan=0 tokhist=8 8 3 4 6 6 7 5 8 8 3 6 5 6 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=2 1 0 0 1 0 0 1 2 1 0 1 1 2 2 0 0 1 2 0 0 1 0 1 0 0 3 3 2 1 3 6 0 4 0 4 1 3 0 2 0 0 0 1 2 0 2 2 4 2 0 2 2 1 0 1 2 3 2 2 0 0 1 3 
+  [t=0 r=3452] SK=3b4e RO=3b4e NV=3b4c
+  [t=0 r=3737] SK=429e RO=429e NV=429d
+  [t=0 r=6887] SK=3b0c RO=3b0c NV=3b0f
+  [t=0 r=7420] SK=c32e RO=c32e NV=c32f
+  [t=0 r=8099] SK=40c7 RO=40c7 NV=40c8
+  [t=0 r=8585] SK=bd32 RO=bd32 NV=bd33
+  [t=0 r=12522] SK=3df2 RO=3df2 NV=3df3
+  [t=0 r=13220] SK=3cfd RO=3cfd NV=3cfe
+A TILE   M=14 rot=4 | t_med=1.430 ms p2=1.418 p8=1.448 | 187.7 GB/s e4m3
+B SKINNY M=14 rot=4 | t_med=1.447 ms p2=1.437 p8=1.455 | 185.6 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = -1.2%
+YHASH arm=base ROW M=14 K=16384 N=16384 yhash=9105551491f6208b nonzero=229376/229376
+CHECKW arm=SK8V ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK4 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK2 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK1 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW8 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW4 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW2 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW1 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+AB r=1 arm=TILE ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=1.430 ms  e4m3 187.7 GB/s nonzero=229376/229376
+AB r=1 arm=base ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=1.447 ms  e4m3 185.6 GB/s nonzero=229376/229376
+AB r=1 arm=SK8V ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=1.451 ms  e4m3 185.0 GB/s nonzero=229376/229376
+   SK8V p2=1.433 p8=1.471 ms
+AB r=1 arm=SK4 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=2.546 ms  e4m3 105.5 GB/s nonzero=229376/229376
+   SK4 p2=2.497 p8=2.593 ms
+AB r=1 arm=SK2 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=2.988 ms  e4m3 89.8 GB/s nonzero=229376/229376
+   SK2 p2=2.917 p8=3.033 ms
+AB r=1 arm=SK1 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=4.223 ms  e4m3 63.6 GB/s nonzero=229376/229376
+   SK1 p2=4.167 p8=4.253 ms
+AB r=1 arm=SKW8 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=1.030 ms  e4m3 260.7 GB/s nonzero=229376/229376
+   SKW8 p2=0.991 p8=1.091 ms
+AB r=1 arm=SKW4 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=2.274 ms  e4m3 118.1 GB/s nonzero=229376/229376
+   SKW4 p2=2.251 p8=2.308 ms
+AB r=1 arm=SKW2 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=2.351 ms  e4m3 114.2 GB/s nonzero=229376/229376
+   SKW2 p2=2.343 p8=2.366 ms
+AB r=1 arm=SKW1 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=2.769 ms  e4m3 96.9 GB/s nonzero=229376/229376
+   SKW1 p2=2.688 p8=2.801 ms
+LEG s1_m14_r1 r=1 rc=0 ab=10 exp=10 rev=0
+ORACLE NaN outputs 0/229376 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=16384 N=16384: ROW==oracle 229293/229376 rel_l2=4.63e-05 | SKINNY==oracle 229293/229376 rel_l2=4.63e-05
+ANAT SKINNY nan=0 tokhist=8 8 3 4 6 6 7 5 8 8 3 6 5 6 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=2 1 0 0 1 0 0 1 2 1 0 1 1 2 2 0 0 1 2 0 0 1 0 1 0 0 3 3 2 1 3 6 0 4 0 4 1 3 0 2 0 0 0 1 2 0 2 2 4 2 0 2 2 1 0 1 2 3 2 2 0 0 1 3 
+  [t=0 r=3452] SK=3b4e RO=3b4e NV=3b4c
+  [t=0 r=3737] SK=429e RO=429e NV=429d
+  [t=0 r=6887] SK=3b0c RO=3b0c NV=3b0f
+  [t=0 r=7420] SK=c32e RO=c32e NV=c32f
+  [t=0 r=8099] SK=40c7 RO=40c7 NV=40c8
+  [t=0 r=8585] SK=bd32 RO=bd32 NV=bd33
+  [t=0 r=12522] SK=3df2 RO=3df2 NV=3df3
+  [t=0 r=13220] SK=3cfd RO=3cfd NV=3cfe
+A TILE   M=14 rot=1 | t_med=1.428 ms p2=1.412 p8=1.438 | 188.0 GB/s e4m3
+B SKINNY M=14 rot=1 | t_med=1.447 ms p2=1.438 p8=1.462 | 185.5 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = -1.3%
+YHASH arm=base ROW M=14 K=16384 N=16384 yhash=9105551491f6208b nonzero=229376/229376
+CHECKW arm=SK8V ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK4 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK2 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK1 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW8 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW4 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW2 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW1 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+AB r=1 arm=TILE ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=1.428 ms  e4m3 188.0 GB/s nonzero=229376/229376
+AB r=1 arm=base ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=1.447 ms  e4m3 185.5 GB/s nonzero=229376/229376
+AB r=1 arm=SK8V ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=1.454 ms  e4m3 184.6 GB/s nonzero=229376/229376
+   SK8V p2=1.442 p8=1.476 ms
+AB r=1 arm=SK4 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=2.556 ms  e4m3 105.0 GB/s nonzero=229376/229376
+   SK4 p2=2.521 p8=2.591 ms
+AB r=1 arm=SK2 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=2.946 ms  e4m3 91.1 GB/s nonzero=229376/229376
+   SK2 p2=2.868 p8=3.002 ms
+AB r=1 arm=SK1 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=4.220 ms  e4m3 63.6 GB/s nonzero=229376/229376
+   SK1 p2=4.193 p8=4.247 ms
+AB r=1 arm=SKW8 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=1.005 ms  e4m3 267.0 GB/s nonzero=229376/229376
+   SKW8 p2=0.972 p8=1.058 ms
+AB r=1 arm=SKW4 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=2.255 ms  e4m3 119.0 GB/s nonzero=229376/229376
+   SKW4 p2=2.242 p8=2.267 ms
+AB r=1 arm=SKW2 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=2.331 ms  e4m3 115.2 GB/s nonzero=229376/229376
+   SKW2 p2=2.310 p8=2.353 ms
+AB r=1 arm=SKW1 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=2.789 ms  e4m3 96.3 GB/s nonzero=229376/229376
+   SKW1 p2=2.764 p8=2.820 ms
+LEG s1_m4_r4 r=1 rc=0 ab=11 exp=11 rev=0
+ORACLE NaN outputs 0/65536 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=4 K=16384 N=16384: ROW==oracle 65513/65536 rel_l2=6.93e-05 | SKINNY==oracle 65513/65536 rel_l2=6.93e-05
+ANAT SKINNY nan=0 tokhist=8 8 3 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=0 0 0 0 1 0 0 0 0 0 0 0 0 2 1 0 0 0 0 0 0 0 0 0 0 0 1 0 2 0 1 2 0 2 0 1 1 1 0 0 0 0 0 0 0 0 0 1 2 0 0 1 0 0 0 0 1 0 1 1 0 0 1 0 
+  [t=0 r=3452] SK=3b4e RO=3b4e NV=3b4c
+  [t=0 r=3737] SK=429e RO=429e NV=429d
+  [t=0 r=6887] SK=3b0c RO=3b0c NV=3b0f
+  [t=0 r=7420] SK=c32e RO=c32e NV=c32f
+  [t=0 r=8099] SK=40c7 RO=40c7 NV=40c8
+  [t=0 r=8585] SK=bd32 RO=bd32 NV=bd33
+  [t=0 r=12522] SK=3df2 RO=3df2 NV=3df3
+  [t=0 r=13220] SK=3cfd RO=3cfd NV=3cfe
+      GEMV==oracle 65513/65536 rel_l2=6.93e-05
+A TILE   M=4 rot=4 | t_med=1.269 ms p2=1.244 p8=1.284 | 211.6 GB/s e4m3
+B SKINNY M=4 rot=4 | t_med=1.289 ms p2=1.277 p8=1.296 | 208.2 GB/s e4m3
+DELTA SKINNY/TILE M=4 | (A/B-1)*100 = -1.6%
+C GEMV   M=4 rot=4 | t_med=1.299 ms p2=1.280 p8=1.313 | 206.7 GB/s e4m3
+DELTA TILE/GEMV M=4 | (C/A-1)*100 = +2.4%
+DELTA SKINNY/GEMV M=4 | (C/B-1)*100 = +0.7%
+YHASH arm=base ROW M=4 K=16384 N=16384 yhash=3eaf75a782153a35 nonzero=65536/65536
+CHECKW arm=SK8V ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SK4 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SK2 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SK1 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SKW8 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SKW4 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SKW2 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SKW1 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+AB r=1 arm=TILE ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.269 ms  e4m3 211.6 GB/s nonzero=65536/65536
+AB r=1 arm=base ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.289 ms  e4m3 208.2 GB/s nonzero=65536/65536
+AB r=1 arm=GEMV ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.299 ms  e4m3 206.7 GB/s nonzero=65536/65536
+AB r=1 arm=SK8V ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.309 ms  e4m3 205.0 GB/s nonzero=65536/65536
+   SK8V p2=1.302 p8=1.335 ms
+AB r=1 arm=SK4 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=2.177 ms  e4m3 123.3 GB/s nonzero=65536/65536
+   SK4 p2=2.152 p8=2.193 ms
+AB r=1 arm=SK2 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=2.290 ms  e4m3 117.2 GB/s nonzero=65536/65536
+   SK2 p2=2.280 p8=2.310 ms
+AB r=1 arm=SK1 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=2.606 ms  e4m3 103.0 GB/s nonzero=65536/65536
+   SK1 p2=2.534 p8=2.648 ms
+AB r=1 arm=SKW8 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=0.811 ms  e4m3 330.9 GB/s nonzero=65536/65536
+   SKW8 p2=0.792 p8=0.819 ms
+AB r=1 arm=SKW4 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.215 ms  e4m3 221.0 GB/s nonzero=65536/65536
+   SKW4 p2=1.198 p8=1.253 ms
+AB r=1 arm=SKW2 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.292 ms  e4m3 207.8 GB/s nonzero=65536/65536
+   SKW2 p2=1.257 p8=1.361 ms
+AB r=1 arm=SKW1 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.784 ms  e4m3 150.5 GB/s nonzero=65536/65536
+   SKW1 p2=1.574 p8=2.141 ms
+LEG s1_m32_r4 r=1 rc=0 ab=10 exp=10 rev=0
+ORACLE NaN outputs 0/524288 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=32 K=16384 N=16384: ROW==oracle 524122/524288 rel_l2=4.10e-05 | SKINNY==oracle 524122/524288 rel_l2=4.10e-05
+ANAT SKINNY nan=0 tokhist=8 8 3 4 6 6 7 5 8 8 3 6 5 6 2 5 4 5 6 7 5 3 4 2 8 3 6 6 3 4 6 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=3 1 0 2 3 1 1 1 3 3 1 3 4 3 5 1 0 2 3 0 1 1 1 4 3 1 4 5 6 2 3 6 4 5 2 5 3 5 1 2 1 3 0 3 3 0 4 3 7 2 3 3 4 3 1 2 3 4 2 3 1 0 2 5 
+  [t=0 r=3452] SK=3b4e RO=3b4e NV=3b4c
+  [t=0 r=3737] SK=429e RO=429e NV=429d
+  [t=0 r=6887] SK=3b0c RO=3b0c NV=3b0f
+  [t=0 r=7420] SK=c32e RO=c32e NV=c32f
+  [t=0 r=8099] SK=40c7 RO=40c7 NV=40c8
+  [t=0 r=8585] SK=bd32 RO=bd32 NV=bd33
+  [t=0 r=12522] SK=3df2 RO=3df2 NV=3df3
+  [t=0 r=13220] SK=3cfd RO=3cfd NV=3cfe
+A TILE   M=32 rot=4 | t_med=1.975 ms p2=1.932 p8=1.988 | 135.9 GB/s e4m3
+B SKINNY M=32 rot=4 | t_med=1.953 ms p2=1.942 p8=1.970 | 137.4 GB/s e4m3
+DELTA SKINNY/TILE M=32 | (A/B-1)*100 = +1.1%
+YHASH arm=base ROW M=32 K=16384 N=16384 yhash=99cee08f53d889b0 nonzero=524288/524288
+CHECKW arm=SK8V ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SK4 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SK2 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SK1 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SKW8 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SKW4 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SKW2 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SKW1 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+AB r=1 arm=TILE ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=1.975 ms  e4m3 135.9 GB/s nonzero=524288/524288
+AB r=1 arm=base ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=1.953 ms  e4m3 137.4 GB/s nonzero=524288/524288
+AB r=1 arm=SK8V ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=1.934 ms  e4m3 138.8 GB/s nonzero=524288/524288
+   SK8V p2=1.909 p8=1.946 ms
+AB r=1 arm=SK4 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=3.935 ms  e4m3 68.2 GB/s nonzero=524288/524288
+   SK4 p2=3.722 p8=4.336 ms
+AB r=1 arm=SK2 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=4.377 ms  e4m3 61.3 GB/s nonzero=524288/524288
+   SK2 p2=4.310 p8=4.426 ms
+AB r=1 arm=SK1 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=6.733 ms  e4m3 39.9 GB/s nonzero=524288/524288
+   SK1 p2=6.657 p8=6.822 ms
+AB r=1 arm=SKW8 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=1.752 ms  e4m3 153.2 GB/s nonzero=524288/524288
+   SKW8 p2=1.738 p8=1.775 ms
+AB r=1 arm=SKW4 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=3.782 ms  e4m3 71.0 GB/s nonzero=524288/524288
+   SKW4 p2=3.717 p8=3.851 ms
+AB r=1 arm=SKW2 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=3.891 ms  e4m3 69.0 GB/s nonzero=524288/524288
+   SKW2 p2=3.848 p8=3.933 ms
+AB r=1 arm=SKW1 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=4.887 ms  e4m3 54.9 GB/s nonzero=524288/524288
+   SKW1 p2=4.790 p8=4.915 ms
+LEG s2_m14_r4 r=1 rc=0 ab=10 exp=10 rev=0
+ORACLE NaN outputs 0/401408 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=8192 N=28672: ROW==oracle 401285/401408 rel_l2=3.22e-05 | SKINNY==oracle 401285/401408 rel_l2=3.22e-05
+ANAT SKINNY nan=0 tokhist=10 8 8 6 7 8 7 13 10 7 11 8 13 7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=4 2 0 1 0 2 1 1 2 1 0 1 1 1 1 0 3 0 1 1 1 2 1 1 1 3 1 1 0 1 1 1 1 1 1 1 2 0 3 1 3 1 1 0 0 1 1 1 2 1 0 1 0 2 1 0 0 2 1 1 0 0 0 1 1 2 3 0 2 1 2 1 1 0 1 0 1 1 0 1 0 3 1 0 0 1 1 3 0 1 0 1 2 0 3 3 2 1 3 1 2 2 2 0 0 1 2 1 0 2 1 0 
+  [t=0 r=461] SK=432f RO=432f NV=4330
+  [t=0 r=948] SK=3ce9 RO=3ce9 NV=3ce8
+  [t=0 r=5604] SK=3db7 RO=3db7 NV=3db8
+  [t=0 r=6632] SK=b8fc RO=b8fc NV=b92d
+  [t=0 r=10739] SK=3f31 RO=3f31 NV=3f30
+  [t=0 r=13651] SK=3f80 RO=3f80 NV=3f81
+  [t=0 r=18348] SK=c26b RO=c26b NV=c26c
+  [t=0 r=24709] SK=bc44 RO=bc44 NV=bc45
+A TILE   M=14 rot=4 | t_med=1.482 ms p2=1.462 p8=1.496 | 158.5 GB/s e4m3
+B SKINNY M=14 rot=4 | t_med=1.472 ms p2=1.442 p8=1.483 | 159.5 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = +0.7%
+YHASH arm=base ROW M=14 K=8192 N=28672 yhash=594c6a011ee3d780 nonzero=401408/401408
+CHECKW arm=SK8V ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SK4 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SK2 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SK1 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SKW8 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SKW4 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SKW2 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SKW1 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+AB r=1 arm=TILE ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.482 ms  e4m3 158.5 GB/s nonzero=401408/401408
+AB r=1 arm=base ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.472 ms  e4m3 159.5 GB/s nonzero=401408/401408
+AB r=1 arm=SK8V ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.468 ms  e4m3 160.0 GB/s nonzero=401408/401408
+   SK8V p2=1.443 p8=1.491 ms
+AB r=1 arm=SK4 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.832 ms  e4m3 128.2 GB/s nonzero=401408/401408
+   SK4 p2=1.613 p8=2.041 ms
+AB r=1 arm=SK2 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=2.150 ms  e4m3 109.3 GB/s nonzero=401408/401408
+   SK2 p2=2.126 p8=2.174 ms
+AB r=1 arm=SK1 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=3.148 ms  e4m3 74.6 GB/s nonzero=401408/401408
+   SK1 p2=3.126 p8=3.169 ms
+AB r=1 arm=SKW8 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.007 ms  e4m3 233.4 GB/s nonzero=401408/401408
+   SKW8 p2=0.974 p8=1.059 ms
+AB r=1 arm=SKW4 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.594 ms  e4m3 147.3 GB/s nonzero=401408/401408
+   SKW4 p2=1.579 p8=1.618 ms
+AB r=1 arm=SKW2 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.767 ms  e4m3 132.9 GB/s nonzero=401408/401408
+   SKW2 p2=1.760 p8=1.778 ms
+AB r=1 arm=SKW1 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=2.083 ms  e4m3 112.8 GB/s nonzero=401408/401408
+   SKW1 p2=2.054 p8=2.108 ms
+LEG s3_m14_r4 r=1 rc=0 ab=10 exp=10 rev=0
+ORACLE NaN outputs 0/57344 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=14336 N=4096: ROW==oracle 57331/57344 rel_l2=3.41e-05 | SKINNY==oracle 57331/57344 rel_l2=3.41e-05
+ANAT SKINNY nan=0 tokhist=1 0 0 0 1 0 1 1 2 3 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=0 1 1 1 0 2 1 0 0 3 0 0 0 1 1 2 
+  [t=0 r=2360] SK=c173 RO=c173 NV=c174
+  [t=4 r=1732] SK=bef7 RO=bef7 NV=bef8
+  [t=6 r=766] SK=c172 RO=c172 NV=c171
+  [t=7 r=1313] SK=bbce RO=bbce NV=bbcd
+  [t=8 r=3779] SK=bd57 RO=bd57 NV=bd56
+  [t=8 r=3900] SK=c346 RO=c346 NV=c347
+  [t=9 r=494] SK=40a3 RO=40a3 NV=40a4
+  [t=9 r=831] SK=3e34 RO=3e34 NV=3e33
+A TILE   M=14 rot=4 | t_med=0.842 ms p2=0.829 p8=0.862 | 69.7 GB/s e4m3
+B SKINNY M=14 rot=4 | t_med=0.848 ms p2=0.822 p8=0.868 | 69.2 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = -0.7%
+YHASH arm=base ROW M=14 K=14336 N=4096 yhash=6ba4c43b8e220bcf nonzero=57344/57344
+CHECKW arm=SK8V ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK4 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK2 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK1 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW8 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW4 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW2 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW1 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+AB r=1 arm=TILE ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.842 ms  e4m3 69.7 GB/s nonzero=57344/57344
+AB r=1 arm=base ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.848 ms  e4m3 69.2 GB/s nonzero=57344/57344
+AB r=1 arm=SK8V ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.853 ms  e4m3 68.9 GB/s nonzero=57344/57344
+   SK8V p2=0.833 p8=0.874 ms
+AB r=1 arm=SK4 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.917 ms  e4m3 64.0 GB/s nonzero=57344/57344
+   SK4 p2=0.910 p8=0.920 ms
+AB r=1 arm=SK2 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=1.068 ms  e4m3 55.0 GB/s nonzero=57344/57344
+   SK2 p2=1.063 p8=1.072 ms
+AB r=1 arm=SK1 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=1.291 ms  e4m3 45.5 GB/s nonzero=57344/57344
+   SK1 p2=1.286 p8=1.298 ms
+AB r=1 arm=SKW8 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.645 ms  e4m3 91.1 GB/s nonzero=57344/57344
+   SKW8 p2=0.640 p8=0.651 ms
+AB r=1 arm=SKW4 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.733 ms  e4m3 80.1 GB/s nonzero=57344/57344
+   SKW4 p2=0.720 p8=0.742 ms
+AB r=1 arm=SKW2 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.801 ms  e4m3 73.3 GB/s nonzero=57344/57344
+   SKW2 p2=0.793 p8=0.810 ms
+AB r=1 arm=SKW1 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.947 ms  e4m3 62.0 GB/s nonzero=57344/57344
+   SKW1 p2=0.943 p8=0.952 ms
+LEG s3c_m14_r1 r=1 rc=0 ab=10 exp=10 rev=0
+ORACLE NaN outputs 0/57344 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=14336 N=4096: ROW==oracle 57331/57344 rel_l2=3.41e-05 | SKINNY==oracle 57331/57344 rel_l2=3.41e-05
+ANAT SKINNY nan=0 tokhist=1 0 0 0 1 0 1 1 2 3 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=0 1 1 1 0 2 1 0 0 3 0 0 0 1 1 2 
+  [t=0 r=2360] SK=c173 RO=c173 NV=c174
+  [t=4 r=1732] SK=bef7 RO=bef7 NV=bef8
+  [t=6 r=766] SK=c172 RO=c172 NV=c171
+  [t=7 r=1313] SK=bbce RO=bbce NV=bbcd
+  [t=8 r=3779] SK=bd57 RO=bd57 NV=bd56
+  [t=8 r=3900] SK=c346 RO=c346 NV=c347
+  [t=9 r=494] SK=40a3 RO=40a3 NV=40a4
+  [t=9 r=831] SK=3e34 RO=3e34 NV=3e33
+A TILE   M=14 rot=1 | t_med=0.613 ms p2=0.612 p8=0.615 | 95.7 GB/s e4m3
+B SKINNY M=14 rot=1 | t_med=0.622 ms p2=0.618 p8=0.625 | 94.4 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = -1.4%
+YHASH arm=base ROW M=14 K=14336 N=4096 yhash=6ba4c43b8e220bcf nonzero=57344/57344
+CHECKW arm=SK8V ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK4 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK2 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK1 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW8 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW4 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW2 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW1 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+AB r=1 arm=TILE ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.613 ms  e4m3 95.7 GB/s nonzero=57344/57344
+AB r=1 arm=base ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.622 ms  e4m3 94.4 GB/s nonzero=57344/57344
+AB r=1 arm=SK8V ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.624 ms  e4m3 94.2 GB/s nonzero=57344/57344
+   SK8V p2=0.619 p8=0.630 ms
+AB r=1 arm=SK4 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.720 ms  e4m3 81.6 GB/s nonzero=57344/57344
+   SK4 p2=0.717 p8=0.725 ms
+AB r=1 arm=SK2 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.842 ms  e4m3 69.7 GB/s nonzero=57344/57344
+   SK2 p2=0.839 p8=0.850 ms
+AB r=1 arm=SK1 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=1.066 ms  e4m3 55.1 GB/s nonzero=57344/57344
+   SK1 p2=1.060 p8=1.070 ms
+AB r=1 arm=SKW8 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.413 ms  e4m3 142.3 GB/s nonzero=57344/57344
+   SKW8 p2=0.410 p8=0.415 ms
+AB r=1 arm=SKW4 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.501 ms  e4m3 117.1 GB/s nonzero=57344/57344
+   SKW4 p2=0.499 p8=0.503 ms
+AB r=1 arm=SKW2 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.616 ms  e4m3 95.4 GB/s nonzero=57344/57344
+   SKW2 p2=0.611 p8=0.619 ms
+AB r=1 arm=SKW1 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.832 ms  e4m3 70.6 GB/s nonzero=57344/57344
+   SKW1 p2=0.828 p8=0.836 ms
+LEG c8k_m14_r1 r=1 rc=0 ab=10 exp=10 rev=0
+ORACLE NaN outputs 0/114688 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=8192 N=8192: ROW==oracle 114650/114688 rel_l2=1.87e-05 | SKINNY==oracle 114650/114688 rel_l2=1.87e-05
+ANAT SKINNY nan=0 tokhist=6 2 1 2 6 2 2 5 1 2 0 5 3 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=2 0 0 0 1 0 1 2 2 0 1 3 0 0 0 2 0 2 1 1 0 1 1 1 2 5 2 2 2 0 1 3 
+  [t=0 r=2268] SK=b9a4 RO=b9a4 NV=b9a6
+  [t=0 r=4440] SK=c0f5 RO=c0f5 NV=c0f4
+  [t=0 r=6468] SK=3d87 RO=3d87 NV=3d86
+  [t=0 r=7026] SK=c227 RO=c227 NV=c228
+  [t=0 r=7053] SK=4145 RO=4145 NV=4144
+  [t=0 r=7195] SK=3a88 RO=3a88 NV=3a87
+  [t=1 r=1868] SK=bde8 RO=bde8 NV=bde9
+  [t=1 r=5469] SK=3be2 RO=3be2 NV=3be1
+A TILE   M=14 rot=1 | t_med=0.397 ms p2=0.395 p8=0.403 | 169.2 GB/s e4m3
+B SKINNY M=14 rot=1 | t_med=0.422 ms p2=0.418 p8=0.424 | 158.9 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = -6.1%
+YHASH arm=base ROW M=14 K=8192 N=8192 yhash=554c56d65d4419ce nonzero=114688/114688
+CHECKW arm=SK8V ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SK4 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SK2 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SK1 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SKW8 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SKW4 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SKW2 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SKW1 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+AB r=1 arm=TILE ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.397 ms  e4m3 169.2 GB/s nonzero=114688/114688
+AB r=1 arm=base ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.422 ms  e4m3 158.9 GB/s nonzero=114688/114688
+AB r=1 arm=SK8V ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.412 ms  e4m3 163.0 GB/s nonzero=114688/114688
+   SK8V p2=0.405 p8=0.420 ms
+AB r=1 arm=SK4 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.459 ms  e4m3 146.1 GB/s nonzero=114688/114688
+   SK4 p2=0.453 p8=0.460 ms
+AB r=1 arm=SK2 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.558 ms  e4m3 120.2 GB/s nonzero=114688/114688
+   SK2 p2=0.554 p8=0.573 ms
+AB r=1 arm=SK1 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.833 ms  e4m3 80.5 GB/s nonzero=114688/114688
+   SK1 p2=0.811 p8=0.842 ms
+AB r=1 arm=SKW8 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.292 ms  e4m3 230.2 GB/s nonzero=114688/114688
+   SKW8 p2=0.289 p8=0.294 ms
+AB r=1 arm=SKW4 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.356 ms  e4m3 188.3 GB/s nonzero=114688/114688
+   SKW4 p2=0.355 p8=0.357 ms
+AB r=1 arm=SKW2 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.422 ms  e4m3 159.0 GB/s nonzero=114688/114688
+   SKW2 p2=0.422 p8=0.424 ms
+AB r=1 arm=SKW1 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.592 ms  e4m3 113.4 GB/s nonzero=114688/114688
+   SKW1 p2=0.590 p8=0.596 ms
+ROUND 1 DONE
+5a8e5923fe3b612167463dafbb3d483d  /home/brendan/scratch/r3d/q54/bench_fp8_skinny
+LEG s1_m14_r4 r=2 rc=0 ab=10 exp=10 rev=1
+ORACLE NaN outputs 0/229376 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=16384 N=16384: ROW==oracle 229293/229376 rel_l2=4.63e-05 | SKINNY==oracle 229293/229376 rel_l2=4.63e-05
+ANAT SKINNY nan=0 tokhist=8 8 3 4 6 6 7 5 8 8 3 6 5 6 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=2 1 0 0 1 0 0 1 2 1 0 1 1 2 2 0 0 1 2 0 0 1 0 1 0 0 3 3 2 1 3 6 0 4 0 4 1 3 0 2 0 0 0 1 2 0 2 2 4 2 0 2 2 1 0 1 2 3 2 2 0 0 1 3 
+  [t=0 r=3452] SK=3b4e RO=3b4e NV=3b4c
+  [t=0 r=3737] SK=429e RO=429e NV=429d
+  [t=0 r=6887] SK=3b0c RO=3b0c NV=3b0f
+  [t=0 r=7420] SK=c32e RO=c32e NV=c32f
+  [t=0 r=8099] SK=40c7 RO=40c7 NV=40c8
+  [t=0 r=8585] SK=bd32 RO=bd32 NV=bd33
+  [t=0 r=12522] SK=3df2 RO=3df2 NV=3df3
+  [t=0 r=13220] SK=3cfd RO=3cfd NV=3cfe
+A TILE   M=14 rot=4 | t_med=1.430 ms p2=1.419 p8=1.443 | 187.7 GB/s e4m3
+B SKINNY M=14 rot=4 | t_med=1.446 ms p2=1.437 p8=1.459 | 185.6 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = -1.1%
+YHASH arm=base ROW M=14 K=16384 N=16384 yhash=9105551491f6208b nonzero=229376/229376
+CHECKW arm=SK8V ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK4 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK2 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK1 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW8 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW4 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW2 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW1 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+AB r=2 arm=TILE ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=1.430 ms  e4m3 187.7 GB/s nonzero=229376/229376
+AB r=2 arm=base ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=1.446 ms  e4m3 185.6 GB/s nonzero=229376/229376
+AB r=2 arm=SKW1 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=2.818 ms  e4m3 95.2 GB/s nonzero=229376/229376
+   SKW1 p2=2.783 p8=2.855 ms
+AB r=2 arm=SKW2 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=2.372 ms  e4m3 113.1 GB/s nonzero=229376/229376
+   SKW2 p2=2.351 p8=2.379 ms
+AB r=2 arm=SKW4 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=2.275 ms  e4m3 118.0 GB/s nonzero=229376/229376
+   SKW4 p2=2.262 p8=2.300 ms
+AB r=2 arm=SKW8 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=1.033 ms  e4m3 259.9 GB/s nonzero=229376/229376
+   SKW8 p2=0.996 p8=1.306 ms
+AB r=2 arm=SK1 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=4.240 ms  e4m3 63.3 GB/s nonzero=229376/229376
+   SK1 p2=4.202 p8=4.300 ms
+AB r=2 arm=SK2 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=2.978 ms  e4m3 90.1 GB/s nonzero=229376/229376
+   SK2 p2=2.934 p8=3.019 ms
+AB r=2 arm=SK4 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=2.534 ms  e4m3 105.9 GB/s nonzero=229376/229376
+   SK4 p2=2.503 p8=2.579 ms
+AB r=2 arm=SK8V ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=1.409 ms  e4m3 190.6 GB/s nonzero=229376/229376
+   SK8V p2=1.394 p8=1.426 ms
+LEG s1_m14_r1 r=2 rc=0 ab=10 exp=10 rev=1
+ORACLE NaN outputs 0/229376 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=16384 N=16384: ROW==oracle 229293/229376 rel_l2=4.63e-05 | SKINNY==oracle 229293/229376 rel_l2=4.63e-05
+ANAT SKINNY nan=0 tokhist=8 8 3 4 6 6 7 5 8 8 3 6 5 6 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=2 1 0 0 1 0 0 1 2 1 0 1 1 2 2 0 0 1 2 0 0 1 0 1 0 0 3 3 2 1 3 6 0 4 0 4 1 3 0 2 0 0 0 1 2 0 2 2 4 2 0 2 2 1 0 1 2 3 2 2 0 0 1 3 
+  [t=0 r=3452] SK=3b4e RO=3b4e NV=3b4c
+  [t=0 r=3737] SK=429e RO=429e NV=429d
+  [t=0 r=6887] SK=3b0c RO=3b0c NV=3b0f
+  [t=0 r=7420] SK=c32e RO=c32e NV=c32f
+  [t=0 r=8099] SK=40c7 RO=40c7 NV=40c8
+  [t=0 r=8585] SK=bd32 RO=bd32 NV=bd33
+  [t=0 r=12522] SK=3df2 RO=3df2 NV=3df3
+  [t=0 r=13220] SK=3cfd RO=3cfd NV=3cfe
+A TILE   M=14 rot=1 | t_med=1.424 ms p2=1.414 p8=1.443 | 188.5 GB/s e4m3
+B SKINNY M=14 rot=1 | t_med=1.450 ms p2=1.440 p8=1.465 | 185.1 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = -1.8%
+YHASH arm=base ROW M=14 K=16384 N=16384 yhash=9105551491f6208b nonzero=229376/229376
+CHECKW arm=SK8V ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK4 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK2 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK1 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW8 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW4 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW2 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW1 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+AB r=2 arm=TILE ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=1.424 ms  e4m3 188.5 GB/s nonzero=229376/229376
+AB r=2 arm=base ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=1.450 ms  e4m3 185.1 GB/s nonzero=229376/229376
+AB r=2 arm=SKW1 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=2.798 ms  e4m3 95.9 GB/s nonzero=229376/229376
+   SKW1 p2=2.765 p8=2.848 ms
+AB r=2 arm=SKW2 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=2.376 ms  e4m3 113.0 GB/s nonzero=229376/229376
+   SKW2 p2=2.360 p8=2.396 ms
+AB r=2 arm=SKW4 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=2.300 ms  e4m3 116.7 GB/s nonzero=229376/229376
+   SKW4 p2=2.276 p8=2.315 ms
+AB r=2 arm=SKW8 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=1.031 ms  e4m3 260.3 GB/s nonzero=229376/229376
+   SKW8 p2=0.998 p8=1.085 ms
+AB r=2 arm=SK1 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=4.207 ms  e4m3 63.8 GB/s nonzero=229376/229376
+   SK1 p2=4.173 p8=4.242 ms
+AB r=2 arm=SK2 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=2.948 ms  e4m3 91.1 GB/s nonzero=229376/229376
+   SK2 p2=2.903 p8=2.994 ms
+AB r=2 arm=SK4 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=2.524 ms  e4m3 106.3 GB/s nonzero=229376/229376
+   SK4 p2=2.509 p8=2.553 ms
+AB r=2 arm=SK8V ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=1.416 ms  e4m3 189.6 GB/s nonzero=229376/229376
+   SK8V p2=1.405 p8=1.426 ms
+LEG s1_m4_r4 r=2 rc=0 ab=11 exp=11 rev=1
+ORACLE NaN outputs 0/65536 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=4 K=16384 N=16384: ROW==oracle 65513/65536 rel_l2=6.93e-05 | SKINNY==oracle 65513/65536 rel_l2=6.93e-05
+ANAT SKINNY nan=0 tokhist=8 8 3 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=0 0 0 0 1 0 0 0 0 0 0 0 0 2 1 0 0 0 0 0 0 0 0 0 0 0 1 0 2 0 1 2 0 2 0 1 1 1 0 0 0 0 0 0 0 0 0 1 2 0 0 1 0 0 0 0 1 0 1 1 0 0 1 0 
+  [t=0 r=3452] SK=3b4e RO=3b4e NV=3b4c
+  [t=0 r=3737] SK=429e RO=429e NV=429d
+  [t=0 r=6887] SK=3b0c RO=3b0c NV=3b0f
+  [t=0 r=7420] SK=c32e RO=c32e NV=c32f
+  [t=0 r=8099] SK=40c7 RO=40c7 NV=40c8
+  [t=0 r=8585] SK=bd32 RO=bd32 NV=bd33
+  [t=0 r=12522] SK=3df2 RO=3df2 NV=3df3
+  [t=0 r=13220] SK=3cfd RO=3cfd NV=3cfe
+      GEMV==oracle 65513/65536 rel_l2=6.93e-05
+A TILE   M=4 rot=4 | t_med=1.272 ms p2=1.261 p8=1.283 | 211.1 GB/s e4m3
+B SKINNY M=4 rot=4 | t_med=1.294 ms p2=1.282 p8=1.302 | 207.4 GB/s e4m3
+DELTA SKINNY/TILE M=4 | (A/B-1)*100 = -1.7%
+C GEMV   M=4 rot=4 | t_med=1.293 ms p2=1.283 p8=1.305 | 207.5 GB/s e4m3
+DELTA TILE/GEMV M=4 | (C/A-1)*100 = +1.7%
+DELTA SKINNY/GEMV M=4 | (C/B-1)*100 = -0.1%
+YHASH arm=base ROW M=4 K=16384 N=16384 yhash=3eaf75a782153a35 nonzero=65536/65536
+CHECKW arm=SK8V ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SK4 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SK2 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SK1 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SKW8 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SKW4 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SKW2 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SKW1 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+AB r=2 arm=TILE ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.272 ms  e4m3 211.1 GB/s nonzero=65536/65536
+AB r=2 arm=base ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.294 ms  e4m3 207.4 GB/s nonzero=65536/65536
+AB r=2 arm=GEMV ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.293 ms  e4m3 207.5 GB/s nonzero=65536/65536
+AB r=2 arm=SKW1 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=2.174 ms  e4m3 123.5 GB/s nonzero=65536/65536
+   SKW1 p2=1.673 p8=2.191 ms
+AB r=2 arm=SKW2 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.330 ms  e4m3 201.8 GB/s nonzero=65536/65536
+   SKW2 p2=1.280 p8=1.421 ms
+AB r=2 arm=SKW4 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.237 ms  e4m3 217.0 GB/s nonzero=65536/65536
+   SKW4 p2=1.216 p8=1.261 ms
+AB r=2 arm=SKW8 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=0.821 ms  e4m3 326.8 GB/s nonzero=65536/65536
+   SKW8 p2=0.799 p8=0.833 ms
+AB r=2 arm=SK1 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=2.563 ms  e4m3 104.7 GB/s nonzero=65536/65536
+   SK1 p2=2.511 p8=2.696 ms
+AB r=2 arm=SK2 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=2.279 ms  e4m3 117.8 GB/s nonzero=65536/65536
+   SK2 p2=2.264 p8=2.300 ms
+AB r=2 arm=SK4 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=2.163 ms  e4m3 124.1 GB/s nonzero=65536/65536
+   SK4 p2=2.144 p8=2.176 ms
+AB r=2 arm=SK8V ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.275 ms  e4m3 210.5 GB/s nonzero=65536/65536
+   SK8V p2=1.266 p8=1.283 ms
+LEG s1_m32_r4 r=2 rc=0 ab=10 exp=10 rev=1
+ORACLE NaN outputs 0/524288 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=32 K=16384 N=16384: ROW==oracle 524122/524288 rel_l2=4.10e-05 | SKINNY==oracle 524122/524288 rel_l2=4.10e-05
+ANAT SKINNY nan=0 tokhist=8 8 3 4 6 6 7 5 8 8 3 6 5 6 2 5 4 5 6 7 5 3 4 2 8 3 6 6 3 4 6 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=3 1 0 2 3 1 1 1 3 3 1 3 4 3 5 1 0 2 3 0 1 1 1 4 3 1 4 5 6 2 3 6 4 5 2 5 3 5 1 2 1 3 0 3 3 0 4 3 7 2 3 3 4 3 1 2 3 4 2 3 1 0 2 5 
+  [t=0 r=3452] SK=3b4e RO=3b4e NV=3b4c
+  [t=0 r=3737] SK=429e RO=429e NV=429d
+  [t=0 r=6887] SK=3b0c RO=3b0c NV=3b0f
+  [t=0 r=7420] SK=c32e RO=c32e NV=c32f
+  [t=0 r=8099] SK=40c7 RO=40c7 NV=40c8
+  [t=0 r=8585] SK=bd32 RO=bd32 NV=bd33
+  [t=0 r=12522] SK=3df2 RO=3df2 NV=3df3
+  [t=0 r=13220] SK=3cfd RO=3cfd NV=3cfe
+A TILE   M=32 rot=4 | t_med=1.941 ms p2=1.932 p8=1.962 | 138.3 GB/s e4m3
+B SKINNY M=32 rot=4 | t_med=1.916 ms p2=1.900 p8=1.929 | 140.1 GB/s e4m3
+DELTA SKINNY/TILE M=32 | (A/B-1)*100 = +1.3%
+YHASH arm=base ROW M=32 K=16384 N=16384 yhash=99cee08f53d889b0 nonzero=524288/524288
+CHECKW arm=SK8V ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SK4 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SK2 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SK1 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SKW8 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SKW4 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SKW2 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SKW1 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+AB r=2 arm=TILE ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=1.941 ms  e4m3 138.3 GB/s nonzero=524288/524288
+AB r=2 arm=base ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=1.916 ms  e4m3 140.1 GB/s nonzero=524288/524288
+AB r=2 arm=SKW1 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=4.981 ms  e4m3 53.9 GB/s nonzero=524288/524288
+   SKW1 p2=4.930 p8=5.068 ms
+AB r=2 arm=SKW2 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=3.917 ms  e4m3 68.5 GB/s nonzero=524288/524288
+   SKW2 p2=3.891 p8=3.968 ms
+AB r=2 arm=SKW4 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=3.771 ms  e4m3 71.2 GB/s nonzero=524288/524288
+   SKW4 p2=3.714 p8=3.831 ms
+AB r=2 arm=SKW8 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=1.745 ms  e4m3 153.8 GB/s nonzero=524288/524288
+   SKW8 p2=1.737 p8=1.763 ms
+AB r=2 arm=SK1 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=6.802 ms  e4m3 39.5 GB/s nonzero=524288/524288
+   SK1 p2=6.748 p8=6.848 ms
+AB r=2 arm=SK2 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=4.331 ms  e4m3 62.0 GB/s nonzero=524288/524288
+   SK2 p2=4.321 p8=4.404 ms
+AB r=2 arm=SK4 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=3.763 ms  e4m3 71.3 GB/s nonzero=524288/524288
+   SK4 p2=3.733 p8=4.109 ms
+AB r=2 arm=SK8V ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=1.870 ms  e4m3 143.6 GB/s nonzero=524288/524288
+   SK8V p2=1.857 p8=1.880 ms
+LEG s2_m14_r4 r=2 rc=0 ab=10 exp=10 rev=1
+ORACLE NaN outputs 0/401408 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=8192 N=28672: ROW==oracle 401285/401408 rel_l2=3.22e-05 | SKINNY==oracle 401285/401408 rel_l2=3.22e-05
+ANAT SKINNY nan=0 tokhist=10 8 8 6 7 8 7 13 10 7 11 8 13 7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=4 2 0 1 0 2 1 1 2 1 0 1 1 1 1 0 3 0 1 1 1 2 1 1 1 3 1 1 0 1 1 1 1 1 1 1 2 0 3 1 3 1 1 0 0 1 1 1 2 1 0 1 0 2 1 0 0 2 1 1 0 0 0 1 1 2 3 0 2 1 2 1 1 0 1 0 1 1 0 1 0 3 1 0 0 1 1 3 0 1 0 1 2 0 3 3 2 1 3 1 2 2 2 0 0 1 2 1 0 2 1 0 
+  [t=0 r=461] SK=432f RO=432f NV=4330
+  [t=0 r=948] SK=3ce9 RO=3ce9 NV=3ce8
+  [t=0 r=5604] SK=3db7 RO=3db7 NV=3db8
+  [t=0 r=6632] SK=b8fc RO=b8fc NV=b92d
+  [t=0 r=10739] SK=3f31 RO=3f31 NV=3f30
+  [t=0 r=13651] SK=3f80 RO=3f80 NV=3f81
+  [t=0 r=18348] SK=c26b RO=c26b NV=c26c
+  [t=0 r=24709] SK=bc44 RO=bc44 NV=bc45
+A TILE   M=14 rot=4 | t_med=1.492 ms p2=1.466 p8=1.510 | 157.4 GB/s e4m3
+B SKINNY M=14 rot=4 | t_med=1.464 ms p2=1.446 p8=1.477 | 160.4 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = +1.9%
+YHASH arm=base ROW M=14 K=8192 N=28672 yhash=594c6a011ee3d780 nonzero=401408/401408
+CHECKW arm=SK8V ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SK4 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SK2 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SK1 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SKW8 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SKW4 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SKW2 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SKW1 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+AB r=2 arm=TILE ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.492 ms  e4m3 157.4 GB/s nonzero=401408/401408
+AB r=2 arm=base ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.464 ms  e4m3 160.4 GB/s nonzero=401408/401408
+AB r=2 arm=SKW1 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=2.147 ms  e4m3 109.4 GB/s nonzero=401408/401408
+   SKW1 p2=2.106 p8=2.188 ms
+AB r=2 arm=SKW2 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.778 ms  e4m3 132.1 GB/s nonzero=401408/401408
+   SKW2 p2=1.759 p8=1.802 ms
+AB r=2 arm=SKW4 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.606 ms  e4m3 146.2 GB/s nonzero=401408/401408
+   SKW4 p2=1.579 p8=1.624 ms
+AB r=2 arm=SKW8 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.029 ms  e4m3 228.3 GB/s nonzero=401408/401408
+   SKW8 p2=0.984 p8=1.113 ms
+AB r=2 arm=SK1 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=3.160 ms  e4m3 74.3 GB/s nonzero=401408/401408
+   SK1 p2=3.122 p8=3.197 ms
+AB r=2 arm=SK2 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=2.121 ms  e4m3 110.7 GB/s nonzero=401408/401408
+   SK2 p2=2.103 p8=2.140 ms
+AB r=2 arm=SK4 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.935 ms  e4m3 121.4 GB/s nonzero=401408/401408
+   SK4 p2=1.536 p8=2.081 ms
+AB r=2 arm=SK8V ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.446 ms  e4m3 162.4 GB/s nonzero=401408/401408
+   SK8V p2=1.428 p8=1.471 ms
+LEG s3_m14_r4 r=2 rc=0 ab=10 exp=10 rev=1
+ORACLE NaN outputs 0/57344 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=14336 N=4096: ROW==oracle 57331/57344 rel_l2=3.41e-05 | SKINNY==oracle 57331/57344 rel_l2=3.41e-05
+ANAT SKINNY nan=0 tokhist=1 0 0 0 1 0 1 1 2 3 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=0 1 1 1 0 2 1 0 0 3 0 0 0 1 1 2 
+  [t=0 r=2360] SK=c173 RO=c173 NV=c174
+  [t=4 r=1732] SK=bef7 RO=bef7 NV=bef8
+  [t=6 r=766] SK=c172 RO=c172 NV=c171
+  [t=7 r=1313] SK=bbce RO=bbce NV=bbcd
+  [t=8 r=3779] SK=bd57 RO=bd57 NV=bd56
+  [t=8 r=3900] SK=c346 RO=c346 NV=c347
+  [t=9 r=494] SK=40a3 RO=40a3 NV=40a4
+  [t=9 r=831] SK=3e34 RO=3e34 NV=3e33
+A TILE   M=14 rot=4 | t_med=0.850 ms p2=0.822 p8=0.868 | 69.1 GB/s e4m3
+B SKINNY M=14 rot=4 | t_med=0.843 ms p2=0.821 p8=0.867 | 69.6 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = +0.7%
+YHASH arm=base ROW M=14 K=14336 N=4096 yhash=6ba4c43b8e220bcf nonzero=57344/57344
+CHECKW arm=SK8V ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK4 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK2 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK1 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW8 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW4 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW2 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW1 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+AB r=2 arm=TILE ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.850 ms  e4m3 69.1 GB/s nonzero=57344/57344
+AB r=2 arm=base ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.843 ms  e4m3 69.6 GB/s nonzero=57344/57344
+AB r=2 arm=SKW1 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.969 ms  e4m3 60.6 GB/s nonzero=57344/57344
+   SKW1 p2=0.957 p8=1.031 ms
+AB r=2 arm=SKW2 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.818 ms  e4m3 71.8 GB/s nonzero=57344/57344
+   SKW2 p2=0.810 p8=0.820 ms
+AB r=2 arm=SKW4 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.736 ms  e4m3 79.8 GB/s nonzero=57344/57344
+   SKW4 p2=0.727 p8=0.744 ms
+AB r=2 arm=SKW8 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.645 ms  e4m3 91.1 GB/s nonzero=57344/57344
+   SKW8 p2=0.640 p8=0.648 ms
+AB r=2 arm=SK1 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=1.291 ms  e4m3 45.5 GB/s nonzero=57344/57344
+   SK1 p2=1.287 p8=1.299 ms
+AB r=2 arm=SK2 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=1.064 ms  e4m3 55.2 GB/s nonzero=57344/57344
+   SK2 p2=1.059 p8=1.068 ms
+AB r=2 arm=SK4 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.912 ms  e4m3 64.4 GB/s nonzero=57344/57344
+   SK4 p2=0.908 p8=0.920 ms
+AB r=2 arm=SK8V ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.864 ms  e4m3 68.0 GB/s nonzero=57344/57344
+   SK8V p2=0.841 p8=0.876 ms
+LEG s3c_m14_r1 r=2 rc=0 ab=10 exp=10 rev=1
+ORACLE NaN outputs 0/57344 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=14336 N=4096: ROW==oracle 57331/57344 rel_l2=3.41e-05 | SKINNY==oracle 57331/57344 rel_l2=3.41e-05
+ANAT SKINNY nan=0 tokhist=1 0 0 0 1 0 1 1 2 3 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=0 1 1 1 0 2 1 0 0 3 0 0 0 1 1 2 
+  [t=0 r=2360] SK=c173 RO=c173 NV=c174
+  [t=4 r=1732] SK=bef7 RO=bef7 NV=bef8
+  [t=6 r=766] SK=c172 RO=c172 NV=c171
+  [t=7 r=1313] SK=bbce RO=bbce NV=bbcd
+  [t=8 r=3779] SK=bd57 RO=bd57 NV=bd56
+  [t=8 r=3900] SK=c346 RO=c346 NV=c347
+  [t=9 r=494] SK=40a3 RO=40a3 NV=40a4
+  [t=9 r=831] SK=3e34 RO=3e34 NV=3e33
+A TILE   M=14 rot=1 | t_med=0.613 ms p2=0.610 p8=0.616 | 95.9 GB/s e4m3
+B SKINNY M=14 rot=1 | t_med=0.672 ms p2=0.619 p8=1.318 | 87.3 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = -8.9%
+YHASH arm=base ROW M=14 K=14336 N=4096 yhash=6ba4c43b8e220bcf nonzero=57344/57344
+CHECKW arm=SK8V ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK4 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK2 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK1 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW8 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW4 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW2 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW1 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+AB r=2 arm=TILE ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.613 ms  e4m3 95.9 GB/s nonzero=57344/57344
+AB r=2 arm=base ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.672 ms  e4m3 87.3 GB/s nonzero=57344/57344
+AB r=2 arm=SKW1 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.849 ms  e4m3 69.1 GB/s nonzero=57344/57344
+   SKW1 p2=0.818 p8=0.981 ms
+AB r=2 arm=SKW2 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.628 ms  e4m3 93.6 GB/s nonzero=57344/57344
+   SKW2 p2=0.621 p8=0.634 ms
+AB r=2 arm=SKW4 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.507 ms  e4m3 115.7 GB/s nonzero=57344/57344
+   SKW4 p2=0.506 p8=0.508 ms
+AB r=2 arm=SKW8 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.423 ms  e4m3 138.8 GB/s nonzero=57344/57344
+   SKW8 p2=0.422 p8=0.426 ms
+AB r=2 arm=SK1 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=1.089 ms  e4m3 53.9 GB/s nonzero=57344/57344
+   SK1 p2=1.080 p8=1.097 ms
+AB r=2 arm=SK2 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.850 ms  e4m3 69.1 GB/s nonzero=57344/57344
+   SK2 p2=0.848 p8=0.852 ms
+AB r=2 arm=SK4 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.721 ms  e4m3 81.5 GB/s nonzero=57344/57344
+   SK4 p2=0.717 p8=0.724 ms
+AB r=2 arm=SK8V ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.624 ms  e4m3 94.0 GB/s nonzero=57344/57344
+   SK8V p2=0.621 p8=0.628 ms
+LEG c8k_m14_r1 r=2 rc=0 ab=10 exp=10 rev=1
+ORACLE NaN outputs 0/114688 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=8192 N=8192: ROW==oracle 114650/114688 rel_l2=1.87e-05 | SKINNY==oracle 114650/114688 rel_l2=1.87e-05
+ANAT SKINNY nan=0 tokhist=6 2 1 2 6 2 2 5 1 2 0 5 3 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=2 0 0 0 1 0 1 2 2 0 1 3 0 0 0 2 0 2 1 1 0 1 1 1 2 5 2 2 2 0 1 3 
+  [t=0 r=2268] SK=b9a4 RO=b9a4 NV=b9a6
+  [t=0 r=4440] SK=c0f5 RO=c0f5 NV=c0f4
+  [t=0 r=6468] SK=3d87 RO=3d87 NV=3d86
+  [t=0 r=7026] SK=c227 RO=c227 NV=c228
+  [t=0 r=7053] SK=4145 RO=4145 NV=4144
+  [t=0 r=7195] SK=3a88 RO=3a88 NV=3a87
+  [t=1 r=1868] SK=bde8 RO=bde8 NV=bde9
+  [t=1 r=5469] SK=3be2 RO=3be2 NV=3be1
+A TILE   M=14 rot=1 | t_med=0.397 ms p2=0.393 p8=0.403 | 169.2 GB/s e4m3
+B SKINNY M=14 rot=1 | t_med=0.421 ms p2=0.418 p8=0.423 | 159.6 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = -5.7%
+YHASH arm=base ROW M=14 K=8192 N=8192 yhash=554c56d65d4419ce nonzero=114688/114688
+CHECKW arm=SK8V ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SK4 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SK2 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SK1 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SKW8 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SKW4 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SKW2 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SKW1 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+AB r=2 arm=TILE ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.397 ms  e4m3 169.2 GB/s nonzero=114688/114688
+AB r=2 arm=base ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.421 ms  e4m3 159.6 GB/s nonzero=114688/114688
+AB r=2 arm=SKW1 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.574 ms  e4m3 116.8 GB/s nonzero=114688/114688
+   SKW1 p2=0.548 p8=0.586 ms
+AB r=2 arm=SKW2 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.423 ms  e4m3 158.7 GB/s nonzero=114688/114688
+   SKW2 p2=0.420 p8=0.426 ms
+AB r=2 arm=SKW4 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.357 ms  e4m3 187.9 GB/s nonzero=114688/114688
+   SKW4 p2=0.356 p8=0.359 ms
+AB r=2 arm=SKW8 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.296 ms  e4m3 226.7 GB/s nonzero=114688/114688
+   SKW8 p2=0.294 p8=0.297 ms
+AB r=2 arm=SK1 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.843 ms  e4m3 79.6 GB/s nonzero=114688/114688
+   SK1 p2=0.832 p8=0.858 ms
+AB r=2 arm=SK2 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.551 ms  e4m3 121.8 GB/s nonzero=114688/114688
+   SK2 p2=0.534 p8=0.555 ms
+AB r=2 arm=SK4 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.459 ms  e4m3 146.1 GB/s nonzero=114688/114688
+   SK4 p2=0.458 p8=0.463 ms
+AB r=2 arm=SK8V ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.428 ms  e4m3 156.6 GB/s nonzero=114688/114688
+   SK8V p2=0.425 p8=0.432 ms
+ROUND 2 DONE
+5a8e5923fe3b612167463dafbb3d483d  /home/brendan/scratch/r3d/q54/bench_fp8_skinny
+LEG s1_m14_r4 r=3 rc=0 ab=10 exp=10 rev=0
+ORACLE NaN outputs 0/229376 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=16384 N=16384: ROW==oracle 229293/229376 rel_l2=4.63e-05 | SKINNY==oracle 229293/229376 rel_l2=4.63e-05
+ANAT SKINNY nan=0 tokhist=8 8 3 4 6 6 7 5 8 8 3 6 5 6 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=2 1 0 0 1 0 0 1 2 1 0 1 1 2 2 0 0 1 2 0 0 1 0 1 0 0 3 3 2 1 3 6 0 4 0 4 1 3 0 2 0 0 0 1 2 0 2 2 4 2 0 2 2 1 0 1 2 3 2 2 0 0 1 3 
+  [t=0 r=3452] SK=3b4e RO=3b4e NV=3b4c
+  [t=0 r=3737] SK=429e RO=429e NV=429d
+  [t=0 r=6887] SK=3b0c RO=3b0c NV=3b0f
+  [t=0 r=7420] SK=c32e RO=c32e NV=c32f
+  [t=0 r=8099] SK=40c7 RO=40c7 NV=40c8
+  [t=0 r=8585] SK=bd32 RO=bd32 NV=bd33
+  [t=0 r=12522] SK=3df2 RO=3df2 NV=3df3
+  [t=0 r=13220] SK=3cfd RO=3cfd NV=3cfe
+A TILE   M=14 rot=4 | t_med=1.432 ms p2=1.423 p8=1.441 | 187.5 GB/s e4m3
+B SKINNY M=14 rot=4 | t_med=1.448 ms p2=1.437 p8=1.462 | 185.4 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = -1.1%
+YHASH arm=base ROW M=14 K=16384 N=16384 yhash=9105551491f6208b nonzero=229376/229376
+CHECKW arm=SK8V ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK4 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK2 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK1 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW8 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW4 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW2 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW1 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+AB r=3 arm=TILE ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=1.432 ms  e4m3 187.5 GB/s nonzero=229376/229376
+AB r=3 arm=base ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=1.448 ms  e4m3 185.4 GB/s nonzero=229376/229376
+AB r=3 arm=SK8V ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=1.449 ms  e4m3 185.2 GB/s nonzero=229376/229376
+   SK8V p2=1.438 p8=1.459 ms
+AB r=3 arm=SK4 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=2.545 ms  e4m3 105.5 GB/s nonzero=229376/229376
+   SK4 p2=2.516 p8=2.599 ms
+AB r=3 arm=SK2 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=2.953 ms  e4m3 90.9 GB/s nonzero=229376/229376
+   SK2 p2=2.825 p8=3.016 ms
+AB r=3 arm=SK1 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=4.213 ms  e4m3 63.7 GB/s nonzero=229376/229376
+   SK1 p2=4.153 p8=4.252 ms
+AB r=3 arm=SKW8 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=1.019 ms  e4m3 263.6 GB/s nonzero=229376/229376
+   SKW8 p2=0.976 p8=1.055 ms
+AB r=3 arm=SKW4 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=2.296 ms  e4m3 116.9 GB/s nonzero=229376/229376
+   SKW4 p2=2.276 p8=2.312 ms
+AB r=3 arm=SKW2 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=2.357 ms  e4m3 113.9 GB/s nonzero=229376/229376
+   SKW2 p2=2.339 p8=2.381 ms
+AB r=3 arm=SKW1 ROW M=14 K=16384 N=16384 rot=4 reps=30 | t_med=2.735 ms  e4m3 98.2 GB/s nonzero=229376/229376
+   SKW1 p2=2.696 p8=2.775 ms
+LEG s1_m14_r1 r=3 rc=0 ab=10 exp=10 rev=0
+ORACLE NaN outputs 0/229376 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=16384 N=16384: ROW==oracle 229293/229376 rel_l2=4.63e-05 | SKINNY==oracle 229293/229376 rel_l2=4.63e-05
+ANAT SKINNY nan=0 tokhist=8 8 3 4 6 6 7 5 8 8 3 6 5 6 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=2 1 0 0 1 0 0 1 2 1 0 1 1 2 2 0 0 1 2 0 0 1 0 1 0 0 3 3 2 1 3 6 0 4 0 4 1 3 0 2 0 0 0 1 2 0 2 2 4 2 0 2 2 1 0 1 2 3 2 2 0 0 1 3 
+  [t=0 r=3452] SK=3b4e RO=3b4e NV=3b4c
+  [t=0 r=3737] SK=429e RO=429e NV=429d
+  [t=0 r=6887] SK=3b0c RO=3b0c NV=3b0f
+  [t=0 r=7420] SK=c32e RO=c32e NV=c32f
+  [t=0 r=8099] SK=40c7 RO=40c7 NV=40c8
+  [t=0 r=8585] SK=bd32 RO=bd32 NV=bd33
+  [t=0 r=12522] SK=3df2 RO=3df2 NV=3df3
+  [t=0 r=13220] SK=3cfd RO=3cfd NV=3cfe
+A TILE   M=14 rot=1 | t_med=1.426 ms p2=1.407 p8=1.443 | 188.2 GB/s e4m3
+B SKINNY M=14 rot=1 | t_med=1.446 ms p2=1.440 p8=1.453 | 185.6 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = -1.4%
+YHASH arm=base ROW M=14 K=16384 N=16384 yhash=9105551491f6208b nonzero=229376/229376
+CHECKW arm=SK8V ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK4 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK2 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SK1 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW8 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW4 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW2 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+CHECKW arm=SKW1 ROW M=14 K=16384 N=16384 rel_l2_vs_oracle=4.63e-05 yhash=9105551491f6208b bitwise_vs_SKINNY=229376/229376 nonzero=229376/229376
+AB r=3 arm=TILE ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=1.426 ms  e4m3 188.2 GB/s nonzero=229376/229376
+AB r=3 arm=base ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=1.446 ms  e4m3 185.6 GB/s nonzero=229376/229376
+AB r=3 arm=SK8V ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=1.445 ms  e4m3 185.8 GB/s nonzero=229376/229376
+   SK8V p2=1.433 p8=1.465 ms
+AB r=3 arm=SK4 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=2.534 ms  e4m3 106.0 GB/s nonzero=229376/229376
+   SK4 p2=2.510 p8=2.560 ms
+AB r=3 arm=SK2 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=2.913 ms  e4m3 92.2 GB/s nonzero=229376/229376
+   SK2 p2=2.791 p8=2.987 ms
+AB r=3 arm=SK1 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=4.210 ms  e4m3 63.8 GB/s nonzero=229376/229376
+   SK1 p2=4.176 p8=4.266 ms
+AB r=3 arm=SKW8 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=1.050 ms  e4m3 255.7 GB/s nonzero=229376/229376
+   SKW8 p2=1.022 p8=1.358 ms
+AB r=3 arm=SKW4 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=2.300 ms  e4m3 116.7 GB/s nonzero=229376/229376
+   SKW4 p2=2.282 p8=2.313 ms
+AB r=3 arm=SKW2 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=2.365 ms  e4m3 113.5 GB/s nonzero=229376/229376
+   SKW2 p2=2.354 p8=2.386 ms
+AB r=3 arm=SKW1 ROW M=14 K=16384 N=16384 rot=1 reps=30 | t_med=2.730 ms  e4m3 98.3 GB/s nonzero=229376/229376
+   SKW1 p2=2.708 p8=2.774 ms
+LEG s1_m4_r4 r=3 rc=0 ab=11 exp=11 rev=0
+ORACLE NaN outputs 0/65536 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=4 K=16384 N=16384: ROW==oracle 65513/65536 rel_l2=6.93e-05 | SKINNY==oracle 65513/65536 rel_l2=6.93e-05
+ANAT SKINNY nan=0 tokhist=8 8 3 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=0 0 0 0 1 0 0 0 0 0 0 0 0 2 1 0 0 0 0 0 0 0 0 0 0 0 1 0 2 0 1 2 0 2 0 1 1 1 0 0 0 0 0 0 0 0 0 1 2 0 0 1 0 0 0 0 1 0 1 1 0 0 1 0 
+  [t=0 r=3452] SK=3b4e RO=3b4e NV=3b4c
+  [t=0 r=3737] SK=429e RO=429e NV=429d
+  [t=0 r=6887] SK=3b0c RO=3b0c NV=3b0f
+  [t=0 r=7420] SK=c32e RO=c32e NV=c32f
+  [t=0 r=8099] SK=40c7 RO=40c7 NV=40c8
+  [t=0 r=8585] SK=bd32 RO=bd32 NV=bd33
+  [t=0 r=12522] SK=3df2 RO=3df2 NV=3df3
+  [t=0 r=13220] SK=3cfd RO=3cfd NV=3cfe
+      GEMV==oracle 65513/65536 rel_l2=6.93e-05
+A TILE   M=4 rot=4 | t_med=1.279 ms p2=1.266 p8=1.295 | 209.9 GB/s e4m3
+B SKINNY M=4 rot=4 | t_med=1.294 ms p2=1.288 p8=1.304 | 207.5 GB/s e4m3
+DELTA SKINNY/TILE M=4 | (A/B-1)*100 = -1.1%
+C GEMV   M=4 rot=4 | t_med=1.290 ms p2=1.283 p8=1.301 | 208.1 GB/s e4m3
+DELTA TILE/GEMV M=4 | (C/A-1)*100 = +0.8%
+DELTA SKINNY/GEMV M=4 | (C/B-1)*100 = -0.3%
+YHASH arm=base ROW M=4 K=16384 N=16384 yhash=3eaf75a782153a35 nonzero=65536/65536
+CHECKW arm=SK8V ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SK4 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SK2 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SK1 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SKW8 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SKW4 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SKW2 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+CHECKW arm=SKW1 ROW M=4 K=16384 N=16384 rel_l2_vs_oracle=6.93e-05 yhash=3eaf75a782153a35 bitwise_vs_SKINNY=65536/65536 nonzero=65536/65536
+AB r=3 arm=TILE ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.279 ms  e4m3 209.9 GB/s nonzero=65536/65536
+AB r=3 arm=base ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.294 ms  e4m3 207.5 GB/s nonzero=65536/65536
+AB r=3 arm=GEMV ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.290 ms  e4m3 208.1 GB/s nonzero=65536/65536
+AB r=3 arm=SK8V ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.310 ms  e4m3 204.8 GB/s nonzero=65536/65536
+   SK8V p2=1.302 p8=1.326 ms
+AB r=3 arm=SK4 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=2.170 ms  e4m3 123.7 GB/s nonzero=65536/65536
+   SK4 p2=2.149 p8=2.193 ms
+AB r=3 arm=SK2 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=2.290 ms  e4m3 117.2 GB/s nonzero=65536/65536
+   SK2 p2=2.272 p8=2.315 ms
+AB r=3 arm=SK1 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=2.555 ms  e4m3 105.1 GB/s nonzero=65536/65536
+   SK1 p2=2.500 p8=2.670 ms
+AB r=3 arm=SKW8 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=0.800 ms  e4m3 335.4 GB/s nonzero=65536/65536
+   SKW8 p2=0.794 p8=0.813 ms
+AB r=3 arm=SKW4 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.238 ms  e4m3 216.9 GB/s nonzero=65536/65536
+   SKW4 p2=1.207 p8=1.257 ms
+AB r=3 arm=SKW2 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=1.277 ms  e4m3 210.2 GB/s nonzero=65536/65536
+   SKW2 p2=1.252 p8=1.362 ms
+AB r=3 arm=SKW1 ROW M=4 K=16384 N=16384 rot=4 reps=30 | t_med=2.060 ms  e4m3 130.3 GB/s nonzero=65536/65536
+   SKW1 p2=1.583 p8=2.138 ms
+LEG s1_m32_r4 r=3 rc=0 ab=10 exp=10 rev=0
+ORACLE NaN outputs 0/524288 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=32 K=16384 N=16384: ROW==oracle 524122/524288 rel_l2=4.10e-05 | SKINNY==oracle 524122/524288 rel_l2=4.10e-05
+ANAT SKINNY nan=0 tokhist=8 8 3 4 6 6 7 5 8 8 3 6 5 6 2 5 4 5 6 7 5 3 4 2 8 3 6 6 3 4 6 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=3 1 0 2 3 1 1 1 3 3 1 3 4 3 5 1 0 2 3 0 1 1 1 4 3 1 4 5 6 2 3 6 4 5 2 5 3 5 1 2 1 3 0 3 3 0 4 3 7 2 3 3 4 3 1 2 3 4 2 3 1 0 2 5 
+  [t=0 r=3452] SK=3b4e RO=3b4e NV=3b4c
+  [t=0 r=3737] SK=429e RO=429e NV=429d
+  [t=0 r=6887] SK=3b0c RO=3b0c NV=3b0f
+  [t=0 r=7420] SK=c32e RO=c32e NV=c32f
+  [t=0 r=8099] SK=40c7 RO=40c7 NV=40c8
+  [t=0 r=8585] SK=bd32 RO=bd32 NV=bd33
+  [t=0 r=12522] SK=3df2 RO=3df2 NV=3df3
+  [t=0 r=13220] SK=3cfd RO=3cfd NV=3cfe
+A TILE   M=32 rot=4 | t_med=1.953 ms p2=1.941 p8=1.960 | 137.4 GB/s e4m3
+B SKINNY M=32 rot=4 | t_med=1.907 ms p2=1.896 p8=1.925 | 140.8 GB/s e4m3
+DELTA SKINNY/TILE M=32 | (A/B-1)*100 = +2.4%
+YHASH arm=base ROW M=32 K=16384 N=16384 yhash=99cee08f53d889b0 nonzero=524288/524288
+CHECKW arm=SK8V ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SK4 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SK2 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SK1 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SKW8 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SKW4 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SKW2 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+CHECKW arm=SKW1 ROW M=32 K=16384 N=16384 rel_l2_vs_oracle=4.10e-05 yhash=99cee08f53d889b0 bitwise_vs_SKINNY=524288/524288 nonzero=524288/524288
+AB r=3 arm=TILE ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=1.953 ms  e4m3 137.4 GB/s nonzero=524288/524288
+AB r=3 arm=base ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=1.907 ms  e4m3 140.8 GB/s nonzero=524288/524288
+AB r=3 arm=SK8V ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=1.914 ms  e4m3 140.3 GB/s nonzero=524288/524288
+   SK8V p2=1.891 p8=1.930 ms
+AB r=3 arm=SK4 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=3.769 ms  e4m3 71.2 GB/s nonzero=524288/524288
+   SK4 p2=3.707 p8=4.538 ms
+AB r=3 arm=SK2 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=4.361 ms  e4m3 61.6 GB/s nonzero=524288/524288
+   SK2 p2=4.288 p8=4.401 ms
+AB r=3 arm=SK1 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=6.781 ms  e4m3 39.6 GB/s nonzero=524288/524288
+   SK1 p2=6.707 p8=6.824 ms
+AB r=3 arm=SKW8 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=1.746 ms  e4m3 153.7 GB/s nonzero=524288/524288
+   SKW8 p2=1.728 p8=1.767 ms
+AB r=3 arm=SKW4 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=3.778 ms  e4m3 71.1 GB/s nonzero=524288/524288
+   SKW4 p2=3.698 p8=3.866 ms
+AB r=3 arm=SKW2 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=3.894 ms  e4m3 68.9 GB/s nonzero=524288/524288
+   SKW2 p2=3.875 p8=3.919 ms
+AB r=3 arm=SKW1 ROW M=32 K=16384 N=16384 rot=4 reps=30 | t_med=4.845 ms  e4m3 55.4 GB/s nonzero=524288/524288
+   SKW1 p2=4.739 p8=4.913 ms
+LEG s2_m14_r4 r=3 rc=0 ab=10 exp=10 rev=0
+ORACLE NaN outputs 0/401408 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=8192 N=28672: ROW==oracle 401285/401408 rel_l2=3.22e-05 | SKINNY==oracle 401285/401408 rel_l2=3.22e-05
+ANAT SKINNY nan=0 tokhist=10 8 8 6 7 8 7 13 10 7 11 8 13 7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=4 2 0 1 0 2 1 1 2 1 0 1 1 1 1 0 3 0 1 1 1 2 1 1 1 3 1 1 0 1 1 1 1 1 1 1 2 0 3 1 3 1 1 0 0 1 1 1 2 1 0 1 0 2 1 0 0 2 1 1 0 0 0 1 1 2 3 0 2 1 2 1 1 0 1 0 1 1 0 1 0 3 1 0 0 1 1 3 0 1 0 1 2 0 3 3 2 1 3 1 2 2 2 0 0 1 2 1 0 2 1 0 
+  [t=0 r=461] SK=432f RO=432f NV=4330
+  [t=0 r=948] SK=3ce9 RO=3ce9 NV=3ce8
+  [t=0 r=5604] SK=3db7 RO=3db7 NV=3db8
+  [t=0 r=6632] SK=b8fc RO=b8fc NV=b92d
+  [t=0 r=10739] SK=3f31 RO=3f31 NV=3f30
+  [t=0 r=13651] SK=3f80 RO=3f80 NV=3f81
+  [t=0 r=18348] SK=c26b RO=c26b NV=c26c
+  [t=0 r=24709] SK=bc44 RO=bc44 NV=bc45
+A TILE   M=14 rot=4 | t_med=1.482 ms p2=1.463 p8=1.493 | 158.5 GB/s e4m3
+B SKINNY M=14 rot=4 | t_med=1.461 ms p2=1.443 p8=1.481 | 160.7 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = +1.4%
+YHASH arm=base ROW M=14 K=8192 N=28672 yhash=594c6a011ee3d780 nonzero=401408/401408
+CHECKW arm=SK8V ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SK4 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SK2 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SK1 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SKW8 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SKW4 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SKW2 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+CHECKW arm=SKW1 ROW M=14 K=8192 N=28672 rel_l2_vs_oracle=3.22e-05 yhash=594c6a011ee3d780 bitwise_vs_SKINNY=401408/401408 nonzero=401408/401408
+AB r=3 arm=TILE ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.482 ms  e4m3 158.5 GB/s nonzero=401408/401408
+AB r=3 arm=base ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.461 ms  e4m3 160.7 GB/s nonzero=401408/401408
+AB r=3 arm=SK8V ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.460 ms  e4m3 160.9 GB/s nonzero=401408/401408
+   SK8V p2=1.438 p8=1.481 ms
+AB r=3 arm=SK4 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.849 ms  e4m3 127.0 GB/s nonzero=401408/401408
+   SK4 p2=1.551 p8=1.983 ms
+AB r=3 arm=SK2 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=2.158 ms  e4m3 108.8 GB/s nonzero=401408/401408
+   SK2 p2=2.130 p8=2.173 ms
+AB r=3 arm=SK1 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=3.158 ms  e4m3 74.4 GB/s nonzero=401408/401408
+   SK1 p2=3.132 p8=3.182 ms
+AB r=3 arm=SKW8 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.026 ms  e4m3 229.0 GB/s nonzero=401408/401408
+   SKW8 p2=0.994 p8=1.071 ms
+AB r=3 arm=SKW4 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.597 ms  e4m3 147.1 GB/s nonzero=401408/401408
+   SKW4 p2=1.564 p8=1.617 ms
+AB r=3 arm=SKW2 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=1.755 ms  e4m3 133.8 GB/s nonzero=401408/401408
+   SKW2 p2=1.730 p8=1.816 ms
+AB r=3 arm=SKW1 ROW M=14 K=8192 N=28672 rot=4 reps=30 | t_med=2.060 ms  e4m3 114.0 GB/s nonzero=401408/401408
+   SKW1 p2=2.038 p8=2.093 ms
+LEG s3_m14_r4 r=3 rc=0 ab=10 exp=10 rev=0
+ORACLE NaN outputs 0/57344 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=14336 N=4096: ROW==oracle 57331/57344 rel_l2=3.41e-05 | SKINNY==oracle 57331/57344 rel_l2=3.41e-05
+ANAT SKINNY nan=0 tokhist=1 0 0 0 1 0 1 1 2 3 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=0 1 1 1 0 2 1 0 0 3 0 0 0 1 1 2 
+  [t=0 r=2360] SK=c173 RO=c173 NV=c174
+  [t=4 r=1732] SK=bef7 RO=bef7 NV=bef8
+  [t=6 r=766] SK=c172 RO=c172 NV=c171
+  [t=7 r=1313] SK=bbce RO=bbce NV=bbcd
+  [t=8 r=3779] SK=bd57 RO=bd57 NV=bd56
+  [t=8 r=3900] SK=c346 RO=c346 NV=c347
+  [t=9 r=494] SK=40a3 RO=40a3 NV=40a4
+  [t=9 r=831] SK=3e34 RO=3e34 NV=3e33
+A TILE   M=14 rot=4 | t_med=0.834 ms p2=0.821 p8=0.858 | 70.4 GB/s e4m3
+B SKINNY M=14 rot=4 | t_med=0.837 ms p2=0.827 p8=0.854 | 70.2 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = -0.3%
+YHASH arm=base ROW M=14 K=14336 N=4096 yhash=6ba4c43b8e220bcf nonzero=57344/57344
+CHECKW arm=SK8V ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK4 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK2 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK1 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW8 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW4 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW2 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW1 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+AB r=3 arm=TILE ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.834 ms  e4m3 70.4 GB/s nonzero=57344/57344
+AB r=3 arm=base ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.837 ms  e4m3 70.2 GB/s nonzero=57344/57344
+AB r=3 arm=SK8V ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.853 ms  e4m3 68.8 GB/s nonzero=57344/57344
+   SK8V p2=0.833 p8=0.865 ms
+AB r=3 arm=SK4 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.914 ms  e4m3 64.3 GB/s nonzero=57344/57344
+   SK4 p2=0.909 p8=0.920 ms
+AB r=3 arm=SK2 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=1.068 ms  e4m3 55.0 GB/s nonzero=57344/57344
+   SK2 p2=1.063 p8=1.071 ms
+AB r=3 arm=SK1 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=1.292 ms  e4m3 45.5 GB/s nonzero=57344/57344
+   SK1 p2=1.288 p8=1.299 ms
+AB r=3 arm=SKW8 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.646 ms  e4m3 91.0 GB/s nonzero=57344/57344
+   SKW8 p2=0.641 p8=0.648 ms
+AB r=3 arm=SKW4 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.731 ms  e4m3 80.3 GB/s nonzero=57344/57344
+   SKW4 p2=0.723 p8=0.740 ms
+AB r=3 arm=SKW2 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.808 ms  e4m3 72.7 GB/s nonzero=57344/57344
+   SKW2 p2=0.802 p8=0.814 ms
+AB r=3 arm=SKW1 ROW M=14 K=14336 N=4096 rot=4 reps=30 | t_med=0.940 ms  e4m3 62.5 GB/s nonzero=57344/57344
+   SKW1 p2=0.936 p8=0.945 ms
+LEG s3c_m14_r1 r=3 rc=0 ab=10 exp=10 rev=0
+ORACLE NaN outputs 0/57344 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=14336 N=4096: ROW==oracle 57331/57344 rel_l2=3.41e-05 | SKINNY==oracle 57331/57344 rel_l2=3.41e-05
+ANAT SKINNY nan=0 tokhist=1 0 0 0 1 0 1 1 2 3 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=0 1 1 1 0 2 1 0 0 3 0 0 0 1 1 2 
+  [t=0 r=2360] SK=c173 RO=c173 NV=c174
+  [t=4 r=1732] SK=bef7 RO=bef7 NV=bef8
+  [t=6 r=766] SK=c172 RO=c172 NV=c171
+  [t=7 r=1313] SK=bbce RO=bbce NV=bbcd
+  [t=8 r=3779] SK=bd57 RO=bd57 NV=bd56
+  [t=8 r=3900] SK=c346 RO=c346 NV=c347
+  [t=9 r=494] SK=40a3 RO=40a3 NV=40a4
+  [t=9 r=831] SK=3e34 RO=3e34 NV=3e33
+A TILE   M=14 rot=1 | t_med=0.614 ms p2=0.612 p8=0.618 | 95.6 GB/s e4m3
+B SKINNY M=14 rot=1 | t_med=0.624 ms p2=0.622 p8=0.626 | 94.2 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = -1.5%
+YHASH arm=base ROW M=14 K=14336 N=4096 yhash=6ba4c43b8e220bcf nonzero=57344/57344
+CHECKW arm=SK8V ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK4 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK2 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SK1 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW8 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW4 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW2 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+CHECKW arm=SKW1 ROW M=14 K=14336 N=4096 rel_l2_vs_oracle=3.41e-05 yhash=6ba4c43b8e220bcf bitwise_vs_SKINNY=57344/57344 nonzero=57344/57344
+AB r=3 arm=TILE ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.614 ms  e4m3 95.6 GB/s nonzero=57344/57344
+AB r=3 arm=base ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.624 ms  e4m3 94.2 GB/s nonzero=57344/57344
+AB r=3 arm=SK8V ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.625 ms  e4m3 94.0 GB/s nonzero=57344/57344
+   SK8V p2=0.618 p8=0.631 ms
+AB r=3 arm=SK4 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.721 ms  e4m3 81.5 GB/s nonzero=57344/57344
+   SK4 p2=0.718 p8=0.725 ms
+AB r=3 arm=SK2 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.842 ms  e4m3 69.7 GB/s nonzero=57344/57344
+   SK2 p2=0.839 p8=0.849 ms
+AB r=3 arm=SK1 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=1.069 ms  e4m3 55.0 GB/s nonzero=57344/57344
+   SK1 p2=1.059 p8=1.072 ms
+AB r=3 arm=SKW8 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.414 ms  e4m3 141.8 GB/s nonzero=57344/57344
+   SKW8 p2=0.410 p8=0.421 ms
+AB r=3 arm=SKW4 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.503 ms  e4m3 116.8 GB/s nonzero=57344/57344
+   SKW4 p2=0.501 p8=0.505 ms
+AB r=3 arm=SKW2 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.618 ms  e4m3 95.0 GB/s nonzero=57344/57344
+   SKW2 p2=0.614 p8=0.621 ms
+AB r=3 arm=SKW1 ROW M=14 K=14336 N=4096 rot=1 reps=30 | t_med=0.833 ms  e4m3 70.5 GB/s nonzero=57344/57344
+   SKW1 p2=0.829 p8=0.837 ms
+LEG c8k_m14_r1 r=3 rc=0 ab=10 exp=10 rev=0
+ORACLE NaN outputs 0/114688 (fixture must hold NaN-free: 0)
+CHECK rblk=1 M=14 K=8192 N=8192: ROW==oracle 114650/114688 rel_l2=1.87e-05 | SKINNY==oracle 114650/114688 rel_l2=1.87e-05
+ANAT SKINNY nan=0 tokhist=6 2 1 2 6 2 2 5 1 2 0 5 3 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 | row/256hist=2 0 0 0 1 0 1 2 2 0 1 3 0 0 0 2 0 2 1 1 0 1 1 1 2 5 2 2 2 0 1 3 
+  [t=0 r=2268] SK=b9a4 RO=b9a4 NV=b9a6
+  [t=0 r=4440] SK=c0f5 RO=c0f5 NV=c0f4
+  [t=0 r=6468] SK=3d87 RO=3d87 NV=3d86
+  [t=0 r=7026] SK=c227 RO=c227 NV=c228
+  [t=0 r=7053] SK=4145 RO=4145 NV=4144
+  [t=0 r=7195] SK=3a88 RO=3a88 NV=3a87
+  [t=1 r=1868] SK=bde8 RO=bde8 NV=bde9
+  [t=1 r=5469] SK=3be2 RO=3be2 NV=3be1
+A TILE   M=14 rot=1 | t_med=0.397 ms p2=0.395 p8=0.404 | 169.2 GB/s e4m3
+B SKINNY M=14 rot=1 | t_med=0.424 ms p2=0.421 p8=0.427 | 158.4 GB/s e4m3
+DELTA SKINNY/TILE M=14 | (A/B-1)*100 = -6.4%
+YHASH arm=base ROW M=14 K=8192 N=8192 yhash=554c56d65d4419ce nonzero=114688/114688
+CHECKW arm=SK8V ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SK4 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SK2 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SK1 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SKW8 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SKW4 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SKW2 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+CHECKW arm=SKW1 ROW M=14 K=8192 N=8192 rel_l2_vs_oracle=1.87e-05 yhash=554c56d65d4419ce bitwise_vs_SKINNY=114688/114688 nonzero=114688/114688
+AB r=3 arm=TILE ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.397 ms  e4m3 169.2 GB/s nonzero=114688/114688
+AB r=3 arm=base ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.424 ms  e4m3 158.4 GB/s nonzero=114688/114688
+AB r=3 arm=SK8V ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.412 ms  e4m3 162.7 GB/s nonzero=114688/114688
+   SK8V p2=0.408 p8=0.423 ms
+AB r=3 arm=SK4 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.455 ms  e4m3 147.4 GB/s nonzero=114688/114688
+   SK4 p2=0.454 p8=0.457 ms
+AB r=3 arm=SK2 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.554 ms  e4m3 121.2 GB/s nonzero=114688/114688
+   SK2 p2=0.552 p8=0.570 ms
+AB r=3 arm=SK1 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.828 ms  e4m3 81.1 GB/s nonzero=114688/114688
+   SK1 p2=0.807 p8=0.844 ms
+AB r=3 arm=SKW8 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.290 ms  e4m3 231.4 GB/s nonzero=114688/114688
+   SKW8 p2=0.286 p8=0.294 ms
+AB r=3 arm=SKW4 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.356 ms  e4m3 188.6 GB/s nonzero=114688/114688
+   SKW4 p2=0.355 p8=0.357 ms
+AB r=3 arm=SKW2 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.422 ms  e4m3 159.0 GB/s nonzero=114688/114688
+   SKW2 p2=0.420 p8=0.424 ms
+AB r=3 arm=SKW1 ROW M=14 K=8192 N=8192 rot=1 reps=30 | t_med=0.595 ms  e4m3 112.9 GB/s nonzero=114688/114688
+   SKW1 p2=0.591 p8=0.598 ms
+ROUND 3 DONE
