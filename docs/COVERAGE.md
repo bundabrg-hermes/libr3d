@@ -3838,3 +3838,21 @@ MEASUREMENTS (same protocol both models: ~3072-word prompt band, fresh salts, ge
 PROTOCOL CAVEAT: window 54/56 serve probes (v160 71.88 / v161 80.70 median "ctx 3072") are NOT A/B-comparable with these (different prompt/cache shaping and gen). Windows 40/43 numbers (gen=512, ~20-token prompt) likewise. These two rows are the new baseline-of-record at THIS protocol; any v162/v163 serve delta claim needs a fresh same-protocol paired arm.
 
 Ops notes: rounds 7-8 of the 27b leg rode a second client invocation after a broken ssh pipe killed round-6's runner (server unaffected, all done-lines id-matched). Host RAM was tight (avail ~2 GB) but no --host-headroom-mib and no swapfile were needed this window; swap as-found (pre-existing 1.9 GB dm-2 only). serve27dmp4 removed after its leg; final state: spec9g Up on v163 (live serve line), v161 rollback stopped, card known state. Artifacts: cat:~/scratch/r3d/w62_serve/.
+
+## Window 63 (2026-10-28, AWST ~15:00-17:00) — 27B q8x FALLBACK ROOT-CAUSED (band physically impossible on 24 GiB) + dflash HEALTHY + prefill-readout engine bug
+
+Operator report: 27B serve logs 8x "mxfp4 q8x plane unavailable"; prefill UI readout freezes ~6000 t/s; dflash accept numbers look odd. One child (81 calls / 59 min), XTX-only. Manager independently verified restore (tokenize 200, clean process space) and incident state.
+
+ROOT CAUSE (measured, debug .so outside repo): plane cache keys per LAYER TENSOR, not per shape — 27B's true plane budget is 26,403 MiB (319 tensors, ~1.06 B/elem ~ 1.47x weight set), not the 632 MiB distinct-shape sum. With weights+KV placed, hipMemGetInfo free = 196-210 MiB at first-dispatch: all 319 decisions why=GUARD, 0 ALLOC. Headroom=0 experiment built 196.56 MiB (0.73% coverage) then vfree=0. CONCLUSION: shipped-walk fallback is CORRECT on 24 GiB; q8x cannot serve 27B-class models on this card. 9b control: full coverage, same-binary interleave ON 69.9 vs OFF 44.0 med (disjoint) = +59% band value confirmed at serve.
+
+27B DECODE: partial-plane vs fallback within noise (16.4 vs 15.8 med, n=4); ~16 t/s today vs w62 12.79 (co-resident load differs; treat w62/w63 as same-band, protocol-internal). BW ceiling ~52 t/s stands; reaching it needs the fast band which needs card capacity -> Q58.
+
+DFLASH: HEALTHY, small-sample artifact. /stats draft_positions rates at >=200 verifies/position: 27B 0.795/0.881/0.947 and 0.785/0.857/0.904; 9b 0.876/0.858/0.880. Draft proposes all 3 tokens in ONE block pass (serve log line + draft_n 36/36). UI anomaly = low-reach captures (12/11/5) where one flip moves rate 0.45.
+
+PREFILL READOUT: NOT a missing plugin hook (plugin ABI has zero progress/timing callbacks). Engine bug: prefill_tps updated only at step commit; tokenless prefill steps "commit" at issue time; EMA t-floor 0.5s replays inflated constant (measured: constant 7419.27 t/s across 39/39 polls vs real 113.5 t/s; 3709.6 tok/0.5s reproduces it exactly). v163 merely made the always-wrong number visible by slowing... NOTE: v163 does not slow prefill; the number was always garbage, long-prefill visibility is new. Fix is engine-side (radiance-fix) -> Q56.
+
+27B PREFILL: 113.5 t/s at 3722 tokens (33 s TTFT) — the dominant 27B UX cost, untouched by decode band -> Q57.
+
+INCIDENT (disclosed): child's first uncapped 27B launch OOMed host RAM (31 GiB; flashnext radiance alone 26.8 GiB RSS host tier): kernel killed child's radiance AND flashnext restarted once (RestartCount=1, healthy ~3 s). Mitigations kept: /swapfile.w63 (16 GiB, ACTIVE, 2.4 GiB used) + future 27B runs --memory=3g --oom-score-adj=900. Swapfile removal = operator call. LESSON BOOKED: 27B launches on cat MUST cap container memory from the first attempt.
+
+Queue: +Q55 (q8x honest-budget/dedup/log, plugin), +Q56 (engine prefill_tps bug, radiance-fix), +Q57 (27B prefill speed), +Q58 (27B decode-band capacity question, parked). Q54 tail (M 33..64 unbenchmarked) unchanged.
