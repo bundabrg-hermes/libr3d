@@ -48,7 +48,9 @@
  * the decode band (both width-row legs: the legacy walk and the q8x sibling; the band
  * falls to the m64 tile); R3D_MXFP4_Q8X=0 (the literal "0") withdraws ONLY the q8x
  * sibling row and the band lands on the legacy byte-plane walk -- see the arm's block
- * comment for the default-on law.
+ * comment for the default-on law. R3D_MX_SK=0 (the literal "0") withdraws the Q36
+ * skinny WMMA band (9 <= M <= 64) back to the m64 tile -- default-ON, the tile arm
+ * is byte-identical under it; see the sk arm's block comment.
  */
 
 #include <hip/hip_runtime.h>
@@ -349,6 +351,255 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_m64_kernel(
         const int m = m0 + r, n = n0 + c;
         if (m < M && n < N)
             Y[(int64_t)m * y_pitch + n] = f32_to_bf16_m4(ldexpf(Acc[r][c], (int)Eref[c] - 127));
+    }
+}
+
+/* ---- Q36 skinny WMMA arm (window 60): 16 weight rows per wave on the nibble plane ----
+ *
+ * The window-60 bench donor skinny4_kernel<8,2> (WPB=8 waves/block, WW=2 staging
+ * window), promoted after the CLOSED WIN: M 9..64 vs the m64 tile DISJOINT
+ * +54.1..76.7% cold / +52.1..73.8% cache-fit, every crossed round; the M<=8 band
+ * stays the q8x row (skinny is disjoint LOSS -134..-165% there). Lineage: the
+ * fp8a8 skinny (Q26/Q26c) and its Q54 bwin staging window, adapted to the mxfp4
+ * plane -- WINDOW-59 mandate (draft on the windowed lineage from day one):
+ *   * one weight dword carries EIGHT e2m1 codes: 8 LDS-LUT hits + the exponent
+ *     fold produce a uint4 store (8 bf16 = 16B) per dword -- the fp8 sk's uint2
+ *     law halved in codes, doubled in store (getting this backwards is the Q26
+ *     quarter-tile trap in the other direction). The decode stays in registers;
+ *     expanded bytes are NEVER staged through LDS (Q26 staging trap).
+ *   * the fold is the m64 tile's boundary conversion verbatim: Eref[row] = the
+ *     row's max non-0xFF scale byte at block entry; fragments stage kE2M1 bits +
+ *     ((x - Eref) << 7) (bf16's biased exponent makes the add the exact
+ *     power-of-two multiply); a 0xFF byte NaNs its whole dword group (the
+ *     oracle poisons the whole element); the flush carries AS[m, g] once per
+ *     128-of-K and the store rides ldexpf(y, Eref - 127). Tile precision class
+ *     (f32 accumulator, exact E8M0): bench rel_l2 3.3e-05..5.4e-05 vs the
+ *     scalar oracle -- tol-graded family, adjudicated by rel_l2 (Q26 law), NOT
+ *     a bitwise claim vs the tile (different k-tree, like every sk sibling).
+ *   * WW=2 issues the NEXT group's 8 dwords/lane into a register window before
+ *     the block touches LDS (Q18 static-index law: both windows consumed under
+ *     `#pragma unroll` at the compile-time trip 8 -- a dynamic index demotes
+ *     them to scratch); WW=1 is the verbatim walk (schedule mirror, dark: only
+ *     <8,2> is instantiated). WPB=8 is the arm of record -- the WPB=4 grid knob
+ *     transferred NEGATIVE again (Q54's occupancy-boost loss class, 3rd sighting).
+ *   * dword-per-lane legality: B's byte pitch (K/2) and base must be %4 (the
+ *     GEMV/Q54 alignment law) and the Eref dword scan pins BS's pitch/base --
+ *     ALL enforced at the dispatch gate; illegal shapes ride the tile verbatim.
+ *
+ * Tokens stream through the block-shared xs as bf16 (16-token slabs, <=4 for
+ * M <= 64, barrier-serialized slab loop inside the K-group loop: weights stream
+ * once). Dead waves stay at the barriers (alive guard, Q26b law): xs is owned
+ * block-wide. Pinned f32 accumulator map: token = lane&15, row = 2k + (lane>>4)
+ * (the sk lineage's map); one AS multiply per slab flush, ascending g.
+ */
+constexpr int kSkLdm = 136;   /* bf16-element LDS stride, pad 8 (sk row-conflict law) */
+
+template <int WPB, int WW>
+__global__ __launch_bounds__(WPB * 32) void gemm_nt_mxfp4_sk_kernel(
+    const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, uint16_t* __restrict__ Y,
+    const float* __restrict__ AS, const uint8_t* __restrict__ BS,
+    int M, int N, int K, int as_cols, int bs_cols,
+    int64_t a_pitch, int64_t b_pitch,        /* B's pitch is BYTES (nibbles: K/2) */
+    int64_t y_pitch, int64_t as_pitch, int64_t bs_pitch) {
+
+    (void) as_cols;                    /* == K/128 by the entry gate; ngrp derives from K */
+    __shared__ uint16_t Lut8[256];                              /* e4m3 byte -> bf16 */
+    __shared__ uint16_t Lut16[16];                              /* e2m1 nib  -> bf16 */
+    __shared__ uint8_t  Eref[WPB][16];                          /* per-row reference exp */
+    __shared__ __align__(16) uint16_t xs[16 * kSkLdm];          /* tokens x slots (bf16) */
+    __shared__ __align__(16) uint16_t ws[WPB][16 * kSkLdm];     /* per-wave rows x slots */
+    for (int i = threadIdx.x; i < 256; i += WPB * 32)           /* full LUTs at any WPB */
+        Lut8[i] = f32_to_bf16_m4(fp8e4m3_m4((uint8_t)i));
+    if (threadIdx.x < 16) Lut16[threadIdx.x] = kE2M1[threadIdx.x];
+
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int tile = (blockIdx.x * WPB + w) * 16;               /* first weight row of tile */
+    const bool alive = tile < N;                                /* barrier-participating */
+    const int nslab = (M + 15) >> 4;                            /* 16-token slabs (<=4) */
+    const int tok = lane & 15;                                  /* pinned f32-acc map */
+    const long ngrp = K / 128;                                  /* gate: K % 128 == 0 */
+    rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, bf16, rocwmma::row_major> fa;
+    rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, bf16, rocwmma::col_major> fb;
+    rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> fc;
+    float y[4][8];                                              /* per-slab accumulators */
+    for (int s = 0; s < 4; ++s)
+#pragma unroll
+        for (int k = 0; k < 8; ++k) y[s][k] = 0.0f;
+
+    /* Eref: per-row max of non-0xFF scale bytes (the m64's self-derived b_ref role).
+     * Two lanes per row split the row's dwords; the pair folds via one shfl_xor. */
+    __syncthreads();                                            /* LUTs visible */
+    {
+        const int r = lane >> 1, half = lane & 1;
+        const int row = tile + r;
+        int mx = 0;
+        if (alive && row < N) {
+            for (int dw = half; dw < (bs_cols >> 2); dw += 2) {
+                const uint32_t x = *(const uint32_t*)&BS[(int64_t)row * bs_pitch + dw * 4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const uint32_t b = (x >> (8 * j)) & 0xffu;
+                    if (b != 0xffu && (int)b > mx) mx = (int)b;   /* scalar max: the byte
+                                                                     positions are NOT
+                                                                     comparable */
+                }
+            }
+        }
+        int other = __shfl_xor(mx, 1);
+        if (other > mx) mx = other;                             /* pair fold */
+        if (half == 0) Eref[w][r] = (uint8_t)mx;
+    }
+    __syncthreads();                                            /* Eref visible */
+
+    /* One window burst: 8 independent dwords (the lane's dword (lane&15) of tile rows
+     * (lane>>4) + 2q), all indices static. dword-per-lane legality is the dispatch's
+     * gate: B's base and byte pitch are %4. */
+#define R3D_M4SK_LOAD8(dst_, gg_) do {                                            \
+    _Pragma("unroll")                                                             \
+    for (int q = 0; q < 8; ++q) {                                                 \
+        const int rr_ = tile + (lane >> 4) + 2 * q;                               \
+        (dst_)[q] = (alive && rr_ < N)                                            \
+            ? *(const uint32_t*)&B[(int64_t)rr_ * b_pitch                         \
+                                   + ((int64_t)(gg_) << 6) + ((lane & 15) << 2)]  \
+            : 0u;                                                                 \
+    } } while (0)
+
+    uint32_t cur[8], nxt[8];
+    if constexpr (WW > 1) R3D_M4SK_LOAD8(cur, 0);
+    for (long g = 0; g < ngrp; ++g) {
+        const int k0 = (int)(g * 128);
+        if constexpr (WW > 1) {
+            if (g + 1 < ngrp) R3D_M4SK_LOAD8(nxt, g + 1);  /* next group's 8 loads in
+                                                              flight across the staging
+                                                              barrier */
+            // Consume the CURRENT window: dword -> 8 codes -> 8 bf16 (LUT + exponent
+            // fold) -> uint4 store (the nibble-plane sibling of the fp8 sk's uint2 law).
+            if (alive) {
+                const int rl = (lane >> 4);                     /* + 2q below */
+#pragma unroll
+                for (int q = 0; q < 8; ++q) {
+                    const int row = tile + rl + 2 * q;
+                    uint32_t out[4];
+                    if (row >= N) {                             /* padding, never NaN */
+                        out[0] = out[1] = out[2] = out[3] = 0u;
+                    } else {
+                        const uint32_t x = cur[q];
+                        const uint8_t sc = BS[(int64_t)row * bs_pitch + (g << 2)
+                                             + ((lane & 15) >> 2)];
+                        if (sc == 0xffu) {                      /* NaN poisons the group */
+                            out[0] = 0x7FC07FC0u; out[1] = 0x7FC07FC0u;
+                            out[2] = 0x7FC07FC0u; out[3] = 0x7FC07FC0u;
+                        } else {
+                            const int d = ((int)sc - (int)Eref[w][rl + 2 * q]) << 7;
+                            uint16_t o16[8];
+#pragma unroll
+                            for (int j = 0; j < 8; ++j) {
+                                const uint32_t nib = (x >> (4 * j)) & 0xfu;
+                                const uint16_t base = Lut16[nib];
+                                if ((nib & 7u) == 0u) o16[j] = base;   /* +-0: no fold */
+                                else {
+                                    const int nb = (int)base + d;
+                                    o16[j] = (uint16_t)(nb < 0x0080
+                                        ? (int)((nib & 8u) ? 0x8000u : 0u) : nb);
+                                }
+                            }
+                            out[0] = o16[0] | ((uint32_t)o16[1] << 16);
+                            out[1] = o16[2] | ((uint32_t)o16[3] << 16);
+                            out[2] = o16[4] | ((uint32_t)o16[5] << 16);
+                            out[3] = o16[6] | ((uint32_t)o16[7] << 16);
+                        }
+                    }
+                    *(uint4*)&ws[w][(rl + 2 * q) * kSkLdm + (lane & 15) * 8] = *(uint4*)out;
+                }
+            }
+        } else {
+            /* WW==1: the verbatim walk (window off; schedule mirror for WW-only
+             * isolation). Dark at promotion: only <8,2> is instantiated. */
+            if (alive) {
+#pragma unroll
+                for (int q = 0; q < 8; ++q) {
+                    const int rl = (lane >> 4) + 2 * q;
+                    const int row = tile + rl;
+                    uint32_t out[4];
+                    if (row >= N) {
+                        out[0] = out[1] = out[2] = out[3] = 0u;
+                    } else {
+                        const uint32_t x = *(const uint32_t*)&B[(int64_t)row * b_pitch
+                                             + (k0 >> 1) + ((lane & 15) << 2)];
+                        const uint8_t sc = BS[(int64_t)row * bs_pitch + (g << 2)
+                                             + ((lane & 15) >> 2)];
+                        if (sc == 0xffu) {
+                            out[0] = 0x7FC07FC0u; out[1] = 0x7FC07FC0u;
+                            out[2] = 0x7FC07FC0u; out[3] = 0x7FC07FC0u;
+                        } else {
+                            const int d = ((int)sc - (int)Eref[w][rl]) << 7;
+                            uint16_t o16[8];
+#pragma unroll
+                            for (int j = 0; j < 8; ++j) {
+                                const uint32_t nib = (x >> (4 * j)) & 0xfu;
+                                const uint16_t base = Lut16[nib];
+                                if ((nib & 7u) == 0u) o16[j] = base;
+                                else {
+                                    const int nb = (int)base + d;
+                                    o16[j] = (uint16_t)(nb < 0x0080
+                                        ? (int)((nib & 8u) ? 0x8000u : 0u) : nb);
+                                }
+                            }
+                            out[0] = o16[0] | ((uint32_t)o16[1] << 16);
+                            out[1] = o16[2] | ((uint32_t)o16[3] << 16);
+                            out[2] = o16[4] | ((uint32_t)o16[5] << 16);
+                            out[3] = o16[6] | ((uint32_t)o16[7] << 16);
+                        }
+                    }
+                    *(uint4*)&ws[w][rl * kSkLdm + (lane & 15) * 8] = *(uint4*)out;
+                }
+            }
+        }
+        for (int slab = 0; slab < nslab; ++slab) {              /* tokens stream through ws */
+            const int live_s = M - slab * 16 < 16 ? M - slab * 16 : 16;
+            for (int i = threadIdx.x; i < 16 * 128; i += WPB * 32) {   /* block-shared */
+                const int m = i >> 7, s = i & 127;
+                const int mm = slab * 16 + m;
+                xs[m * kSkLdm + s] = (m < live_s) ? Lut8[A[(int64_t)mm * a_pitch + k0 + s]]
+                                                  : (uint16_t)0;
+            }
+            __syncthreads();                                    /* xs (and ws) visible */
+            if (alive) {
+                rocwmma::fill_fragment(fc, 0.0f);
+#pragma unroll
+                for (int kk = 0; kk < 128; kk += 16) {
+                    rocwmma::load_matrix_sync(fa, (const bf16*)&ws[w][kk], kSkLdm);
+                    rocwmma::load_matrix_sync(fb, (const bf16*)&xs[kk], kSkLdm);
+                    rocwmma::mma_sync(fc, fa, fb, fc);
+                }
+                /* flush: one AS multiply per 128-of-K, ascending g (the m64's order;
+                 * the E8M0 side already rides the fragments exactly). */
+                if (tok < live_s) {
+#pragma unroll
+                    for (int k = 0; k < 8; ++k)
+                        y[slab][k] += fc.x[k] * AS[(int64_t)(slab * 16 + tok) * as_pitch + g];
+                }
+            }
+            __syncthreads();
+        }
+        if constexpr (WW > 1) {
+#pragma unroll
+            for (int q = 0; q < 8; ++q) cur[q] = nxt[q];        /* static-index copy */
+        }
+    }
+#undef R3D_M4SK_LOAD8
+    /* store: the row's reference exponent rides out once per output (m64 law; ldexpf
+     * by an integer power of two is exact; NaN/0 pass through). */
+    for (int slab = 0; slab < nslab; ++slab) {
+        const int live_s = M - slab * 16 < 16 ? M - slab * 16 : 16;
+        const int mm = slab * 16 + tok;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int rr = tile + 2 * k + (lane >> 4);
+            if (tok < live_s && rr < N)
+                Y[(int64_t)mm * y_pitch + rr] = f32_to_bf16_m4(
+                    ldexpf(y[slab][k], (int)Eref[w][rr - tile] - 127));
+        }
     }
 }
 
@@ -1215,6 +1466,12 @@ template <bool DBUF>
 __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_m64_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint8_t*,
     int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int, int) {}
+/* the Q36 sk arm mirrors too (the mirror-decl law, window 58: the host pass must
+ * see the same mangled name the runtime resolves at hipLaunchKernelGGL). */
+template <int WPB, int WW>
+__global__ __launch_bounds__(WPB * 32) void gemm_nt_mxfp4_sk_kernel(
+    const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint8_t*,
+    int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t) {}
 template <int MT, int W, int CH = 1, int RPR = 1>
 __global__ __launch_bounds__(kThreads) void gemm_nt_mxfp4_gemv_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint8_t*,
@@ -1358,6 +1615,60 @@ static int r3d_gemm_nt_q_impl(const RadArgs* a, RadStream s) {
 
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
     dim3 grid((unsigned)((P.N + kNB - 1) / kNB), (unsigned)((P.M + kMB - 1) / kMB));
+
+    /* ---- Q36 skinny band: 9 <= M <= 64 rides the skinny WMMA walk -------------------
+     *
+     * Window-60 bench CLOSED WIN: WPB=8/WW=2, disjoint +54..77% cold and +52..74%
+     * cache-fit vs the m64 tile at every M 9..64 leg; M<=8 is disjoint LOSS (that
+     * band is the q8x row's, untouched); M>64 was never measured -- the tile keeps
+     * it. R3D_MX_SK=0 (the literal "0", the q8x/f8win lever law) is the VERBATIM
+     * withdrawal: the tile dispatch below is byte-identical to the pre-Q36 line.
+     * Any other spelling (including "1") is the promoted default; the override is
+     * honored ONLY inside the band -- nothing outside 9..64 can be pushed onto the
+     * sk route. Tile precision class by construction (same boundary conversion),
+     * tol-graded family: NOT bit-compat with the tile (different k-tree, sk law).
+     *
+     * Legality gates (the walk's own laws; illegal shapes route to the tile
+     * VERBATIM, never a refusal):
+     *   K % 128 == 0    -- 128-of-K groups close (sk slab law) AND the E8M0 dword
+     *                     walk needs bs_cols % 4 == 0  (both subsume the plan's K%64)
+     *   N % 128 == 0    -- the measured shape class; the kernel's padding guard is
+     *                     unit-proven but unbenched, so ragged N rides the tile
+     *   B base %4 && b_pitch %4 -- dword-per-lane staging walk (GEMV/Q54 law)
+     *   BS base %4 && bs_pitch %4 && bs_cols %4 -- the Eref dword scan */
+    static const bool mx_sk = !(getenv("R3D_MX_SK") && strcmp(getenv("R3D_MX_SK"), "0") == 0);
+    if (mx_sk && P.M >= 9 && P.M <= 64 &&
+        (P.K % 128) == 0 && (P.N % 128) == 0 &&
+        (P.bs_cols % 4) == 0 &&
+        (P.b_pitch % 4) == 0 && (((uintptr_t)P.B & 3) == 0) &&
+        (P.bs_pitch % 4) == 0 && (((uintptr_t)P.BS & 3) == 0)) {
+        dim3 sk_grid((unsigned)((P.N + 127) / 128));            /* WPB=8: 128 rows/block */
+        hipLaunchKernelGGL((gemm_nt_mxfp4_sk_kernel<8, 2>), sk_grid, dim3(kThreads), 0, stream,
+                           P.A, P.B, (uint16_t*)Y->data, P.AS, P.BS,
+                           (int)P.M, (int)P.N, (int)P.K, P.as_cols, P.bs_cols,
+                           P.a_pitch, P.b_pitch, P.y_pitch, P.as_pitch, P.bs_pitch);
+        const hipError_t se = hipGetLastError();
+        if (se == hipSuccess) {
+            if (getenv("R3D_DEBUG_GEMM")) {
+                /* once per DISTINCT m (window-16 silent-lever law): a lever that
+                 * never dispatches must not look bit-exact, and one static-bool-once
+                 * cannot tell M 9's sk leg from M 64's tile leg. */
+                static unsigned long long sk_seen = 0;
+                const unsigned long long key = 1ull << ((int)P.M - 9);   /* M 9..64 */
+                if (!(sk_seen & key)) {
+                    sk_seen |= key;
+                    fprintf(stderr, "libr3d: mxfp4 skinny wmma launched (m=%d wpb=8 win=2 "
+                                    "slabs=%d)\n", (int)P.M, (int)((P.M + 15) >> 4));
+                }
+            }
+            return RAD_OK;
+        }
+        fprintf(stderr, "libr3d: mxfp4 skinny launch FAILED (%s), m64 tile takes this "
+                        "launch\n", hipGetErrorName(se));
+        /* fall through: the tile below re-launches on the same operands -- sk wrote
+         * only into the caller's Y, which the tile fully rewrites. */
+    }
+
     if (no_dbuf)
         hipLaunchKernelGGL((gemm_nt_mxfp4_m64_kernel<false>), grid, dim3(kThreads), 0, stream,
                            P.A, P.B, (uint16_t*)Y->data, P.AS, P.BS,
