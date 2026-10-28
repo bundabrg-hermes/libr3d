@@ -496,9 +496,28 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
  * run their single trip), so the M<=16 arm can be stream-diffed byte-identical
  * against the shipped build instead of merely fingerprinted (additive-port law);
  * the ONE admitted delta is the runtime-trip init loop, dead-provable at nslab==1 —
- * the stream diff adjudicates that claim too, and a surviving loop is a veto. */
+ * the stream diff adjudicates that claim too, and a surviving loop is a veto.
+ *
+ * Q54 (WIN template param; bench lineage skinny2_kernel<WPB*10+WW>, WW=2 at the
+ * shipped WPB=8 grid): the GEMV walk's bwin lineage finally reaches the skinny
+ * staging walk. WIN=2 issues the NEXT group's 16 dwords (lane's dword of each of
+ * the wave's 16 tile rows — same lane->byte mapping as the walk) back-to-back
+ * BEFORE the block touches LDS, into cur/nxt register windows; the current group
+ * is consumed from cur after the barrier. Q18 static-index law: every window
+ * index is a compile-time unrolled index (a dynamic index demotes the arrays to
+ * scratch — spills = gate failure); depth stays 1 (cur+nxt = 32 dwords/lane),
+ * wider re-creates the pressure the window relieves (Q18b law). Loads are
+ * reordered ONLY: no dot leg, flush leg, or scale read moves, every byte reaches
+ * ws the same way (dword -> 4 LUT codes -> uint2 store, never the uint4 idiom),
+ * so outputs are bit-identical to WIN=1 — graded bitwise in the bench cross.
+ * The host routes WIN=2 only when the dword-per-lane load is legal (B base and
+ * b_pitch dword-aligned, the GEMV band's alignment law); ragged-pitch shapes
+ * keep the byte-wise WIN=1 walk. R3D_F8WIN=0 withdraws to WIN=1. Bench verdict
+ * (q54, 3 crossed rounds, 8/8 legs disjoint): +23.5..37.3% across M 4..32 cold
+ * and cache-fit; WPB grid rebalance was measured and REJECTED — only the window
+ * transfers. */
 #define R3D_SKY(si, k) (SLABS == 1 ? y[0][k] : y[si][k])
-template <int SLABS>
+template <int SLABS, int WIN>
 __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_sk_kernel(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, uint16_t* __restrict__ Y,
     const float* __restrict__ AS, const uint16_t* __restrict__ BS,
@@ -529,9 +548,41 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_sk_kernel(
 #pragma unroll
         for (int k = 0; k < 8; ++k) y[s][k] = 0.0f;
 
+    /* Q54 window burst: 16 independent dwords (this lane's dword of each of the
+     * wave's 16 tile rows at group grp), issued back to back, all indices static.
+     * Same lane->byte mapping as the walk, so every value that reaches ws is the
+     * same byte decoded the same way. Off entirely at WIN==1 (if constexpr). */
+    [[maybe_unused]] uint32_t cur[16], nxt[16];
+#define R3D_F8WIN_LOAD16(dst_, grp_) do {                                            \
+    _Pragma("unroll")                                                                \
+    for (int d_ = 0; d_ < 16; ++d_) {                                                \
+        const int rr_ = tile + d_;                                                   \
+        (dst_)[d_] = (alive && rr_ < N)                                              \
+            ? *(const uint32_t*)&B[(int64_t)rr_ * b_pitch + ((int64_t)(grp_) << 7)   \
+                                  + (lane << 2)]                                     \
+            : 0u;                                                                    \
+    } } while (0)
+    if constexpr (WIN > 1) R3D_F8WIN_LOAD16(cur, 0);
+
     for (int g = 0; g < ngrp; ++g) {
         const int64_t k0 = (int64_t)g * 128;
-        if (alive) {
+        if constexpr (WIN > 1) {
+            if (g + 1 < ngrp) R3D_F8WIN_LOAD16(nxt, g + 1);  /* 16 loads in flight
+                                                              * across the staging
+                                                              * barrier */
+            if (alive) {
+                /* consume the CURRENT window: dword -> 4 bf16 -> uint2 store
+                 * (never a uint4; bench quarter-tile law). cur[d] is lane's dword
+                 * of tile row d -- exactly the walk's mapping. */
+#pragma unroll
+                for (int d = 0; d < 16; ++d) {
+                    uint16_t o[4] = {0, 0, 0, 0};
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) o[j] = Lut[(cur[d] >> (8 * j)) & 0xffu];
+                    *(uint2*)&ws[w][d * kSkLdm + lane * 4] = *(uint2*)o;
+                }
+            }
+        } else if (alive) {
             /* EVERY wave stages its OWN tile (window-17 dead-row law). 16 rows x
              * 32 dwords of e4m3 = 512 dwords per wave, 16 per lane; each dword
              * decodes to 4 bf16 -- a uint2 store, NEVER the w2a8 uint4 idiom
@@ -586,7 +637,12 @@ __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_sk_kernel(
             }
             __syncthreads();
         }
+        if constexpr (WIN > 1) {
+#pragma unroll
+            for (int d = 0; d < 16; ++d) cur[d] = nxt[d];    /* static-index register copy */
+        }
     }
+#undef R3D_F8WIN_LOAD16
     if (alive) {
         if constexpr (SLABS == 1) {
             /* tok < live with live = min(M,16): the exact Q26b predicate, RESTORED.
@@ -633,7 +689,7 @@ template <int MT, int W, bool D2>
 __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_gemv_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint16_t*,
     int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int) {}
-template <int SLABS>
+template <int SLABS, int WIN>
 __global__ __launch_bounds__(kThreads) void gemm_nt_fp8a8_sk_kernel(
     const uint8_t*, const uint8_t*, uint16_t*, const float*, const uint16_t*,
     int, int, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int) {}
@@ -880,6 +936,9 @@ void f8_launch_tile(const F8Plan& P, void* ydata, int64_t y_pitch, RadStream s,
      * "0" withdraws to the pre-Q26 dispatch. The family kill switch R3D_NO_FP8_DEC
      * withdraws it too (band law: one env kills the whole decode family). */
     static const bool sk      = !(getenv("R3D_F8_SK") && strcmp(getenv("R3D_F8_SK"), "0") == 0);
+    /* Q54: bwin staging window on the skinny walk. Default ON; the literal
+     * "0" withdraws to the pre-Q54 byte-wise walk (WIN=1 instantiation). */
+    static const bool f8win   = !(getenv("R3D_F8WIN") && strcmp(getenv("R3D_F8WIN"), "0") == 0);
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
 
     /* Q26b: the skinny row owns M 4..16. No dword-alignment gate -- it reads B
@@ -893,23 +952,34 @@ void f8_launch_tile(const F8Plan& P, void* ydata, int64_t y_pitch, RadStream s,
      * M > 64 stays on the tile (bench did not measure past 64; no claim beyond). */
     if (!no_dec && sk && P.M >= 4 && P.M <= 64) {
         dim3 grid((unsigned)((P.N + 127) / 128));
-        #define R3D_F8_SK_LAUNCH(S_) hipLaunchKernelGGL(gemm_nt_fp8a8_sk_kernel<S_>, \
+        /* Q54: the window's dword-per-lane load pins B's alignment (GEMV's law):
+         * odd-base or ragged-pitch shapes stay on the byte-wise WIN=1 walk so the
+         * skinny row keeps its "no dword-alignment gate" property under
+         * withdrawal and for those shapes alike. */
+        const int win = (f8win && (P.b_pitch % 4) == 0 && (((uintptr_t)P.B & 3) == 0)) ? 2 : 1;
+        #define R3D_F8_SK_LAUNCH(S_, W_) hipLaunchKernelGGL((gemm_nt_fp8a8_sk_kernel<S_, W_>), \
             grid, dim3(kThreads), 0, stream,                                          \
             P.A, P.B, (uint16_t*)ydata, P.AS, P.BS,                                   \
             (int)P.M, (int)P.N, (int)P.K, P.as_cols, P.bs_cols,                       \
             P.a_pitch, P.b_pitch, y_pitch, P.as_pitch, P.bs_pitch, P.rblk)
+        #define R3D_F8_SK_SW(W_)                                                      \
+            switch (slabs) {                                                          \
+                case 1: R3D_F8_SK_LAUNCH(1, W_); break;                               \
+                case 2: R3D_F8_SK_LAUNCH(2, W_); break;                               \
+                case 3: R3D_F8_SK_LAUNCH(3, W_); break;                               \
+                default: R3D_F8_SK_LAUNCH(4, W_); break;                              \
+            }
         const int slabs = P.M <= 16 ? 1 : P.M <= 32 ? 2 : P.M <= 48 ? 3 : 4;
-        switch (slabs) {
-            case 1: R3D_F8_SK_LAUNCH(1); break;
-            case 2: R3D_F8_SK_LAUNCH(2); break;
-            case 3: R3D_F8_SK_LAUNCH(3); break;
-            default: R3D_F8_SK_LAUNCH(4); break;
-        }
+        if (win == 2) { R3D_F8_SK_SW(2) } else { R3D_F8_SK_SW(1) }
+        #undef R3D_F8_SK_SW
         #undef R3D_F8_SK_LAUNCH
         if (getenv("R3D_DEBUG_GEMM")) {
-            static bool once = false;
-            if (!once) { once = true; fprintf(stderr, "libr3d: fp8a8 skinny wmma launched (m=%d rblk=%d slabs=%d)\n",
-                                               (int)P.M, P.rblk, slabs); }
+            /* once per distinct win arm (window-16 silent-lever law): a lever that
+             * never dispatches must not look bit-exact. */
+            static bool once_w[2] = { false, false };
+            if (!once_w[win - 1]) { once_w[win - 1] = true;
+                fprintf(stderr, "libr3d: fp8a8 skinny wmma launched (m=%d rblk=%d slabs=%d win=%d)\n",
+                        (int)P.M, P.rblk, slabs, win); }
         }
         return;
     }

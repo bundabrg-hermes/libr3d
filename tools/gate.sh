@@ -69,6 +69,7 @@ stage_and_run() {  # stage_and_run <home-subdir> <libs...> -- <kbench args...>
     [ -n "${R3D_DUMP_DIR:-}" ] && envs+=(-e R3D_DUMP_DIR="$R3D_DUMP_DIR")
     [ -n "${R3D_DUMP_MAX:-}" ] && envs+=(-e R3D_DUMP_MAX="$R3D_DUMP_MAX")
     [ -n "${R3D_F8_SK:-}" ] && envs+=(-e R3D_F8_SK="$R3D_F8_SK")
+    [ -n "${R3D_F8WIN:-}" ] && envs+=(-e R3D_F8WIN="$R3D_F8WIN")
     [ -n "${R3D_NO_FP8_DEC:-}" ] && envs+=(-e R3D_NO_FP8_DEC="$R3D_NO_FP8_DEC")
     [ -n "${R3D_DEBUG_GEMM:-}" ] && envs+=(-e R3D_DEBUG_GEMM="$R3D_DEBUG_GEMM")
     [ -n "${R3D_ATTN_NO_DBUF:-}" ] && envs+=(-e R3D_ATTN_NO_DBUF="$R3D_ATTN_NO_DBUF")
