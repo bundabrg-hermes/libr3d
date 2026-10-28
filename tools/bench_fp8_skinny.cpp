@@ -20,6 +20,26 @@
 //   hipcc -O2 --offload-arch=gfx1100 -mno-wavefrontsize64 -std=c++17 -ffp-contract=off \
 //         -I/opt/radiance/include/radiance -w bench_fp8_skinny.cpp -o /s/f8sk -ldl
 //   ROCR_VISIBLE_DEVICES=1 LIBR3D_SO=... /s/f8sk <M> <K> <N> <REPS> <ROT>
+//
+// Q54 EXTENSION (bench-only, src/ untouched): the two levers Q50's closed budget named
+// for the skinny arm (Little-law MLP cap ~185 GB/s from per-group load->use
+// serialization x grid tail 1.50 from 128 blocks over 96 CUs at 1 blk/CU):
+//   SKINNYW family = skinny2_kernel<WPB,WW> below:
+//     WW=2: bwin-style double-buffer window on the staging walk (the GEMV walk's
+//           uint32_t bwin[W] lineage, Q18 static-index law honoured: both windows
+//           are consumed under `#pragma unroll` at compile-time trip 16, so every
+//           index is static; a dynamic index would demote them to scratch).
+//     WW=1: the verbatim bench walk (the load->LUT->uint2-store shape), so WPB-only
+//           variants isolate the grid lever.
+//     WPB = waves (16-row tiles) per block: 8 = the shipped shape; 4/2/1 are
+//           launcher-reachable template choices that shrink LDS (39936B -> 22.3/13.6/
+//           9.2KB) so >1 block/CU fits, and rebalance the block count (S1: 128 ->
+//           256/512/1024 over the 96 CUs).
+// Runtime levers live HERE (bench arms), not as env levers in the library.
+// Extra envs: F8SK_ROUND=<n> stamps the AB lines; F8SK_REV=1 crosses the arm order.
+//   Each timed arm prints  AB r=.. arm=<name> ROW M=.. K=.. N=.. rot=.. reps=.. |
+//   t_med=.. ms  e4m3 <GB/s> GB/s nonzero=..  (tools/ab_parse.py adjudicates;
+//   baseline arm name is "base" = the SKINNY walk above).
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <dlfcn.h>
@@ -234,6 +254,148 @@ __global__ __launch_bounds__(256) void skinny_kernel(
     }
 }
 
+// ---- Q54: skinny2_kernel<WPB,WW> -- grid knob + bwin staging window ----------------
+// Faithful mirror of the bench SKINNY walk above (same fixture contract, same ws/xs
+// staging, same WMMA/flush/epilogue order) except for the two Q54 levers described in
+// the header comment: WW=1 reproduces the walk's schedule (load->LUT->uint2 store per
+// q), WW=2 issues the NEXT group's 16 dwords into a register window before the block
+// touches LDS (the GEMV walk's bwin lineage; Q18 static-index law: every window index
+// is a compile-time unrolled index, so the windows live in VGPRs -- a dynamic index
+// would demote them to scratch and recreate the Q18 spill trap; Q18b law: the window
+// stays at depth 1 (cur+nxt = 32 dwords/lane), NOT wider -- all-W live re-creates the
+// pressure the window was meant to relieve).
+// Loads are reordered; no dot leg, flush leg, or scale read moves -- expected outcome
+// at equal grid is BIT-IDENTICAL y (the bench CHECKW line grades bitwise vs SKINNY).
+// Dead-wave law (Q26b): the SKINNY prototype above early-returns on tile>=N, which was
+// only ever safe on all-alive grids; this kernel carries the shipped `alive` guard
+// instead (dead waves own slices of the block-shared xs staging and must stay at the
+// barrier). All measured shapes have tiles % WPB == 0, so all waves are alive anyway.
+// WPB shrinks the per-block LDS footprint (xs 4352B + ws WPB*4352B + Lut 512B), the
+// launcher-reachable axis that turns the 1 blk/CU tail (Q50: LDS 39936B + VGPR 224)
+// into 2/4/... blocks per CU at 256/512/1024 blocks for N=16384.
+// Single CODE template parameter (WPB=CODE/10, WW=CODE%10): HIP's <<<>>> parser
+// misparses a comma inside template args before <<<, and the shipped launcher style
+// (hipLaunchKernelGGL with one template arg) keeps the same single-arg shape.
+template <int CODE>
+__global__ __launch_bounds__(CODE / 10 * 32) void skinny2_kernel(
+    const uint8_t* __restrict__ A, const uint8_t* __restrict__ Bp,
+    uint16_t* __restrict__ Y, const float* __restrict__ AS,
+    const uint16_t* __restrict__ BS, int M, int N, int K, long ngrp, int rblk)
+{
+    constexpr int WPB = CODE / 10, WW = CODE % 10;
+    __shared__ uint16_t Lut[256];                            // e4m3 byte -> exact bf16
+    __shared__ __align__(16) uint16_t xs[16 * kLdm];         // tokens x slots (bf16)
+    __shared__ __align__(16) uint16_t ws[WPB][16 * kLdm];    // per-wave rows x slots
+    for (int i = threadIdx.x; i < 256; i += WPB * 32)        // full LUT at any WPB
+        Lut[i] = f32_to_bf16_f8(fp8e4m3_f8((uint8_t)i));
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int tile = (blockIdx.x * WPB + w) * 16;            // first weight row of tile
+    const bool alive = tile < N;                             // barrier-participating
+    const int nslab = (M + 15) >> 4;                         // 16-token slabs (<=4)
+    const int tok = lane & 15;                               // pinned f32-acc map
+    roCW::fragment<roCW::matrix_a, 16, 16, 16, roCW::bfloat16_t, roCW::row_major> fa;
+    roCW::fragment<roCW::matrix_b, 16, 16, 16, roCW::bfloat16_t, roCW::col_major> fb;
+    roCW::fragment<roCW::accumulator, 16, 16, 16, float> fc;
+    float y[4][8];                                           // per-slab accumulators
+    for (int s = 0; s < 4; ++s)
+#pragma unroll
+        for (int k = 0; k < 8; ++k) y[s][k] = 0.0f;
+
+    // One window burst: 16 independent dwords (lane's dword of each tile row at group
+    // gg), issued back to back, all indices static. Same lane->byte mapping as the
+    // walk, so every value that reaches ws is the same byte decoded the same way.
+#define LOAD16(dst, gg) do { \
+    _Pragma("unroll") \
+    for (int d = 0; d < 16; ++d) { \
+        const int rr_ = tile + d; \
+        (dst)[d] = (alive && rr_ < N) \
+            ? *(const uint32_t*)&Bp[(int64_t)rr_ * K + (int64_t)(gg) * 128 + (lane << 2)] \
+            : 0u; \
+    } } while (0)
+
+    uint32_t cur[16], nxt[16];
+    if constexpr (WW > 1) LOAD16(cur, 0);
+    for (long g = 0; g < ngrp; ++g) {
+        const long k0 = g * 128;
+        if constexpr (WW > 1) {
+            if (g + 1 < ngrp) LOAD16(nxt, g + 1);   // next group's 16 loads in flight
+            // across the staging barrier.
+            // consume the CURRENT window: dword -> 4 bf16 -> uint2 store (never a
+            // uint4: one e4m3 dword decodes to 4 codes, not 16 -- bench quarter-tile
+            // law). cur[d] is lane's dword of tile row d, exactly the walk's mapping.
+            if (alive) {
+#pragma unroll
+                for (int d = 0; d < 16; ++d) {
+                    uint16_t o[4] = {0, 0, 0, 0};
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) o[j] = Lut[(cur[d] >> (8 * j)) & 0xffu];
+                    *(uint2*)&ws[w][d * kLdm + lane * 4] = *(uint2*)o;
+                }
+            }
+        } else {
+            // WW==1: the verbatim SKINNY walk (window off; schedule mirror).
+            if (alive) {
+#pragma unroll
+                for (int q = 0; q < 16; ++q) {
+                    const int rr = tile + q;
+                    uint16_t o[4] = {0, 0, 0, 0};
+                    if (rr < N) {
+                        const uint8_t* b = &Bp[(int64_t)rr * K + k0 + lane * 4];
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) o[j] = Lut[b[j]];
+                    }
+                    *(uint2*)&ws[w][q * kLdm + lane * 4] = *(uint2*)o;
+                }
+            }
+        }
+        for (int slab = 0; slab < nslab; ++slab) {           // tokens stream through ws
+            const int live_s = M - slab * 16 < 16 ? M - slab * 16 : 16;
+            for (int i = threadIdx.x; i < 16 * 128; i += WPB * 32) {  // block-shared
+                const int m = i >> 7, s = i & 127;
+                const int mm = slab * 16 + m;
+                xs[m * kLdm + s] = (m < live_s) ? Lut[A[(int64_t)mm * K + k0 + s]]
+                                                : (uint16_t)0;
+            }
+            __syncthreads();                                 // xs (and ws) visible
+            if (alive) {
+                roCW::fill_fragment(fc, 0.0f);
+#pragma unroll
+                for (int kk = 0; kk < 128; kk += 16) {
+                    roCW::load_matrix_sync(fa, (const roCW::bfloat16_t*)&ws[w][kk], kLdm);
+                    roCW::load_matrix_sync(fb, (const roCW::bfloat16_t*)&xs[kk], kLdm);
+                    roCW::mma_sync(fc, fa, fb, fc);
+                }
+                // per-group flush in the m64's oracle order: (sub_g * sa) * sb, g asc.
+                if (tok < live_s) {
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        const int rr = tile + 2 * k + (lane >> 4);
+                        if (rr >= N) continue;
+                        const float sb = bf16_to_f32_f8(
+                            BS[(int64_t)(rblk > 1 ? rr / rblk : rr) * ngrp + g]);
+                        y[slab][k] += (fc.x[k] * AS[(int64_t)(slab * 16 + tok) * ngrp + g]) * sb;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        if constexpr (WW > 1) {
+#pragma unroll
+            for (int d = 0; d < 16; ++d) cur[d] = nxt[d];    // static-index register copy
+        }
+    }
+#undef LOAD16
+    for (int slab = 0; slab < nslab; ++slab) {
+        const int live_s = M - slab * 16 < 16 ? M - slab * 16 : 16;
+        const int mm = slab * 16 + tok;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int rr = tile + 2 * k + (lane >> 4);
+            if (tok < live_s && rr < N) Y[(int64_t)mm * N + rr] = f32_to_bf16_f8(y[slab][k]);
+        }
+    }
+}
+
 // ---- NAIVE oracle: one thread per (row, token), ref quant_dot order ------------
 __global__ void naive_kernel(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ Bp,
@@ -390,6 +552,40 @@ int main(int argc, char** argv) {
             (const uint8_t*)dA[p], (const uint8_t*)dB[p], (uint16_t*)dY,
             (const float*)dAS, (const uint16_t*)dBS, M, (int)N, (int)K, ngrp, rblk, dbg);
         CK(hipDeviceSynchronize()); };
+    // ---- Q54 arms: skinny2_kernel<WPB,WW> (grid knob + staging window) ----
+    struct Arm2 { const char* name; int wpb, ww; };
+    static const Arm2 kArms2[] = {
+        {"SK8V", 8, 1},                                    // sanity: new kernel, old shape
+        {"SK4",  4, 1}, {"SK2", 2, 1}, {"SK1", 1, 1},      // grid lever only
+        {"SKW8", 8, 2},                                     // window lever only
+        {"SKW4", 4, 2}, {"SKW2", 2, 2}, {"SKW1", 1, 2},    // both levers
+    };
+    const int NARMS2 = (int)(sizeof(kArms2) / sizeof(kArms2[0]));
+#define SK2LAUNCH(wpb_, ww_) \
+    skinny2_kernel<wpb_ * 10 + ww_><<<(unsigned)((N + wpb_ * 16 - 1) / (wpb_ * 16)), wpb_ * 32>>>( \
+        (const uint8_t*)dA[p], (const uint8_t*)dB[p], (uint16_t*)dY, \
+        (const float*)dAS, (const uint16_t*)dBS, M, (int)N, (int)K, ngrp, rblk)
+    auto launch_skinny2 = [&](int p, int wpb, int ww) {
+        const int key = wpb * 10 + ww;
+        if      (key == 81) SK2LAUNCH(8, 1);
+        else if (key == 41) SK2LAUNCH(4, 1);
+        else if (key == 21) SK2LAUNCH(2, 1);
+        else if (key == 11) SK2LAUNCH(1, 1);
+        else if (key == 82) SK2LAUNCH(8, 2);
+        else if (key == 42) SK2LAUNCH(4, 2);
+        else if (key == 22) SK2LAUNCH(2, 2);
+        else if (key == 12) SK2LAUNCH(1, 2);
+        else { printf("BAD ARM key=%d\n", key); exit(2); }
+        CK(hipDeviceSynchronize()); };
+#undef SK2LAUNCH
+    // FNV-1a 64 over the raw bf16 output plane (yhash: per-shape bit-identity gate).
+    auto fnv = [](const std::vector<uint16_t>& v) {
+        uint64_t h = 1469598103934665603ull;
+        const uint8_t* b = (const uint8_t*)v.data();
+        for (size_t i = 0; i < v.size() * 2; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+        return h; };
+    auto nz16 = [](const std::vector<uint16_t>& v) {
+        size_t n = 0; for (auto h : v) n += ((h & 0x7fffu) != 0); return n; };
 
     // ---- correctness at plane 0 vs the oracle (tol-graded family: rel_l2 bar) ----
     std::vector<uint16_t> yNv((size_t)M * N), yRo((size_t)M * N), yGv((size_t)M * N), ySk((size_t)M * N);
@@ -507,6 +703,7 @@ int main(int argc, char** argv) {
             clock_gettime(CLOCK_MONOTONIC, &t0);
             if (which == 0) launch_tile(r % rot);
             else if (which == 1) launch_skinny(r % rot);
+            else if (which >= 3) launch_skinny2(r % rot, kArms2[which - 3].wpb, kArms2[which - 3].ww);
             else launch_gemv(r % rot);
             clock_gettime(CLOCK_MONOTONIC, &t1);
             ts.push_back((t1.tv_sec - t0.tv_sec) + 1e-9 * (t1.tv_nsec - t0.tv_nsec));
@@ -528,6 +725,50 @@ int main(int argc, char** argv) {
                M, rot, mgv * 1e3, p2g * 1e3, p8g * 1e3, gb / mgv);
         printf("DELTA TILE/GEMV M=%d | (C/A-1)*100 = %+.1f%%\n", M, (mgv / mt - 1.0) * 100.0);
         printf("DELTA SKINNY/GEMV M=%d | (C/B-1)*100 = %+.1f%%\n", M, (mgv / msk - 1.0) * 100.0);
+    }
+    // ---- Q54: correctness gate + crossed-order timing of the window/grid arms ----
+    {
+        const int round_no = getenv("F8SK_ROUND") ? atoi(getenv("F8SK_ROUND")) : 0;
+        const bool rev = getenv("F8SK_REV") && atoi(getenv("F8SK_REV")) != 0;
+        auto abline = [&](const char* arm, double tmed, double gbs,
+                          size_t nz, size_t tot) {
+            printf("AB r=%d arm=%s ROW M=%d K=%lld N=%lld rot=%d reps=%d | t_med=%.3f ms"
+                   "  e4m3 %.1f GB/s nonzero=%llu/%llu\n",
+                   round_no, arm, M, K, N, rot, reps, tmed * 1e3, gbs,
+                   (unsigned long long)nz, (unsigned long long)tot); };
+        const size_t ytot = (size_t)M * N;
+        printf("YHASH arm=base ROW M=%d K=%lld N=%lld yhash=%016llx nonzero=%llu/%llu\n",
+               M, K, N, (unsigned long long)fnv(ySk),
+               (unsigned long long)nz16(ySk), (unsigned long long)ytot);
+        std::vector<uint16_t> yW(ytot);
+        for (int a = 0; a < NARMS2; ++a) {          // bit-identity gate, plane 0
+            CK(hipMemset(dY, 0, (size_t)64 * N * 2));
+            launch_skinny2(0, kArms2[a].wpb, kArms2[a].ww);
+            CK(hipMemcpy(yW.data(), dY, ytot * 2, hipMemcpyDeviceToHost));
+            unsigned long long eq = 0;
+            for (size_t i = 0; i < ytot; ++i) eq += (yW[i] == ySk[i]);
+            printf("CHECKW arm=%s ROW M=%d K=%lld N=%lld rel_l2_vs_oracle=%.2e"
+                   " yhash=%016llx bitwise_vs_SKINNY=%llu/%llu nonzero=%llu/%llu\n",
+                   kArms2[a].name, M, K, N, rel_l2_h(yW, yNv),
+                   (unsigned long long)fnv(yW), eq, (unsigned long long)ytot,
+                   (unsigned long long)nz16(yW), (unsigned long long)ytot);
+            fflush(stdout);
+        }
+        abline("TILE", mt, gb / mt, nz16(yRo), ytot);
+        abline("base", msk, gb / msk, nz16(ySk), ytot);
+        if (M <= 8 && gemv_rc == 0) abline("GEMV", mgv, gb / mgv, nz16(yGv), ytot);
+        std::vector<int> seq;
+        for (int a = 0; a < NARMS2; ++a) seq.push_back(3 + a);
+        if (rev) std::reverse(seq.begin(), seq.end());   // crossed order across rounds
+        for (int idx : seq) {
+            const Arm2& a = kArms2[idx - 3];
+            double med, p2x, p8x;
+            timeit(idx, &med, &p2x, &p8x);
+            CK(hipMemcpy(yW.data(), dY, ytot * 2, hipMemcpyDeviceToHost));
+            abline(a.name, med, gb / med, nz16(yW), ytot);
+            printf("   %s p2=%.3f p8=%.3f ms\n", a.name, p2x * 1e3, p8x * 1e3);
+            fflush(stdout);
+        }
     }
     (void)f32_to_e4m3_h;
     return 0;
