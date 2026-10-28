@@ -3866,3 +3866,53 @@ KV: arch 64L = 16 full-attn + 48 GDN (hybrid-aware confirmed): 64 KiB/token bf16
 GPTQ-Int4 DONOR: REJECTED. Confirmed 28.17 GiB container; 10.67B params still BF16 — only the 64 FFN matrices were GPTQ'd (I32 17.11B elems = 64x(34816x5120+5120x17408) exactly); attn/GDN/embeddings untouched. Dequant->re-mxfp4 stacks double 4-bit loss on 62% with zero byte benefit vs current donor (amd/Qwen3.8-27B-Quark-AWQ-MXFP4 quantizes 24.33B values vs GPTQ 17.11B).
 INTEL NOTE: "XTX handles int4 well" = v_dot4_i32_iu8 (RDNA3) — already the planned W4A8 kernel path (Q36 lineage), independent of which upstream 4-bit checkpoint we store. Decode speed is bytes-moved; format politics irrelevant.
 Queue: +Q59 (LM export slim: draft sidecar + vision drop + fp8 embeddings -> 14.46 GiB), +Q60 (q8_0 KV flag/default + worst-case slot policy; enables large-ctx on 24 GiB). Q58 stands (fast-band plane still 26.4 GiB — in-place design or bigger card; export slim alone does NOT fix it).
+
+## WINDOW 65 (2026-10-28, AWST ~13:30-18:30) — Q59 + Q60 EXPORT/CTX CAMPAIGN (USER-GREENLIT; TWO CARD SESSIONS, ONE CHILD AT A TIME)
+- USER DIRECTIVE (lives here): ALL large-file work executes entirely on cat — never
+  shuttle large files host<->cat. Both children ran fully on cat.
+- Q59 (child, XTX session, artifacts cat:~/scratch/r3d/w65_q59/): LM-slim export SHIPPED
+  to bench: out/qwen3.8-27b-lm-slim.rad = 16,799,860,736 B = 15.646 GiB (from
+  19,377,119,232 = 18.048): dflash draft -> sidecar (1.55 GiB ARCHIVE ONLY, --draft-model
+  NOT IMPLEMENTED core/main.cpp:612-620), vision dropped, meta gates zeroed so no flag
+  combo can request missing weights. LM bytes bit-identical: 691/691 per-entry sha256;
+  manager-verified file size + md5 fabde399 head. 3-prompt temp-0 probes character-
+  identical to original (df0); df3-vs-df0 reasoning drift = speculation flag changes
+  dispatch shapes, NOT the export. FALSIFIED HEADLINE: file-slim frees 0 GiB VRAM at
+  df0 (draft/vision never resident at mm-max-patches 0 — measured Q60); pays +2.46 GiB
+  ONLY vs the df3 serve line (draft planes 1.59 + drafter KV group 0.77), which needs
+  draft dropped from serve. fp8-embd variant (14.462 GiB, rel-RMS 9.9e-4) ENGINE-BLOCKED
+  at declare, pre-VRAM: qwen35_fp8.cpp:707 pins token_embd to RAD_BF16; rad_builder.cpp:
+  205-220 refuses non-F32-widening stored encodings; embed_lookup_q r4d_model_bf16.hip:
+  1082 single-whole-table-scale only, no g128 path. Do not deploy that file. -> Q61.
+- Q60 (child, XTX session, artifacts cat:~/scratch/r3d/w66_q60/ 18 legs + w66_report.md):
+  q8/fp8 KV FLAG ALREADY EXISTS engine-side: --kv-cache-dtype bf16|fp8|fp8_v4|k6_v4
+  (manager-verified in --help; help text names Qwen3.8-27B). Dtype fixed
+  core/engine_bringup.cpp:878 (RAD_F8E4M3), default core/rad_core.h:744, parse
+  core/config.cpp:464. Worst-case slot policy = KVManager::ceiling() core/mem/kv.cpp:
+  266-277 (blocks = max_seqs x ceil(ctx/16)), budget core/mem/vram_budget.cpp:32-82.
+  ALL 9 fp8 legs died ~5 s: kv_store + qk_norm_rope_gate_kv_store device bands "kv_dtype
+  in {bf16}, have fp8_e4m3" (32 bands = 2 ops x 16 full-attn layers, head_dim=256;
+  manager-verified verbatim). Engine needs ZERO changes; missing piece is libr3d
+  fp8-256 kernel instantiations (store+descale side, then paged-attn arms) -> Q62.
+- POLICY LAW (measured, df0, n=5): max-num-seqs 4/2/1 @8k -> pool 2.57/1.29/0.66 GiB,
+  decode 4.69/4.74/4.79 tok/s FLAT. Slot over-provision is pure free-VRAM: 4->1
+  reclaims 1.93 GiB at zero speed cost. BF16 CEILING 80,080 tokens @seqs=1 (5.03 GiB
+  pool); 16k/32k/64k boot fully backed; 131,072 boots CAPPED 61%, prompts >80,080
+  refused 400, engine's own warning names --kv-cache-dtype fp8 (+3,187 MiB). fp8 math
+  (measured 64->32 KiB/tok): 131k needs 4.14 GiB <= 5.03 observed -> fits ~0.9 GiB
+  headroom. fp8-256 kernels = the single missing piece for 131K CAPACITY.
+- SPEED-vs-CTX CURVE (gen-128 e2e, df0): 4.1 @2.6k -> 1.35 @9.8k -> 0.68 @19.7k ->
+  0.35 @38.4k -> 0.16 @78.6k tok/s. Solve: prefill ~163 tok/s, decode ~8.6 @4k, ~0.5
+  @79k. DTYPE UNLOCKS CAPACITY, NOT SPEED: 131K decode on this card is sub-tok/s
+  without spec-decode even at fp8. CROSS-VALIDATION BONUS: df0 8k floor 4.7 vs w62
+  df3 serve 12.8 = MEASURED 2.7x spec-decode factor on the live line — dflash is
+  earning its keep (also means any future df0 serve line must be judged vs 4.7, not 12.8).
+- QUEUE: Q59 CLOSED (sidecar+vision-drop = archive + df0-line enabler; fp8-embd split
+  out). +Q61 (fp8 token_embd: engine declare/builder surface + embed kernel g128 path;
+  -1.18 GiB, three file:line sites known). +Q62 (libr3d fp8-256 KV kernels: kv_store +
+  descale + paged-attn arms; THE 131K path; quality-gate via --kld-record/--kld-ref per
+  Q60 report section D). Q58/Q28/Q41 unchanged; Q47 card pass + Q54 tail (M33-64) stand.
+- SERVE STATE AT CLOSE: spec9g Up on :9008 (9b df3) — /tokenize 200 manager-verified
+  after BOTH children (payload key is "prompt", not "text"). flashnext untouched
+  (healthy throughout). No stray containers. /srv/models/rad untouched. 27B serve
+  remains OFF (owner's call; v163 27B line measured but not deployed).
