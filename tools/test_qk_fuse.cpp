@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "rad_abi.h"
+#include "rad_plugin.h"      /* Q62: the fp8 store test's oracle IS the ABI encoder */
 
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) {                        \
     std::printf("HIP FAIL %s @%d: %s\n", #x, __LINE__, hipGetErrorString(e_));          \
@@ -55,6 +56,15 @@ struct Lib {
         for (int i = 0; i < count(); ++i) {
             const RadKernelInfo* k = at(i);
             if (k && std::strcmp(k->op, op) == 0 && k->domain == RAD_DOMAIN_DEVICE) return k;
+        }
+        return nullptr;
+    }
+    /* Q62: op "kv_store" and "qk_norm_rope_gate_kv_store" each claim two rows (bf16,
+     * fp8_e4m3); a differential case picks one by row name. */
+    const RadKernelInfo* row_named(const char* name) {
+        for (int i = 0; i < count(); ++i) {
+            const RadKernelInfo* k = at(i);
+            if (k && std::strcmp(k->name, name) == 0 && k->domain == RAD_DOMAIN_DEVICE) return k;
         }
         return nullptr;
     }
@@ -407,6 +417,247 @@ static void case_run(Lib& lib, std::mt19937& rng, const Geo& g, bool fuse_kv,
     if (getenv("QK_DIAG")) std::fprintf(stderr, "PHASE freed %s\n", tag);
 }
 
+
+/* ================= Q62: the fp8 (E4M3) store rows =================
+ * The oracle is not the kernel's own arithmetic re-spelled: it is the ABI's host
+ * rad_f32_to_fp8e4m3 (rad_plugin.h) -- the very encoder libref's stt() uses. Chain side:
+ * qk_norm_rope_gate (prologue row) + kv_store_fp8 on its k_out, exactly what the engine
+ * would run unfused. Fused side: qk_norm_rope_gate_kv_store_fp8 on pitched views, as
+ * live hands them. Byte-identity is the law on both legs.
+ * Row-count law (the dead-row bug class): M sweeps past one wave's worth of
+ * (token,head) blocks (grid = M x (nq+nkv)), and slots scatter across MORE block rows
+ * than a wave, so a row that silently never dispatched cannot hide. Slots include
+ * negative and >= nb*bs: those cache bytes must stay poisoned at 0xA5. */
+static void fp8_store_case(Lib& lib, std::mt19937& rng, int hd, int M, int nq, int nkv,
+                           int bs, int pitch, double kscale, double vscale) {
+    char tag[160];
+    const int fails_before = g_fail;
+    const int nb = 9;                                    /* fixed pool: slots scatter wide */
+    std::snprintf(tag, sizeof tag, "F8-store hd=%d M=%d nq=%d nkv=%d bs=%d%s ks=%g vs=%g",
+                  hd, M, nq, nkv, bs, pitch ? " pitch" : "", kscale, vscale);
+    std::vector<Buf*> keep;
+    auto mkbuf = [&](uint32_t dt, std::vector<int64_t> sh) {
+        Buf* b = new Buf(); b->init(dt, std::move(sh)); keep.push_back(b); return b;
+    };
+    const long long kcols = (long long)nkv * hd;
+    const long long kpitch = kcols + (pitch == 1 ? 96 : pitch == 2 ? 4 : 0);
+    const long long cfp = 2LL * hd + (pitch == 1 ? 96 : pitch == 2 ? 4 : 0);
+
+    Buf* k   = mkbuf(RAD_BF16, {M, kpitch});
+    Buf* v   = mkbuf(RAD_BF16, {M, kpitch});
+    Buf* slot = mkbuf(RAD_I32, {M});
+    Buf* cache = mkbuf(RAD_F8E4M3, {nb, nkv, bs, cfp});
+    for (size_t i = 0; i < k->n(); ++i) {                    /* amp spread: normals, big (clamp), tiny (flush) */
+        float amp = (i % 7 == 0) ? 600.0f : (i % 11 == 0) ? 0.001f : 1.0f;
+        std::uniform_real_distribution<float> u(-amp, amp);
+        float f = u(rng); uint32_t u32; std::memcpy(&u32, &f, 4);
+        ((uint16_t*)k->h.data())[i] = (uint16_t)(u32 >> 16);
+        float f2 = u(rng) * (amp * 0.7f); std::memcpy(&u32, &f2, 4);
+        ((uint16_t*)v->h.data())[i] = (uint16_t)(u32 >> 16);
+    }
+    std::memset(cache->h.data(), 0xA5, cache->h.size());
+    /* Slots: a BIJECTION (coprime stride mod the pool) over valid slots, so every slot
+     * has exactly one writer and the oracle is order-free; plus dedicated padding (-1)
+     * and out-of-range (>= nb*bs) rows that must leave their bytes at the poison. */
+    const int32_t total = (int32_t)(nb * bs);
+    for (int i = 0; i < M; ++i) {
+        int32_t s;
+        if (i % 13 == 5) s = -1;
+        else if (i % 17 == 9) s = (int32_t)(total + (i % bs));
+        else s = (int32_t)((i * 5) % total);
+        ((int32_t*)slot->h.data())[i] = s;
+    }
+
+    const RadKernelInfo* ks8 = lib.row_named("kv_store_fp8");
+    if (!ks8) { std::printf("%-52s no kv_store_fp8 row\n", tag); ++g_fail; for (auto* b : keep) delete b; return; }
+
+    /* ---- direct: kv_store_fp8 against the ABI-encoder oracle, byte for byte ---- */
+    {
+        std::vector<Buf*> o{ k, v, slot, cache };
+        std::vector<RadParam> p{ Pi("head_dim", hd), Pi("block_size", bs),
+                                 Pi("n_head_kv", nkv), Ps("kv_dtype", "fp8_e4m3"),
+                                 Pf("k_scale", kscale), Pf("v_scale", vscale) };
+        int rc = run(ks8, o, p);
+        if (rc) { std::printf("%-52s kv_store_fp8 rc=%d\n", tag, rc); ++g_fail; }
+        const double kmul = 1.0 / kscale, vmul = 1.0 / vscale;
+        const uint16_t* kp = (const uint16_t*)k->h.data();
+        const uint16_t* vp = (const uint16_t*)v->h.data();
+        const int32_t*  sl = (const int32_t*)slot->h.data();
+        uint8_t* cp = (uint8_t*)cache->h.data();
+        std::vector<uint8_t> want(cache->h.size(), 0xA5);
+        for (int t = 0; t < M; ++t) {
+            const int32_t s = sl[t];
+            if (s < 0 || s / bs >= nb) continue;
+            const int64_t b = s / bs, off = s % bs;
+            for (int h = 0; h < nkv; ++h) {
+                uint8_t* dst = cp + (((b * nkv + h) * bs + off) * cfp);
+                uint8_t* wdst = want.data() + (((b * nkv + h) * bs + off) * 2 * hd);
+                for (int d = 0; d < hd; ++d) {
+                    const uint16_t kb = kp[(size_t)t * kpitch + (size_t)h * hd + d];
+                    const uint16_t vb = vp[(size_t)t * kpitch + (size_t)h * hd + d];
+                    const float kx = (float)((uint32_t)kb << 16);
+                    const float vx = (float)((uint32_t)vb << 16);
+                    const uint8_t kcode = rad_f32_to_fp8e4m3(kx * (float)kmul);
+                    const uint8_t vcode = rad_f32_to_fp8e4m3(vx * (float)vmul);
+                    wdst[d] = kcode; wdst[hd + d] = vcode;
+                }
+            }
+        }
+        /* Compare byte-for-byte over the dense footprint (pitch columns must stay 0xA5). */
+        for (int64_t b = 0; b < nb; ++b)
+            for (int64_t h = 0; h < nkv; ++h)
+                for (int64_t off = 0; off < bs; ++off)
+                    for (int64_t e = 0; e < 2 * hd; ++e) {
+                        const uint8_t got = cp[((b * nkv + h) * bs + off) * cfp + e];
+                        const uint8_t exp = want[((b * nkv + h) * bs + off) * 2 * hd + e];
+                        if (got != exp) {
+                            ++g_fail;
+                            if (g_fail - fails_before < 6)
+                                std::printf("  MISMATCH b=%lld h=%lld off=%lld e=%lld got=%02x exp=%02x\n",
+                                            b, h, off, e, got, exp);
+                        }
+                    }
+        for (int64_t b = 0; b < nb; ++b)
+            for (int64_t h = 0; h < nkv; ++h)
+                for (int64_t off = 0; off < bs; ++off)
+                    for (int64_t e = 2 * hd; e < cfp; ++e)
+                        if (cp[((b * nkv + h) * bs + off) * cfp + e] != 0xA5) {
+                            ++g_fail;
+                            if (g_fail - fails_before < 2) std::printf("  REDZONE walked at e=%lld\n", e);
+                        }
+        if (!g_fail) ++g_pass;
+    }
+    if (getenv("QK_DIAG")) std::fprintf(stderr, "PHASE f8-direct %s\n", tag);
+    for (auto* b : keep) delete b;
+    std::printf("%-52s %s\n", tag, g_fail > fails_before ? "MISMATCH (above)" : "ok");
+}
+
+/* Fused-vs-chain fp8: qk_norm_rope_gate + kv_store_fp8 vs qk_norm_rope_gate_kv_store_fp8,
+ * identical seeds, pitched views, byte-identical cache. hd=256 mirrors the 27B. */
+static void fp8_fused_case(Lib& lib, std::mt19937& rng, int hd, int rot, int M, int nq,
+                           int nkv, int bs, double kscale, double vscale) {
+    char tag[160];
+    const int fails_before = g_fail;
+    const int nb = 9;
+    std::snprintf(tag, sizeof tag, "F8-fused hd=%d rot=%d M=%d nq=%d nkv=%d bs=%d ks=%g",
+                  hd, rot, M, nq, nkv, bs, kscale);
+    const int CS_ROWS = 96;
+    std::vector<Buf*> keep;
+    auto mkbuf = [&](uint32_t dt, std::vector<int64_t> sh) {
+        Buf* b = new Buf(); b->init(dt, std::move(sh)); keep.push_back(b); return b;
+    };
+    const long long kcols = (long long)nkv * hd;
+    const long long kpitch = kcols + 96;                 /* pitched everywhere: live shape */
+
+    Buf* qg   = mkbuf(RAD_BF16, {M, (long long)nq * 2 * hd});
+    Buf* kc   = mkbuf(RAD_BF16, {M, kcols});             /* chain k, dense */
+    Buf* kf   = mkbuf(RAD_BF16, {M, kpitch});            /* fused k, pitched image */
+    Buf* vc   = mkbuf(RAD_BF16, {M, kcols});
+    Buf* vf   = mkbuf(RAD_BF16, {M, kpitch});
+    Buf* wq   = mkbuf(RAD_BF16, {hd});
+    Buf* wk   = mkbuf(RAD_BF16, {hd});
+    Buf* pos  = mkbuf(RAD_I32, {M});
+    Buf* slot = mkbuf(RAD_I32, {M});
+    Buf* cs   = mkbuf(RAD_F32, {CS_ROWS, rot});
+    Buf* qco  = mkbuf(RAD_BF16, {M, (long long)nq * hd});
+    Buf* qfo  = mkbuf(RAD_BF16, {M, (long long)nq * hd});
+    Buf* cchain = mkbuf(RAD_F8E4M3, {nb, nkv, bs, 2LL * hd});
+    Buf* cfused = mkbuf(RAD_F8E4M3, {nb, nkv, bs, kpitch == kcols ? 2LL * hd : 2LL * hd + 96});
+    const long long cfp = cfused->shape[3];
+
+    fill_bf16(rng, *qg, 1.0f); fill_bf16(rng, *kc, 1.0f); fill_bf16(rng, *vc, 1.0f);
+    fill_bf16(rng, *wq, 0.5f); fill_bf16(rng, *wk, 0.5f);
+    for (size_t i = 0; i < cs->n(); ++i) ((float*)cs->h.data())[i] =
+        std::uniform_real_distribution<float>(-1.f, 1.f)(rng);
+    for (int i = 0; i < M; ++i) {
+        ((int32_t*)pos->h.data())[i] = (int)(rng() % (unsigned)(CS_ROWS - 1)) + 1;
+        int32_t s;
+        if (i % 13 == 5) s = -1;
+        else if (i % 17 == 9) s = (int32_t)(nb * bs + (i % bs));
+        else s = (int32_t)((i * 5) % (nb * bs));       /* bijection: order-free oracle */
+        ((int32_t*)slot->h.data())[i] = s;
+    }
+    std::memset(cchain->h.data(), 0xA5, cchain->h.size());
+    std::memset(cfused->h.data(), 0xA5, cfused->h.size());
+
+    const RadKernelInfo* pro  = lib.row_named("qk_norm_rope_gate");
+    const RadKernelInfo* ks8  = lib.row_named("kv_store_fp8");
+    const RadKernelInfo* fus8 = lib.row_named("qk_norm_rope_gate_kv_store_fp8");
+    if (!pro || !ks8 || !fus8) { std::printf("%-52s missing row\n", tag); ++g_fail;
+        for (auto* b : keep) delete b; return; }
+
+    auto seed_pitched = [&](Buf* img, const std::vector<uint8_t>& dense) {
+        for (auto& b : img->h) b = 0xA5;
+        const uint16_t* s = (const uint16_t*)dense.data();
+        uint16_t* d = (uint16_t*)img->h.data();
+        for (long long t = 0; t < M; ++t)
+            for (long long c = 0; c < kcols; ++c) d[t * kpitch + c] = s[t * kcols + c];
+    };
+
+    /* ---- chain ---- */
+    {
+        std::vector<Buf*> o{ qg, kc, cs, pos, wq, wk, qco, kc };
+        std::vector<RadParam> p{ Pi("M", M), Pi("head_dim", hd), Pi("n_head", nq),
+                                 Pi("n_head_kv", nkv), Pi("rot", rot), Ps("q_dtype", "bf16"),
+                                 Pf("eps", 1e-6), Pf("wadd", 0.0), Pi("cs_f32", 1) };
+        int rc = run(pro, o, p);
+        if (rc) { std::printf("%-52s chain prologue rc=%d\n", tag, rc); ++g_fail; }
+        seed_pitched(vf, vc->h);
+        std::vector<Buf*> o2{ kc, vf, slot, cchain };        /* k = dense k_out, v pitched */
+        std::vector<RadParam> p2{ Pi("head_dim", hd), Pi("block_size", bs),
+                                  Pi("n_head_kv", nkv), Ps("kv_dtype", "fp8_e4m3"),
+                                  Pf("k_scale", kscale), Pf("v_scale", vscale) };
+        rc = run(ks8, o2, p2);
+        if (rc) { std::printf("%-52s chain kv_store_fp8 rc=%d\n", tag, rc); ++g_fail; }
+    }
+    if (getenv("QK_DIAG")) std::fprintf(stderr, "PHASE f8-chain %s\n", tag);
+
+    /* ---- fused: pitched k/v/cache views, cache wider than 2*hd ---- */
+    seed_pitched(kf, kc->h); seed_pitched(vf, vc->h);
+    Buf kf_v; kf_v.dtype = RAD_BF16; kf_v.shape = {M, nkv, hd};
+    kf_v.strides = {kpitch, hd, 1}; kf_v.alias = kf;
+    Buf vf_v; vf_v.dtype = RAD_BF16; vf_v.shape = {M, nkv, hd};
+    vf_v.strides = {kpitch, hd, 1}; vf_v.alias = vf;
+    Buf cf_v; cf_v.dtype = RAD_F8E4M3; cf_v.shape = {nb, nkv, bs, 2 * hd};
+    cf_v.strides = {nkv * bs * cfp, bs * cfp, cfp, 1}; cf_v.alias = cfused;
+    std::memset(qfo->h.data(), 0, qfo->h.size());
+    {
+        keep.push_back(new Buf()); keep.back()->present = false;   /* absent gate_out slot */
+        std::vector<Buf*> o{ qg, &kf_v, cs, pos, wq, wk, qfo, &kf_v, keep.back(),
+                             &vf_v, slot, &cf_v };
+        std::vector<RadParam> p{ Pi("M", M), Pi("head_dim", hd), Pi("n_head", nq),
+                                 Pi("n_head_kv", nkv), Pi("rot", rot), Ps("q_dtype", "bf16"),
+                                 Pf("eps", 1e-6), Pf("wadd", 0.0), Pi("cs_f32", 1),
+                                 Pi("block_size", bs), Ps("kv_dtype", "fp8_e4m3"),
+                                 Pf("k_scale", kscale), Pf("v_scale", vscale) };
+        int rc = run(fus8, o, p);
+        if (rc) { std::printf("%-52s fused rc=%d\n", tag, rc); ++g_fail;
+            for (auto* b : keep) delete b; return; }
+    }
+    if (getenv("QK_DIAG")) std::fprintf(stderr, "PHASE f8-fused %s\n", tag);
+
+    /* ---- compare caches byte for byte (chain dense vs fused pitched) ---- */
+    {
+        const uint8_t* s = cfused->h.data();
+        for (int64_t b = 0; b < nb; ++b)
+            for (int64_t h = 0; h < nkv; ++h)
+                for (int64_t off = 0; off < bs; ++off)
+                    for (int64_t e = 0; e < 2 * hd; ++e) {
+                        const uint8_t got = s[((b * nkv + h) * bs + off) * cfp + e];
+                        const uint8_t exp = cchain->h[((b * nkv + h) * bs + off) * 2 * hd + e];
+                        if (got != exp) {
+                            ++g_fail;
+                            if (g_fail - fails_before < 6)
+                                std::printf("  MISMATCH b=%lld h=%lld off=%lld e=%lld got=%02x exp=%02x\n",
+                                            b, h, off, e, got, exp);
+                        }
+                    }
+        if (!g_fail) ++g_pass;
+    }
+    std::printf("%-52s %s\n", tag, g_fail > fails_before ? "MISMATCH (above)" : "ok");
+    for (auto* b : keep) delete b;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { std::printf("usage: %s <libr3d.so>\n", argv[0]); return 2; }
     Lib lib; lib.open(argv[1]);
@@ -431,6 +682,30 @@ int main(int argc, char** argv) {
             for (int M : {1, 16})
                 if (pick(idx)) case_run(lib, rng, Geo{hd, rot, M, 8, 2, 16, 1, 1, 0, 0}, false, false, false);
                 else (void)rng;
+    /* Q62 fp8 store coverage: the compiled widths, past-one-wave row counts, the
+     * alignment-split (pitch) pair, scales off the identity, and the fused-vs-chain
+     * differential at the 27B's shape (hd=256, nq=8, nkv=2). */
+    if (!only || atoi(only) >= 200) {
+        struct F8Case { int hd, M, nq, nkv, bs, pitch; double ks, vs; };
+        static const F8Case f8[] = {
+            { 256, 131, 8, 2, 16, 0, 1.0, 1.0 },
+            { 256,  64, 8, 2, 16, 1, 1.0, 1.0 },
+            { 256,  17, 8, 2, 16, 2, 2.0, 0.5 },      /* odd pitch: the scalar walk */
+            { 128, 256, 8, 2, 16, 0, 1.0, 1.0 },
+            { 128,  33, 8, 2, 16, 1, 0.25, 4.0 },
+            {  64,  64, 8, 2, 16, 2, 1.0, 1.0 },
+        };
+        static const F8Case f8f[] = {
+            { 256, 131, 8, 2, 16, 0, 1.0, 1.0 },
+            { 256,  64, 8, 2, 16, 0, 2.0, 2.0 },
+            { 128, 131, 8, 2, 16, 0, 1.0, 1.0 },
+            {  64,  64, 8, 2, 16, 0, 0.5, 0.5 },
+        };
+        if (!only || atoi(only) == 200)
+            for (auto& c : f8)  fp8_store_case (lib, rng, c.hd, c.M, c.nq, c.nkv, c.bs, c.pitch, c.ks, c.vs);
+        if (!only || atoi(only) == 201)
+            for (auto& c : f8f) fp8_fused_case (lib, rng, c.hd, c.hd, c.M, c.nq, c.nkv, c.bs, c.ks, c.vs);
+    }
     if (!only) {
     for (int M : {1, 8})
         case_run(lib, rng, Geo{128, 128, M, 8, 2, 16, 1, 1, 0, M == 8}, true, false, false);

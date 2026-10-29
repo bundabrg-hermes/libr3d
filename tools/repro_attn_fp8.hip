@@ -31,7 +31,8 @@ static float bf16_f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; memcp
 static int envid(const char* k, int dflt) { const char* v = getenv(k); return v ? atoi(v) : dflt; }
 
 int main() {
-    const int HD = 128, BS = 16, NB = 4, QH = 8, KVH = 2, GQA = 4;
+    const int HD = envid("REPRO_HD", 128);   /* Q62: 256 exercises the fp8 staging arms */
+    const int BS = 16, NB = 4, QH = 8, KVH = 2, GQA = 4;
     const int QLEN = envid("REPRO_QLEN", 8);
     const int CTX  = envid("REPRO_CTX", 52);          // keys 48..51 land in unmapped block 3
     const int WIN  = envid("REPRO_WIN", 2048);
