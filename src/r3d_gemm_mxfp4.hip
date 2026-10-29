@@ -1842,6 +1842,40 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
         static std::vector<Q8xScr> q8x_scr;
         static bool q8x_scratch_dead = false;
 
+        /* ---- Q55 guard ledger (stderr bookkeeping only) --------------------------------
+         * Pure logging around the plane guard below. NO field here is read by any
+         * decision arm: the guard condition, the hipMalloc/repack walk, the
+         * q8x_cache/q8x_failed contents and every fallback are untouched (verbatim
+         * discipline). Three fixes for the window-63 finding (319 identical guard
+         * lines per 27B-class serve boot, no cumulative budget, no fit verdict):
+         *   1. cumulative accounting: q8x_bytes_want sums the plane bytes of EVERY
+         *      distinct key the guard has evaluated (planned + committed);
+         *      q8x_bytes_have is the committed subset. The cache keys on the operand
+         *      pointer, so by the per-tensor replication law the true budget is
+         *      bytes-per-plane x tensor count (~1.47x the weight set on a 27B-class
+         *      model), not the distinct-shape sum.
+         *   2. stderr dedup: ONE line per distinct (N,K) shape -- on that shape's
+         *      first decline, carrying the running cumulative -- instead of one line
+         *      per tensor. The per-shape sharing count lands in the summary.
+         *   3. one end-of-declare summary line (once per process): total plane
+         *      budget vs free VRAM at guard time and whether the model class can
+         *      EVER fit. End-of-declare signal: the first REVISIT of an already-
+         *      evaluated key (cache hit or known-dead). Every weight tensor is
+         *      touched exactly once per forward pass, so the first revisit proves
+         *      every unique tensor has passed the guard at least once and the
+         *      ledger is complete. (R3D_MXFP4_Q8X=0 never enters this branch: the
+         *      ledger stays empty and stderr stays silent, as before.)
+         * Why-codes are split (guard-refusal vs guard-passed-then-failed) per the
+         * serve-diagnostics law: only the guard split proves the guard, not the
+         * allocator, made the call. Same single-dispatch-thread discipline as
+         * q8x_cache/q8x_failed above. */
+        struct Q8xShape { int64_t n, k; int tensors, declined, committed; };
+        static std::vector<Q8xShape> q8x_shapes;
+        static int64_t q8x_bytes_want = 0, q8x_bytes_have = 0;
+        static int64_t q8x_decline_guard = 0, q8x_decline_alloc = 0;
+        static size_t q8x_free_at_first = 0, q8x_total_at_first = 0, q8x_free_at_last = 0;
+        static bool q8x_have_first_free = false, q8x_summary_done = false;
+
         uint8_t* plane = nullptr;
         bool known_dead = false;
         for (const Q8xEnt& e : q8x_failed)
@@ -1877,12 +1911,96 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
                         else { (void)hipFree(nb); plane = nullptr; }
                     }
                 }
-                if (!plane) {
-                    q8x_failed.push_back(Q8xEnt{P.B, P.BS, P.N, P.K, nullptr});
-                    fprintf(stderr, "libr3d: mxfp4 q8x plane unavailable (N=%lld K=%lld), "
-                                    "shipped walk keeps this band\n", (long long)P.N, (long long)P.K);
+                if (!plane) q8x_failed.push_back(Q8xEnt{P.B, P.BS, P.N, P.K, nullptr});
+
+                /* Q55 ledger: account this key -- BOTH arms (committed or declined).
+                 * Reads only decision OUTPUTS (plane, build) and the locals the guard
+                 * already computed; writes only the ledger and stderr. vfree/vtot are
+                 * only meaningful when hipMemGetInfo succeeded, which is exactly the
+                 * vtot != 0 case (both stay 0 on failure, and the guard declined). */
+                q8x_bytes_want += bytes;
+                if (vtot) {
+                    if (!q8x_have_first_free) {
+                        q8x_have_first_free = true;
+                        q8x_free_at_first = vfree; q8x_total_at_first = vtot;
+                    }
+                    q8x_free_at_last = vfree;
+                }
+                size_t si = q8x_shapes.size();
+                for (size_t i = 0; i < q8x_shapes.size(); ++i)
+                    if (q8x_shapes[i].n == P.N && q8x_shapes[i].k == P.K) { si = i; break; }
+                if (si == q8x_shapes.size()) q8x_shapes.push_back(Q8xShape{P.N, P.K, 0, 0, 0});
+                Q8xShape& sh = q8x_shapes[si];
+                ++sh.tensors;
+                const double q55_gib = 1073741824.0;
+                if (plane) {
+                    q8x_bytes_have += bytes;
+                    ++sh.committed;
+                } else {
+                    ++sh.declined;
+                    if (!build) ++q8x_decline_guard; else ++q8x_decline_alloc;
+                    /* dedup: one line per (N,K) shape, on its first decline */
+                    if (sh.declined == 1)
+                        fprintf(stderr, "libr3d: mxfp4 q8x plane declined (N=%lld K=%lld, "
+                                        "%.1f MiB/tensor): cumulative q8x budget %.1f GiB wanted "
+                                        "/ %.1f GiB committed, %.2f GiB free at guard -- "
+                                        "shipped walk keeps this band\n",
+                                (long long)P.N, (long long)P.K, (double)bytes / 1048576.0,
+                                (double)q8x_bytes_want / q55_gib,
+                                (double)q8x_bytes_have / q55_gib,
+                                (double)q8x_free_at_last / q55_gib);
                 }
             }
+        }
+
+        /* Q55: ONE end-of-declare summary line, emitted once per process the first
+         * time an already-evaluated key is revisited (cache hit or known-dead) --
+         * see the ledger comment for the revisit law. Logging only: no control flow
+         * leaves this block, and every q8x decision above already happened. */
+        if (!q8x_summary_done && (known_dead || plane) && !q8x_shapes.empty()) {
+            q8x_summary_done = true;
+            const double gib = 1073741824.0;
+            int q55_tensors = 0, q55_declined = 0;
+            for (const Q8xShape& s : q8x_shapes) { q55_tensors += s.tensors; q55_declined += s.declined; }
+            char q55_shapes[512]; q55_shapes[0] = '\0';   /* per-shape sharing tally, if it fits */
+            if (q8x_shapes.size() <= 16) {
+                size_t off = 0;
+                for (const Q8xShape& s : q8x_shapes) {
+                    const int w = snprintf(q55_shapes + off, sizeof(q55_shapes) - off,
+                                           "%s%llux%llux%d", off ? " " : "",
+                                           (long long)s.n, (long long)s.k, s.tensors);
+                    if (w < 0 || off + (size_t)w >= sizeof(q55_shapes)) { q55_shapes[0] = '\0'; break; }
+                    off += (size_t)w;
+                }
+            }
+            /* Fit verdict (machine-honest, from observed facts only): planes are
+             * immortal and coexist, so the WHOLE class budget must fit the free VRAM
+             * the first guard check saw -- weights and KV are already resident there,
+             * and every later free reading is smaller only because our own committed
+             * planes eat it. The 512 MiB headroom law is the guard's own constant. */
+            const bool q55_class_fits =
+                (int64_t)q8x_free_at_first - (int64_t(512) << 20) >= q8x_bytes_want;
+            char q55_why[96] = "";   /* why-codes, declined cases only */
+            if (q55_declined != 0)
+                snprintf(q55_why, sizeof(q55_why), " [declines: guard %lld / alloc-or-repack %lld]",
+                         (long long)q8x_decline_guard, (long long)q8x_decline_alloc);
+            char q55_tail[640] = "";
+            snprintf(q55_tail, sizeof(q55_tail), "%s%s%s", q55_why,
+                     q55_shapes[0] ? " [N x K x tensors: " : "", q55_shapes[0] ? q55_shapes : "");
+            if (q55_shapes[0]) std::strncat(q55_tail, "]", sizeof(q55_tail) - std::strlen(q55_tail) - 1);
+            fprintf(stderr, "libr3d: mxfp4 q8x declare summary: %d tensors / %d shapes, "
+                            "plane budget %.1f GiB wanted / %.1f GiB committed, %.2f GiB free "
+                            "(of %.1f GiB) at first guard [guard headroom 512 MiB]: %s%s\n",
+                    q55_tensors, (int)q8x_shapes.size(),
+                    (double)q8x_bytes_want / gib, (double)q8x_bytes_have / gib,
+                    (double)q8x_free_at_first / gib, (double)q8x_total_at_first / gib,
+                    q55_declined == 0 ? "FITS: every q8x plane committed, band live"
+                        : !q55_class_fits ? "CANNOT FIT: this model class needs more plane "
+                              "VRAM than was free after weights+KV; shipped walk keeps "
+                              "every declined band"
+                        : "PARTIAL FIT: class budget would fit the first-guard free; "
+                              "declines came AFTER guard entry (alloc/repack), see why-codes",
+                    q55_tail);
         }
 
         int8_t* q8x_x8 = nullptr; float* q8x_sg = nullptr;
