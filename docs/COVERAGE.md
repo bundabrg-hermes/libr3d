@@ -4022,3 +4022,34 @@ re-verified on cat by the manager before booking.
 - QUEUE AFTER THIS WINDOW: Q62b (fp8-KV deploy-gate legs), Q55-residual
   (withdraw-row + real-boot summary), Q61/Q56 (engine repo radiance-fix), Q57
   (prefill), Q54 cold-tail gate, Q58/Q28/Q41 owner-gated.
+
+## WINDOW 68 (2026-10-29, AWST ~23:30 - 10-30 ~04:00) — Q62b RAN: GATE FAIL ON L1; THE "EVICT-RECOMPUTE" READING FALSIFIED
+
+- Q62b (card child, manager-verified verdict + serve gates): 27B fp8-KV deploy
+  gate on build_v165 (md5 5e9147eb), FULL model df3, same-session
+  bf16 pairing throughout. L1 LONG-DOC KLD **FAIL**: 12 seeded docs
+  1626-2979 words, 38,022 positions — median 2.15e-4 (BETTER than w66 short
+  band), top1 0.965, ppl 0.9969 — but 3/12 docs breach the 5e-3 per-doc mean
+  line (doc03 5.41e-2 = 10.8x, doc06 1.42e-2, doc04 8.33e-3), tail-dominated:
+  rare single-token KLD up to 1.69e+1 on repetitive synthetic prose. L2
+  **PASS-with-falsification**: fp8 131k boot backs 98,752/131,072 (76%),
+  stages to 96.7k clean (restarts 0, needle recall OK at 94.6k), decode
+  15.1->12.0 tok/s graceful. THE EVICTION SURFACE DOES NOT EXIST: window-66's
+  "evict-recompute beyond ~99k" was WRONG — engine refuses prompts > pool cap
+  (400) and hard-fails HTTP 500 when a reply crosses it mid-decode (symmetric
+  bf16 48,720/fp8 98,752, server survives). 131k on this card is FUNCTIONALLY
+  98,752. L3 **PASS**: fp8 accept 0.782/0.664/0.654 vs bf16 0.789/0.666/0.720
+  (>=200 verifies/pos) — fp8 KV does not touch draft engagement. SIDE FINDING:
+  positions 2/3 sit far under the w63 reference (0.88/0.95) on BOTH dtypes in
+  this regime -> regime drift, new row Q66. OVERALL: fp8-KV stays TEST-ONLY;
+  re-gate via Q65 (real-prose trace of the extreme positions). Verdict + per-
+  position rows: cat:~/scratch/r3d/w68_q62b/. Correction to window 66's
+  residual clause above stands (append-only history).
+- SERVE STATE AT CLOSE: spec9g LIVE v163 mount (md5 714bd41b, /tokenize 200
+  manager-verified). v165 still undeployed (owner's call; recommendation
+  unchanged — Q63 floor + Q55 logging). flashnext untouched; no stray
+  containers; card idle; /swapfile.w63 active.
+- QUEUE AFTER THIS WINDOW: Q65 (fp8 extreme-position forensics, card+desk),
+  Q55-residual (withdraw-row + real-boot summary — rides a v165 9b dry-run
+  boot), Q64/Q66 + engine items Q61/Q56 (radiance-fix repo), Q57, Q54
+  cold-tail gate, Q58/Q28/Q41 owner-gated.
