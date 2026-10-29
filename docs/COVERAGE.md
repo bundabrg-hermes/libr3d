@@ -4108,3 +4108,43 @@ re-verified on cat by the manager before booking.
   corpus 8k-vs-131k paired accept curves); engine items Q64/Q56/Q61
   (radiance-fix repo on cat); Q57 (prefill campaign); Q54 cold-tail gate;
   Q55 withdraw-row clause; Q58/Q28/Q41 owner-gated unchanged.
+
+## WINDOW 70 (2026-10-30, AWST) — ENGINE DESK BATCH: Q56 + Q64 PATCHED IN radiance-fix, BOTH RUNTIME-PROVEN; PORT-TO-1.11.0 OWED
+
+- Engine child (desk+card, manager-verified): radiance-fix tree at
+  cat:~/projects/radiance-fix. 4-file git diff (scheduler.{h,cpp},
+  engine_bringup.cpp, sched_test.cpp; +123/-20) left UNCOMMITTED per protocol.
+- Q56 FIXED: open-step wall clock charged to the TPS denominator
+  (pub_step_open_at_ + rates_from_window; EMA floor kept). Runtime pair on
+  GPU1/9b, same 3722-tok prompt: OLD prod 1.11.0 = 3 distinct values across
+  57 polls, 30-poll constant run of 4096 (= 2048-chunk/0.5 s floor) vs wall
+  truth 329.4 t/s (manager re-derived from raw JSON); FIXED = 113/114 polls
+  distinct, monotone decay 7421->369 converging to 163.5 vs true 163.6.
+  Residual (documented): first poll after idle can read burst/0.5-floor once
+  but decays with wall clock — constant replay eliminated.
+- Q64 FIXED: mid-decode pool-cap crossing now close_request(Finished,"length")
+  — partial reply, HTTP 200, clean SSE close — replacing Failed/RAD_E_FULL
+  (500). Runtime pair: OLD HTTP 500 mid-stream at cap 12352 (prompt 7242);
+  FIXED finish=length, prompt 8784 + gen 2977 = 11761 = cap exactly, HTTP 200
+  (manager verified finish_reason in raw JSON). Boot-honesty warning
+  pre-existed; wording corrected to match. Preempt/recompute path out of
+  scope (sanctioned).
+- TESTS: host tier 79/80 before AND after (sole failure videos_test =
+  pre-existing libavcodec absence); GPU tier (radiance-dev v1.11.0 image, HIP,
+  gfx1100) 575/575; +2 new sched tests (open-step rate; cap-crossing end).
+- DEPLOYABILITY CAVEAT (child-found, manager-booked): radiance-fix tree is
+  engine 1.8.1 / plugin-ABI 22; production serve runs 1.11.0 / ABI 26 (v165
+  kernels refused on 1.8.1). Fixed-engine legs paired with libr3d build16
+  (ABI-22) + spec-off. Diagnosis sites byte-compare identical across the two,
+  so the fixes are PORTABLE but not drop-in: porting to the 1.11.0 line is a
+  new queued step before these can reach the live serve.
+- HOST WARNING: cat root disk 100% (3.4 G free, 863/912 GiB used; manager
+  re-verified). Child removed its GPU build tree after install. 17 exited
+  containers incl. superseded rollbacks are prune candidates — OWNER CALL
+  (never auto-pruned; latest rollback spec9g_v163_rollback must survive).
+- SERVE STATE AT CLOSE: spec9g LIVE v165 (post-child /tokenize 200
+  manager-verified, Up, restarts 0); flashnext untouched (Up 32h healthy);
+  no stray GPU1 containers; /swapfile.w63 active.
+- QUEUE AFTER THIS WINDOW: OWNER Q67 fund-vs-demote; OWNER cat-disk prune;
+  Q56/Q64 port-to-1.11.0 (new residual); Q66 (card); Q61; Q57; Q54 cold-tail
+  gate; Q55 withdraw-row clause; Q58/Q28/Q41 owner-gated.
