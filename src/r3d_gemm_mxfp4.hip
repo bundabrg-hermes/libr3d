@@ -1760,7 +1760,16 @@ static int r3d_gemm_nt_q_m4dec_impl(const RadArgs* a, RadStream s, const bool q8
     if (P.K % 128) return RAD_E_UNSUPPORTED;       /* the spans must close (the row gate) */
     if (P.b_pitch % 4 || ((uintptr_t)P.B & 3)) return RAD_E_UNSUPPORTED;
 
-    const int mt = P.M >= 8 ? 8 : P.M >= 4 ? 4 : P.M >= 2 ? 2 : 1;
+    /* Q63 (mirrors issue #18 at the fp8a8 sibling): this ladder rounded DOWN --
+     * at M 3 and M 5..7 it picked an MT below M while every decode kernel here
+     * (dot4 q8x, lm q8x, shipped walk) computes live = min(M, MT) and only
+     * writes rows m < live, so rows live..M-1 were silently NEVER WRITTEN
+     * (M=7: 4 of 7; M=3: 2 of 3). The kernels' own predicates make MT > M
+     * safe: the m-loops break at m >= live and the stores sit behind
+     * m < live -- no read or write ever touches a row >= M. Round UP.
+     * Correctness fix: unconditional, NOT lever-gated -- the withdrawal
+     * paths return the old ROUTING, never the old bug. */
+    const int mt = P.M <= 1 ? 1 : P.M <= 2 ? 2 : P.M <= 4 ? 4 : 8;
     hipStream_t stream = (hipStream_t)(uintptr_t)s;
 
     /* ---- dot2 leg (issue #6): M == 1 only. OPT-IN (R3D_FP4_DOT2=1): measured on the
