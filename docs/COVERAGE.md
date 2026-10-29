@@ -3916,3 +3916,72 @@ Queue: +Q59 (LM export slim: draft sidecar + vision drop + fp8 embeddings -> 14.
   after BOTH children (payload key is "prompt", not "text"). flashnext untouched
   (healthy throughout). No stray containers. /srv/models/rad untouched. 27B serve
   remains OFF (owner's call; v163 27B line measured but not deployed).
+
+## WINDOW 66 (2026-10-29, AWST ~00:00-12:00) — Q62 SHIPPED AS v164 (fp8 KV, THE 131K PATH) + Q47 CLOSED LOSS + Q54 TAIL + Q55 LOGGING MERGED
+
+Four children, one at a time, manager-orchestrated; every headline independently
+re-verified on cat by the manager before booking.
+
+- Q62 (build child, 7 commits 032dfca..12a1fc8 on card/q62-fp8kv256): libr3d fp8
+  (E4M3) KV kernels at head_dim 256 — store side (kv_store_fp8 + fused
+  qk_norm_rope_gate_kv_store_fp8, software RTNE encoder bit-equal to libref,
+  RDNA3 has no HW convert) + read side (F8ST staging arms on the hd256 carve,
+  dedicated r3d_launch256_f8 launcher, PAD=1 forced: PAD=0 overflows the 64 KiB/WG
+  LDS limit once the 512 B staging LUT joins — confirmed 65104<=65536). The 32
+  boot refusals ('kv_dtype in {bf16}, have fp8_e4m3') are GONE: 27B fp8 boots live
+  at 8k with real dispatch liveness ('attn-decode hd256 fp8 arm launched
+  pad=1 fold=1 f8st=3'); 131072 boots live but 76-78% VRAM-backed (df3 budget +
+  tenant --memory=3g law leave 3.3-3.44 GiB elastic vs ~4.4 needed; engine
+  evicts-and-recomputes beyond ~99k, does NOT cap ctx). fp8_v4/k6_v4 remain
+  refused (distinct dtypes, out of scope). Correctness: 57/57 test_qk_fuse (byte
+  oracle + fused-vs-chain differential, rows past one wave, poison redzones),
+  repro_attn_fp8 hd256 rel_l2 2.5e-3 with descale, battery 2031/2031. KLD vs bf16
+  (short-doc corpus 16 docs/326 pos, control floor 1e-6): mean 1.80e-3, top1
+  0.9724, ppl 0.44% BETTER — PASS-lean but corpus depth is the booked gap -> Q62b
+  deploy-gate. Speed: parity with bf16 both regimes (df0 17.7 vs 16.8 med,
+  overlap; df3 16.9 vs 16.7) — fp8 unlocks CAPACITY, not perf, exactly as w65
+  predicted. Artifacts cat:~/scratch/r3d/w66_q62/.
+- Q62 PROMOTION (ceremony child, manager-supervised): ff-merge -> fresh build_v164,
+  FATBIN byte-identical to the validated wip build (19,759,056 B, sha256 ea81e57c;
+  .so md5s differ by link stamps only); battery 2031/2031 zero-diverged with diffs
+  = additive registration rows only (20 kv_store_fp8 bit-exact 0.0, 53 attn fp8
+  rows within tol, 11 formerly-refused bands now answering; mxfp4 jitter class
+  re-proven harness noise by same-binary re-run + v163-era control); full census
+  v163->v164 = +14 kernels, 0 arms removed, 0 metadata deltas on 299 common arms;
+  serve decode arm 212 VGPR spill-free, prefill tile arm 256 VGPR + 7-VGPR/32B
+  spill (family precedent ships 88-179 unchanged); rows 59->61, cases 577->597.
+  PUSHED 12a1fc8 (GitHub == local == cat). SERVE UNTOUCHED: 9b line is bf16-KV;
+  v163 stays live (v164 = next deploy candidate). Report cat:~/scratch/r3d/
+  w66_promote/report.md.
+- Q54 TAIL (card child): regime-split across M33..64 — cache-fit keeps the win
+  (+11.9..+15.5% disjoint, mildly shrunk), cold shrinks and INVERTS (+4.9 @M33,
+  FLAT @M40, -3.2..-6.0% disjoint LOSS @M48..64). Manager: default stays ON;
+  slabs<=2 cold-tail gate proposed, unmeasured (row residual).
+- Q47 CARD PASS (same card child): CLOSED LOSS. Fidelity gate bitwise-equal +
+  census control field-for-field; candidates resource-eligible (49/55 VGPR 0 spill
+  — desk arithmetic vindicated) but 20/20 A/B legs disjoint-LOSS -2.1..-17.6%.
+  Band is at the memory wall (~500-586 GB/s), never load-stalled — schedule-only
+  windows have nothing to cure (joins Q33/Q43/Q45 dark-doctrine: wins come from
+  REMOVING work). DVFS trap booked: short legs inside the ramp = +/-20% position
+  artifact; pre-burn + fine round-robin is the cure. SIDE FINDING -> Q63: mxfp4
+  q8x round-DOWN leaves rows 4..M-1 unwritten at M 5..7 (fp8a8 has the #18 fix,
+  mxfp4 does not; engine never issues M 5..7 today at spec-3 -> latent). Report
+  cat:~/scratch/r3d/q47/w66_card_report.md.
+- Q55 (desk child): plane-guard logging merged (abe5280, ff, pushed): cumulative
+  budget ledger + per-(N,K) dedup + one end-of-declare FITS/CANNOT-FIT summary
+  (319 lines -> 6 synthetic 27B; 281 -> 1 on 9b class). LOGGING-ONLY by diff audit
+  + independent arithmetic verifier; merged WITHOUT battery re-gate (stderr only,
+  no device code); rides next gated build. 'Withdraw row when class cannot fit'
+  clause stays queued (behavior change, needs battery+serve A/B). Unobserved leg:
+  summary emit on a real boot (revisit-trigger; confirm at next card window).
+  A -Wformat bug (bad %lllx) was caught pre-commit by the first TU build.
+- OPS NOTES: cat push failed from a bare non-interactive ssh session (credential
+  helper not loaded); push route = local via git-credential-vault, cat fetches
+  origin after. Law: pushes go through the local host.
+- SERVE STATE AT CLOSE: spec9g Up on v163 mount (md5 714bd41b, /tokenize 200,
+  chat probe OK — manager-verified after every child). flashnext untouched (Up,
+  healthy). No stray containers (w66_* Exited corpses removed). Card idle.
+- QUEUE AFTER THIS WINDOW: Q62b (fp8-KV deploy-gate legs), Q63 (M5..7 unwritten
+  rows), Q55-residual (withdraw-row behavior + real-boot summary leg), Q61/Q56
+  (engine repo), Q57 (prefill), Q58/Q28/Q41 owner-gated, Q54 cold-tail gate.
+
