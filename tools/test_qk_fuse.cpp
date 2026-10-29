@@ -495,8 +495,9 @@ static void fp8_store_case(Lib& lib, std::mt19937& rng, int hd, int M, int nq, i
                 for (int d = 0; d < hd; ++d) {
                     const uint16_t kb = kp[(size_t)t * kpitch + (size_t)h * hd + d];
                     const uint16_t vb = vp[(size_t)t * kpitch + (size_t)h * hd + d];
-                    const float kx = (float)((uint32_t)kb << 16);
-                    const float vx = (float)((uint32_t)vb << 16);
+                    float kx, vx;   /* BIT reinterpret (a C float cast converts numerically!) */
+                    { const uint32_t ku = (uint32_t)kb << 16, vu = (uint32_t)vb << 16;
+                      std::memcpy(&kx, &ku, 4); std::memcpy(&vx, &vu, 4); }
                     const uint8_t kcode = rad_f32_to_fp8e4m3(kx * (float)kmul);
                     const uint8_t vcode = rad_f32_to_fp8e4m3(vx * (float)vmul);
                     wdst[d] = kcode; wdst[hd + d] = vcode;
@@ -594,6 +595,10 @@ static void fp8_fused_case(Lib& lib, std::mt19937& rng, int hd, int rot, int M, 
             for (long long c = 0; c < kcols; ++c) d[t * kpitch + c] = s[t * kcols + c];
     };
 
+    /* The fused side must see the ORIGINAL k/v, not the chain prologue's in-place
+     * rewrite of kc: snapshot before the chain runs. */
+    const std::vector<uint8_t> kc_seed = kc->h;
+
     /* ---- chain ---- */
     {
         std::vector<Buf*> o{ qg, kc, cs, pos, wq, wk, qco, kc };
@@ -603,7 +608,9 @@ static void fp8_fused_case(Lib& lib, std::mt19937& rng, int hd, int rot, int M, 
         int rc = run(pro, o, p);
         if (rc) { std::printf("%-52s chain prologue rc=%d\n", tag, rc); ++g_fail; }
         seed_pitched(vf, vc->h);
-        std::vector<Buf*> o2{ kc, vf, slot, cchain };        /* k = dense k_out, v pitched */
+        Buf vf_c2; vf_c2.dtype = RAD_BF16; vf_c2.shape = {M, nkv, hd};   /* pitched like live */
+        vf_c2.strides = {kpitch, hd, 1}; vf_c2.alias = vf;
+        std::vector<Buf*> o2{ kc, &vf_c2, slot, cchain };    /* k = dense k_out, v pitched */
         std::vector<RadParam> p2{ Pi("head_dim", hd), Pi("block_size", bs),
                                   Pi("n_head_kv", nkv), Ps("kv_dtype", "fp8_e4m3"),
                                   Pf("k_scale", kscale), Pf("v_scale", vscale) };
@@ -613,7 +620,7 @@ static void fp8_fused_case(Lib& lib, std::mt19937& rng, int hd, int rot, int M, 
     if (getenv("QK_DIAG")) std::fprintf(stderr, "PHASE f8-chain %s\n", tag);
 
     /* ---- fused: pitched k/v/cache views, cache wider than 2*hd ---- */
-    seed_pitched(kf, kc->h); seed_pitched(vf, vc->h);
+    seed_pitched(kf, kc_seed); seed_pitched(vf, vc->h);
     Buf kf_v; kf_v.dtype = RAD_BF16; kf_v.shape = {M, nkv, hd};
     kf_v.strides = {kpitch, hd, 1}; kf_v.alias = kf;
     Buf vf_v; vf_v.dtype = RAD_BF16; vf_v.shape = {M, nkv, hd};
@@ -647,9 +654,14 @@ static void fp8_fused_case(Lib& lib, std::mt19937& rng, int hd, int rot, int M, 
                         const uint8_t exp = cchain->h[((b * nkv + h) * bs + off) * 2 * hd + e];
                         if (got != exp) {
                             ++g_fail;
-                            if (g_fail - fails_before < 6)
-                                std::printf("  MISMATCH b=%lld h=%lld off=%lld e=%lld got=%02x exp=%02x\n",
-                                            b, h, off, e, got, exp);
+                            if (g_fail - fails_before < 6) {
+                                const uint8_t* kp = cfused->h.data();
+                                std::printf("  MISMATCH b=%lld h=%lld off=%lld e=%lld got=%02x exp=%02x"
+                                            " | fused[0..7]=%02x %02x %02x %02x chain[0..3]=%02x %02x %02x %02x\n",
+                                            b, h, off, e, got, exp,
+                                            kp[0],kp[1],kp[2],kp[3],
+                                            cchain->h[0],cchain->h[1],cchain->h[2],cchain->h[3]);
+                            }
                         }
                     }
         if (!g_fail) ++g_pass;
