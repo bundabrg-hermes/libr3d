@@ -3985,3 +3985,40 @@ re-verified on cat by the manager before booking.
   rows), Q55-residual (withdraw-row behavior + real-boot summary leg), Q61/Q56
   (engine repo), Q57 (prefill), Q58/Q28/Q41 owner-gated, Q54 cold-tail gate.
 
+
+## WINDOW 67 (2026-10-29, AWST ~20:00-23:30) — Q63 SHIPPED AS v165 (ROUND-UP FIX; BUG WIDER THAN TICKET)
+
+- Q63 (bench child -> transplant child, manager-verified both legs): mxfp4 q8x
+  ladder src:1763 rounded DOWN; fix = fp8a8 Issue-#18 ladder verbatim
+  (`mt = P.M<=1?1 : <=2?2 : <=4?4 : 8`), unconditional. REPRO WIDER THAN TICKET:
+  M=3 also lost row 2 (mt 3->2) and the legacy walk (K%256!=0) carries the same
+  gap — same one line fixes all. Kernel MT>M safety read from source first
+  (live=min(M,MT) in all three families; x8/SG scratch always 8 rows wide).
+  Row-write driver 48 legs (0xAAAA canary, per-row fnv, 3 shapes x 2 levers x
+  M1..8): old loses M3+M5..7 everywhere, new writes exactly M rows everywhere,
+  neither ever writes beyond M. Bitwise: M{1,2,4,8} fully identical; M5..7 rows
+  0..3 identical (fix only fills). CAVEAT shipped: M=3 default levers flip
+  dot4<2>->lane-map<4> (mt 2->4 gates lm_arm) — Q44 tolerance class, 2/24576
+  elems 1-ulp, same flip the fp8a8 #18 shipped with. A/B M{4,8} zero-cost:
+  machine-normalized lib/base ratios all 1.00+-2%, disjoint cells opposite-signed
+  (= position noise; raw medians leg-bimodal ~0.092/0.16ms EVEN WITH 400-launch
+  pre-burn — normalization is now the adjudication default for sub-0.2ms legs).
+  Census: 23/23 family kernels byte-identical, 0 spill (MT=8 arms already ship —
+  host-line change, zero codegen). Promotion: battery stock 2031/2031 + mxfp4
+  4737/4737 both on v165 and v164-control, decision rows BYTE-IDENTICAL all
+  comparisons (zero battery legs cover non-rung M -> row driver is the cover);
+  xcheck v165-vs-scratch-NEW 48/48 legs 384/384 row hashes pairwise equal;
+  fatbin determinism byte-equal (19,759,056 B, sha 0ee1fb83...). v165 lib md5
+  5e9147eb. Fix commit c166730. Artifacts cat:~/scratch/r3d/w67_q63/ +
+  w67_promote/. NOTE M-liveness: engine at spec-3 with always-3 proposals runs
+  M in {1,4} only (w63 accept data) -> M=3 gap was near-latent like M5..7, not
+  actively corrupting the live serve; fix is the correctness floor for any
+  spec-depth change.
+- SERVE STATE AT CLOSE: spec9g LIVE on build_v163 mount (md5 714bd41b,
+  /tokenize 200 manager-verified). v164 (fp8-KV, Q62b-gated for fp8 USE) and
+  v165 (Q63 fix, deployable on bf16-KV lines) both shipped, NEITHER deployed —
+  deploy is owner's call; v165 recommended next swap. flashnext untouched.
+  Card idle.
+- QUEUE AFTER THIS WINDOW: Q62b (fp8-KV deploy-gate legs), Q55-residual
+  (withdraw-row + real-boot summary), Q61/Q56 (engine repo radiance-fix), Q57
+  (prefill), Q54 cold-tail gate, Q58/Q28/Q41 owner-gated.
