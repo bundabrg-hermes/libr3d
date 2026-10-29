@@ -31,7 +31,10 @@ static float bf16_f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; memcp
 static int envid(const char* k, int dflt) { const char* v = getenv(k); return v ? atoi(v) : dflt; }
 
 int main() {
+    /* (HD guard below once read) */
     const int HD = envid("REPRO_HD", 128);   /* Q62: 256 exercises the fp8 staging arms */
+    if (HD > 256 || (HD != 64 && HD != 128 && HD != 256)) {
+        printf("REPRO_HD outside {64,128,256}\n"); return 2; }
     const int BS = 16, NB = 4, QH = 8, KVH = 2, GQA = 4;
     const int QLEN = envid("REPRO_QLEN", 8);
     const int CTX  = envid("REPRO_CTX", 52);          // keys 48..51 land in unmapped block 3
@@ -89,7 +92,7 @@ int main() {
                 const float s = dot * scale;
                 sc[nj++] = s; if (s > mx) mx = s;
             }
-            float sum = 0, acc[HD] = {}; int jj = 0;
+            float sum = 0, acc[256] = {}; int jj = 0;   /* HD <= 256 guarded above */
             for (int64_t j = 0; j < CTX; ++j) {
                 const int64_t d = pos - j;
                 if (WIN > 0 && (d >= WIN || d <= -WIN)) continue;
