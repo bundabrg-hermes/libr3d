@@ -1097,10 +1097,17 @@ static const RadConstraint cKvStore[] = {
     { "kv_dtype",   RAD_C_IN, 0, "bf16" },
 };
 
+/* kv_store_fp8 (Q62): the E4M3 cache scatter. Same shape law as the bf16 row (the cache
+ * strides are elements -- bytes for this dtype); the fold is ref_kv_store's 1/scale. */
+static const RadConstraint cKvStoreFp8[] = {
+    { "block_size", RAD_C_GE, 1, nullptr },
+    { "kv_dtype",   RAD_C_IN, 0, "fp8_e4m3" },
+};
+
 /* qk_norm_rope_gate, the positional form of libr4d's cQkNormRopeGate = { C_IN("q_dtype",
  * "bf16"), C_LE("head_dim", 256), C_DIV("head_dim", 32) }. The Kv variants keep libr4d's
- * shape; the fp8 cache arm has no libr3d row (no native E4M3 path), so only the bf16 pair
- * is spelled. */
+ * shape; the fp8 cache arm (Q62) joins as the kv pair's E4M3 sibling, the software-encoder
+ * fold of r3d_qk_norm_rope_gate.hip. */
 static const RadConstraint cQkNormRopeGate[] = {
     { "q_dtype",  RAD_C_IN, 0, "bf16" },
     { "head_dim", RAD_C_LE, 256, nullptr },
@@ -1112,6 +1119,14 @@ static const RadConstraint cQkNormRopeGateKvBf16[] = {
     { "head_dim",   RAD_C_DIV, 32, nullptr },
     { "block_size", RAD_C_GE, 1, nullptr },
     { "kv_dtype",   RAD_C_IN, 0, "bf16" },
+};
+/* The fp8 pair of the fused row (Q62): identical shape law, E4M3 cache. */
+static const RadConstraint cQkNormRopeGateKvFp8[] = {
+    { "q_dtype",    RAD_C_IN, 0, "bf16" },
+    { "head_dim",   RAD_C_LE, 256, nullptr },
+    { "head_dim",   RAD_C_DIV, 32, nullptr },
+    { "block_size", RAD_C_GE, 1, nullptr },
+    { "kv_dtype",   RAD_C_IN, 0, "fp8_e4m3" },
 };
 
 /* libr3d is the only device library on RDNA3, so no in-plugin arbitration; the value only
@@ -1170,7 +1185,8 @@ static const RadTunable tAttnSplit = { "splits", kSplits, 5, 0,
  * serves a full KV walk; windowed decode stays with the tile), bf16 q, bf16/fp8-e4m3
  * cache. head_dim is one row per value, libr4d's convention: each is exactly a WMMA
  * template instantiation, and no IN set exists for integer keys. head_dim 256
- * (accept 2026-10-27) is bf16-cache only: the 256 family has no fp8 instantiation. */
+ * (accept 2026-10-27) is bf16- and fp8-e4m3-cache since Q62 (the F8ST staging arms at
+ * the fitted carve; R3D_HD256=0 still withdraws the whole family). */
 static const RadConstraint cAttnDecodeH128[] = {
     RAD_CLE("q_len", 8),
     RAD_CEQ("window", 0),
@@ -1190,7 +1206,7 @@ static const RadConstraint cAttnDecodeH256[] = {
     RAD_CEQ("window", 0),
     RAD_CEQ("head_dim", 256),
     RAD_CIN("q_dtype", "bf16"),
-    RAD_CIN("kv_dtype", "bf16"),   /* no 256-fp8 instantiation (issue #11 law) */
+    RAD_CIN("kv_dtype", "bf16 fp8_e4m3"),   /* fp8@256 joins in Q62 (F8ST staging arms) */
 };
 
 /* rope: neox and gptj over [M] positions, plus imrope over [3, M] component-major positions
@@ -1278,12 +1294,14 @@ static RadConstraint cConvFused[] = {
 extern "C" int r3d_rad_rmsnorm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_embed_lookup(const RadArgs*, RadStream);
 extern "C" int r3d_rad_kv_store(const RadArgs*, RadStream);
+extern "C" int r3d_rad_kv_store_fp8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_act_mul(const RadArgs*, RadStream);
 extern "C" int r3d_rad_cast(const RadArgs*, RadStream);
 extern "C" int r3d_rad_rope(const RadArgs*, RadStream);
 extern "C" int r3d_rad_rope_table(const RadArgs*, RadStream);
 extern "C" int r3d_rad_qk_norm_rope_gate(const RadArgs*, RadStream);
 extern "C" int r3d_rad_qk_norm_rope_gate_kv_store(const RadArgs*, RadStream);
+extern "C" int r3d_rad_qk_norm_rope_gate_kv_store_fp8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt(const RadArgs*, RadStream);
 extern "C" int r3d_rad_logits_gemm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_gemm_nt_q(const RadArgs*, RadStream);
@@ -1397,6 +1415,16 @@ static const RadKernelInfo kRows[] = {
   cKvStore, 2, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_kv_store },
 
+{ "kv_store_fp8", "kv_store", "attn",
+  "scatter k and v into the E4M3 paged cache, one workgroup a token (Q62)",
+  "cache exactly [n_blocks, kv_heads, block_size, 2*head_dim] fp8_e4m3; a negative or "
+  "out-of-range slot stores nothing",
+  "bf16 k / v, fp8_e4m3 cache, i32 slot mapping; stored value = ref_kv_store's "
+  "value * (1/k_scale) through the ABI's saturating RTNE encoder",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cKvStoreFp8, 2, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_kv_store_fp8 },
+
 { "act_mul_bf16", "act_mul", "elem",
   "gated activation over two operands: act(a) rounded, times b",
   "any n; a, b and y each at their own row pitch, so both may be column slices of one buffer",
@@ -1472,6 +1500,18 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cQkNormRopeGateKvBf16, 5, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_qk_norm_rope_gate_kv_store },
+
+{ "qk_norm_rope_gate_kv_store_fp8", "qk_norm_rope_gate_kv_store", "attn",
+  "qk_norm_rope_gate, and kv_store into an E4M3 paged cache from the same launch (Q62) -- "
+  "the two bytes per k-head element that kv_store_fp8 would write, encoded from the block "
+  "that already holds them",
+  "qk_norm_rope_gate's shapes; cache exactly [n_blocks, kv_heads, block_size, 2*head_dim] "
+  "and one slot a row; a negative or out-of-range slot stores nothing",
+  "bf16 in and out, fp8_e4m3 cache, i32 slot mapping; the stored byte is the bf16 value "
+  "kv_store_fp8 would read, re-widened and scaled exactly as ref_kv_store does it",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cQkNormRopeGateKvFp8, 5, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_qk_norm_rope_gate_kv_store_fp8 },
 
 { "gemm_nt_bf16", "gemm_nt", "gemm",
   "dense bf16 GEMM, 64x64 output tile per workgroup, K in 16-wide LDS slices",
@@ -1672,7 +1712,7 @@ static const RadKernelInfo kRows[] = {
 
 { "attn_paged_decode_bf16kv_h256", "attn_paged", "attn",
   "split-KV decode attention, head_dim 256: as attn_paged_decode_bf16kv_h128 on the "
-  "m2 fitted body at SPLITK=1 (issue #11 m3); bf16 cache only -- no 256-fp8 arm",
+  "m2 fitted body at SPLITK=1 (issue #11 m3); bf16 and fp8_e4m3 caches (Q62 staging arms)",
   "decode and speculative verify (q_len <= 8), window 0, head_dim 256, any gqa, any "
   "block size, ragged batches via cu_seqlens, unmapped block table entries skipped",
   "bf16 query, bf16 kv cache with optional per-(seq,head) descales, bf16 or f32 out, "

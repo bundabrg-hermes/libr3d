@@ -24,9 +24,12 @@
  *   * the bf16 cache write copies the same two bytes `kv_store_bf16` copies (identity, no
  *     rounding), at the layout its kernel walks: [n_blocks, kv_heads, block_size, 2*head_dim],
  *     K at [.., d], V at [.., head_dim + d], fully contiguous (checked at entry).
- *   * the fp8 cache fold of the donor is NOT ported: RDNA3 has no native E4M3 conversion path,
- *     the same scope rule as r3d_kvstore.hip ("the fp8 cache variants stay out of scope with the
- *     rest of fp8 -- RDNA3 has no native E4M3 path"), and the live gated stack runs a bf16 cache.
+ *   * the fp8 cache fold (Q62) stores the two bytes kv_store_fp8 would write: the bf16
+ *     value this kernel just rounded, re-widened exactly as ref's ld_dt widens it, times
+ *     ref's store multiplier (1/k_scale, f32), encoded by the device port of the ABI's
+ *     rad_f32_to_fp8e4m3 -- the saturating RTNE the oracle stores through. RDNA3 has no
+ *     hardware E4M3 conversion (the donor's v_cvt_pk_fp8_f32 is gfx12), so the fold is the
+ *     software encoder; bit-equality with libref is by transcription, not by class.
  *   * `wadd` is GemmaRMSNorm's `1 +` (Qwen3.5's QK gains are zero-centred), added to the gain in
  *     f32 after the load -- the identical expression r3d_rmsnorm computes.
  *
@@ -61,6 +64,48 @@ constexpr uint32_t kWaves   = kThreads / kWave;
 
 /* Verbatim r3d_rope.hip's device-side narrowings (which mirror rad_plugin.h's host
  * conversions bit for bit), so the fused kernel rounds exactly where its references round. */
+/* Verbatim device transcription of the ABI's rad_f32_to_fp8e4m3 (rad_plugin.h:285 --
+ * host-only static inline there, so the body is ported rather than called). Saturating at
+ * 448, RTNE incl. the subnormal band, single NaN code kept: bit-equal to libref's
+ * stt(RAD_F8E4M3), which stores through this very function. The twin lives in
+ * r3d_kvstore.hip -- the project's duplicate-rather-than-share rule keeps the TUs
+ * independent; these are the most reviewed lines in the file. */
+__device__ __forceinline__ uint8_t r3d_f32_to_e4m3(float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    {
+        uint8_t  s = (uint8_t)((u >> 24) & 0x80u);
+        uint32_t a = u & 0x7fffffffu;
+        int e;
+        uint32_t m;
+        if (a > 0x7f800000u) return (uint8_t)(s | 0x7fu);     /* nan */
+        if (a >= 0x43e00000u) return (uint8_t)(s | 0x7eu);    /* >= 448: clamp to the largest */
+        e = (int)(a >> 23) - 127;
+        m = a & 0x7fffffu;
+        if (e < -10) return s;
+        if (e < -6) {                                         /* subnormal fp8 */
+            int sh = -6 - e + 20;
+            uint32_t lo, q, half;
+            m |= 0x800000u;
+            lo   = m & ((1u << sh) - 1u);
+            q    = m >> sh;
+            half = 1u << (sh - 1);
+            if (lo > half || (lo == half && (q & 1u))) ++q;
+            return (uint8_t)(s | q);
+        }
+        {
+            uint32_t q  = m >> 20;
+            uint32_t lo = m & 0xfffffu;
+            int ee;
+            if (lo > 0x80000u || (lo == 0x80000u && (q & 1u))) ++q;
+            ee = e + 7;
+            if (q == 0x8u) { q = 0; ++ee; }
+            if (ee > 15 || (ee == 15 && q >= 7u)) return (uint8_t)(s | 0x7eu);
+            return (uint8_t)(s | ((uint32_t)ee << 3) | q);
+        }
+    }
+}
+
 __device__ __forceinline__ float r3d_bf16_to_f32(uint16_t h) {
     return __uint_as_float((uint32_t)h << 16);
 }
@@ -88,10 +133,13 @@ struct QkKvStore {
     const int32_t*  slot;
     long kv_s0, kv_s1, kv_s2;   /* element strides for [n_blocks, kv_heads, block_size] */
     int v_pitch, block_size, n_blocks;
+    float k_inv, v_inv;         /* fp8 fold only: ref_kv_store's 1/scale multipliers */
 };
 
-/* The cache forms KV selects. fp8 is out of scope (file header). */
-enum { QK_KV_NONE = 0, QK_KV_BF16 = 1 };
+/* The cache forms KV selects. QK_KV_FP8 (Q62) writes the E4M3 cache the engine allocates
+ * for --kv-cache-dtype fp8; the fold is kv_store_fp8's (r3d_kvstore.hip header for the
+ * bit-identity anchor). */
+enum { QK_KV_NONE = 0, QK_KV_BF16 = 1, QK_KV_FP8 = 2 };
 
 /* One block per (token, head) and one element per lane, required for bit-equality. Eight
  * elements per lane computes a different sum-of-squares fold (see the header). Lanes past the
@@ -182,20 +230,31 @@ __global__ __launch_bounds__(kThreads) void r3d_qk_norm_rope_gate_kernel(
          * interleaved projection (gate_quant_fp8), so the template passes none. */
         if (!isk && GO) GO[((size_t)tok * nq + lh) * HD + t] = in[HD + t];
     }
-    /* The cache write kv_store_bf16 would make next, from the same bytes: the rotated k as just
-     * computed and the head's v element as the projection left it. Layout [n_blocks, kv_heads,
-     * block_size, 2*head_dim], k then v, fully contiguous (entry-checked); a negative or
-     * out-of-range slot stores nothing, exactly as r3d_kvstore.hip does. */
+    /* The cache write kv_store_bf16/kv_store_fp8 would make next, from the same bytes: the
+     * rotated k as just computed and the head's v element as the projection left it. Layout
+     * [n_blocks, kv_heads, block_size, 2*head_dim], k then v, fully contiguous
+     * (entry-checked); a negative or out-of-range slot stores nothing, exactly as
+     * r3d_kvstore.hip does. The fp8 form narrows the SAME bf16 value through ref's fold
+     * (re-widen, multiply by 1/scale, saturating RTNE encode): one narrowing, at the
+     * encode, and the bf16 round trip before it is the value unfused kv_store reads back. */
     if constexpr (KV != QK_KV_NONE) {
         if (isk && t < HD) {
             const int32_t sl = kvs.slot[tok];
             if (sl >= 0 && (uint32_t)sl / (uint32_t)kvs.block_size < (uint32_t)kvs.n_blocks) {
                 const uint32_t blk = (uint32_t)sl / (uint32_t)kvs.block_size;
                 const uint32_t off = (uint32_t)sl % (uint32_t)kvs.block_size;
-                uint16_t* cch = kvs.cache + (size_t)blk * kvs.kv_s0 +
-                                (size_t)lh * kvs.kv_s1 + (size_t)off * kvs.kv_s2;
-                cch[t]      = r3d_f32_to_bf16(res);
-                cch[HD + t] = kvs.v[(size_t)tok * kvs.v_pitch + (size_t)lh * HD + t];
+                const size_t at = (size_t)blk * kvs.kv_s0 +
+                                  (size_t)lh * kvs.kv_s1 + (size_t)off * kvs.kv_s2;
+                if constexpr (KV == QK_KV_FP8) {
+                    uint8_t* __restrict__ cch = (uint8_t*)kvs.cache + at;
+                    cch[t]      = r3d_f32_to_e4m3(r3d_bf16_to_f32(out[t]) * kvs.k_inv);
+                    cch[HD + t] = r3d_f32_to_e4m3(r3d_bf16_to_f32(
+                        kvs.v[(size_t)tok * kvs.v_pitch + (size_t)lh * HD + t]) * kvs.v_inv);
+                } else {
+                    uint16_t* __restrict__ cch = kvs.cache + at;
+                    cch[t]      = r3d_f32_to_bf16(res);
+                    cch[HD + t] = kvs.v[(size_t)tok * kvs.v_pitch + (size_t)lh * HD + t];
+                }
             }
         }
     }
@@ -408,3 +467,58 @@ static int r3d_qk_norm_rope_gate_kv_store_impl(const RadArgs* a, RadStream s) {
 }
 extern "C" int r3d_rad_qk_norm_rope_gate_kv_store(const RadArgs* a, RadStream s)
     R3D_DUMP_WRAP("qk_norm_rope_gate_kv_store_bf16", r3d_qk_norm_rope_gate_kv_store_impl)
+
+/* The prologue with the fp8 (E4M3) cache store folded in (Q62): the bf16 kv entry's
+ * operands, schema and shape gates verbatim, with the cache dtype moved to E4M3 and
+ * k_scale/v_scale driving ref_kv_store's store multiplier (the same pair kv_store_fp8
+ * reads; the engine runs the identity 1.0 today). */
+static int r3d_qk_norm_rope_gate_kv_store_f8_impl(const RadArgs* a, RadStream s) {
+    const RadTensor* qg = rad_arg_in(a, QK_QGATE);
+    const RadTensor* k  = rad_arg_in(a, QK_K);
+    const RadTensor* v  = rad_arg_in(a, QK_V);
+    const RadTensor* sm = rad_arg_in(a, QK_SLOT);
+    const RadTensor* kv = rad_arg_in(a, QK_CACHE);
+    if (!k || !v || !sm || !kv) return RAD_E_INVAL;
+    /* fp8 cache only on this entry; v stays bf16 (the engine's v-projection dtype). The
+     * row's constraints pin kv_dtype already; this is the cold-call re-check. */
+    const char* kvd = rad_args_gets(a, "kv_dtype");
+    if ((kvd && std::strcmp(kvd, "fp8_e4m3") != 0) ||
+        v->dtype != RAD_BF16 || kv->dtype != RAD_F8E4M3 || sm->dtype != RAD_I32)
+        return RAD_E_DTYPE;
+    if (!rad_contig(sm)) QK_REFUSE(RAD_E_STRIDE, "slot_mapping not contiguous");
+    if (kv->rank != 4 || kv->stride[3] != 1) QK_REFUSE(RAD_E_STRIDE, "kv_cache stride");
+
+    long long hd = 0, nkv = 0, bs = 0;
+    rad_args_geti(a, "head_dim", &hd);
+    rad_args_geti(a, "n_head_kv", &nkv);
+    rad_args_geti(a, "block_size", &bs);
+    if (hd <= 0 || nkv <= 0 || bs <= 0) return RAD_E_SHAPE;
+    if (kv->rank != 4 || kv->shape[1] != nkv || kv->shape[2] != bs || kv->shape[3] != 2 * hd)
+        return RAD_E_SHAPE;
+    const long long M = qg ? qg->shape[0] : k->shape[0];
+    if (v->shape[0] < M || rad_tensor_numel(sm) != M) return RAD_E_SHAPE;
+    const long v_pitch = pitched_ok(v, nkv * hd);   /* v may be pitched too */
+    if (v_pitch < 0) QK_REFUSE_T(RAD_E_STRIDE, "v stride/pitch", v);
+
+    /* ref_kv_store's store multipliers: positive, default identity -- read exactly as
+     * kv_store_fp8 reads them (the bf16 entry's guard, load-bearing here). */
+    const double ksc = rad_args_getf_or(a, "k_scale", 1.0);
+    const double vsc = rad_args_getf_or(a, "v_scale", 1.0);
+    if (!(ksc > 0.0) || !(vsc > 0.0)) return RAD_E_INVAL;
+
+    QkKvStore kvs{};
+    kvs.v          = (const uint16_t*)v->data;
+    kvs.slot       = (const int32_t*)sm->data;
+    kvs.cache      = (uint16_t*)kv->data;   /* byte-walked by the FP8 fold; the cast is storage */
+    kvs.v_pitch    = (int)v_pitch;
+    kvs.kv_s0      = (long)kv->stride[0];   /* elements == bytes for the fp8 cache */
+    kvs.kv_s1      = (long)kv->stride[1];
+    kvs.kv_s2      = (long)kv->stride[2];
+    kvs.block_size = (int)bs;
+    kvs.n_blocks   = (int)kv->shape[0];
+    kvs.k_inv      = 1.0f / (float)ksc;
+    kvs.v_inv      = 1.0f / (float)vsc;
+    return qk_body<QK_KV_FP8>(a, (hipStream_t)(uintptr_t)s, kvs);
+}
+extern "C" int r3d_rad_qk_norm_rope_gate_kv_store_fp8(const RadArgs* a, RadStream s)
+    R3D_DUMP_WRAP("qk_norm_rope_gate_kv_store_fp8", r3d_qk_norm_rope_gate_kv_store_f8_impl)
