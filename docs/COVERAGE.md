@@ -4053,3 +4053,58 @@ re-verified on cat by the manager before booking.
   Q55-residual (withdraw-row + real-boot summary — rides a v165 9b dry-run
   boot), Q64/Q66 + engine items Q61/Q56 (radiance-fix repo), Q57, Q54
   cold-tail gate, Q58/Q28/Q41 owner-gated.
+
+## WINDOW 69 (2026-10-30, AWST) — SERVE SWAPPED TO v165 (OWNER-APPROVED); Q65 RAN: SCALE-EDGE FALSIFIED, REAL PROSE WORSE; fp8-KV STAYS TEST-ONLY
+
+- SERVE SWAP (manager-executed, owner go): spec9g retired as
+  spec9g_v163_rollback (stopped); identical-spec container re-run on the
+  build_v165 mount (image c21457846d47, /dev/kfd+/dev/dri,
+  ROCR_VISIBLE_DEVICES=1, cmd/env byte-copied from inspect). Verified: served
+  .so md5 5e9147eb (artifact-identical), gfx1100 boot assert, arms launched,
+  /tokenize 200, chat probe live, restarts 0.
+- Q55 REAL-BOOT OBSERVATION CLOSED: unified guard summary emits exactly ONE
+  honest line on the live 9b boot ("I load: 161 weight(s), 970.68 MiB of
+  planes ... 970.18 MiB held at most"). 'Withdraw row when class cannot fit'
+  clause remains queued (behavior change, needs battery+serve A/B window).
+- Q65 RAN (card child, manager-verified): the L1 breach mechanism is NOT the
+  suspected scale edge. (1) EXONERATION: env-gated RTNE-rounding emulation on
+  the bf16 store path (R3D_W69_QROUND) reproduces native fp8 md5-identically
+  (doc03 rows) and 33438/33444 on real prose — read/descale arms innocent,
+  damage is 100% in stored values. (2) NO SATURATION: max |K| 23.25, max |V|
+  111.5 << 448, zero saturating elements. (3) SCALE EDGE FALSIFIED: uniform
+  grid shift x8 keeps 41/43 extremes (positions reshuffle), x0.25 far worse
+  (+54%, underflow); damage tracks scale-INVARIANT relative precision (e4m3
+  3-bit mantissa ~3.6% rms/value) integrated by attention over long ctx —
+  extremes sit on near-tie reference distributions (only 9/43 have ref top-1
+  p>=0.9; top-1 agreement survives on 19/43: tail inversion, not argmax
+  error). (4) PLANE ATTRIBUTION symmetric: K-only 91% / V-only 97% of doc-mean
+  damage — no single-plane pathology. Per-token quantizer error at extremes is
+  unremarkable and rank-uncorrelated with KLD.
+- REAL-PROSE CONTROL FALSIFIES THE SYNTHETIC-CORPUS HYPOTHESIS: 12 Gutenberg
+  docs (Holmes/Moby-Dick/Origin/P&P), 33,444 positions, same-session bf16
+  pairing: 9/12 breach the 5e-3 per-doc line (manager-verified on raw JSON:
+  agg mean 0.01995, top1 0.940; Holmes ~0.036, P&P 0.027-0.029, Origin
+  0.0085-0.017; Moby-Dick class clean 0.003-0.005). fp8-KV fails long-ctx
+  quality on REAL prose, worse than on synthetic.
+- FIX RANKING (child; endorsed by manager): #1 per-block amax INT8 KV store
+  (err/~5 -> KLD/~25 -> est. worst doc-mean ~1.4e-3 = ~3x margin; same 1 B/val;
+  MEDIUM ~v164-arc scope; heavy-tail blocks need clip/percentile scale)
+  -> booked as Q67, OWNER DECISION (fund vs demote fp8 to documented
+  experimental). Rejected/insufficient: existing k_scale/v_scale knobs (-12%
+  only), K-fp8/V-bf16 mixed (falsified — K alone carries 91%), fp8_v4/k6_v4
+  (4-bit V worse), per-block fp8 scaling (scale-invariance measured => gain ~0),
+  stochastic rounding (nondeterministic).
+- RE-GATE POSITION: do NOT re-gate by moving corpus/thresholds — the failure
+  is intrinsic. ppl-only gating would "pass" fp8 but hides 6% top-1 flips
+  (policy call, flagged to owner).
+- Artifacts: cat:~/scratch/r3d/w69_q65/ (verdict.md, w69_extremes_table.csv
+  [58 extremes >= 0.5], localized_extremes_doc03.csv, kld_real_fp8.json
+  .rows, corpus_real.jsonl, instrumented repo/ + build_w69dbg/).
+- SERVE STATE AT CLOSE: spec9g LIVE v165 (md5 5e9147eb, /tokenize 200
+  manager-verified post-child, restarts 0); rollback spec9g_v163_rollback
+  stopped. flashnext untouched (Up 29h healthy). /swapfile.w63 active. Card
+  idle. Repo clean at window-close commit; child made NO src/ commits.
+- QUEUE AFTER THIS WINDOW: OWNER Q67-vs-demote decision; Q66 (card, same-
+  corpus 8k-vs-131k paired accept curves); engine items Q64/Q56/Q61
+  (radiance-fix repo on cat); Q57 (prefill campaign); Q54 cold-tail gate;
+  Q55 withdraw-row clause; Q58/Q28/Q41 owner-gated unchanged.
