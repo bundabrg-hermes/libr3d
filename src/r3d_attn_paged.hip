@@ -393,13 +393,14 @@ static int r3d_attn_paged_impl(const RadArgs* a, RadStream s) {
      * itself refuses (windowed, f32 cache, other head_dims): they keep the
      * direct path with no extra fill. head_dim 256 joins the mirror iff the
      * R3D_HD256 lever is on (default ON since the 2026-10-27 accept): issue #11
-     * m3 wired the 256 slice arm into the decode entry, so a 256 bf16-cache
-     * decode shape rides split-KV there; with R3D_HD256=0 -- or fp8 KV at 256,
-     * which has no instantiation -- the shape takes the WMMA offer below (the
-     * plain tile or v1) exactly as it did at v148. rows <= 8*n_seq is the
+     * m3 wired the 256 slice arm into the decode entry, so a 256 cache shape
+     * (bf16 or fp8 since Q62) rides split-KV there; with R3D_HD256=0 the shape
+     * takes the WMMA offer below (the plain tile or v1) exactly as it did at
+     * v148. rows <= 8*n_seq is the
      * per-step bound that survives cu_seqlens (q_len_uniform is 0 whenever the
      * engine passes it). */
-    const int d256_mirror = r3d_hd256_on() && P.head_dim == 256 && P.kvdt == RAD_BF16;
+    const int d256_mirror = r3d_hd256_on() && P.head_dim == 256
+                                  && (P.kvdt == RAD_BF16 || P.kvdt == RAD_F8E4M3);   /* Q62: fp8@256 has instantiations */
     if (P.window == 0 && P.n_seq > 0 && P.rows <= 8 * P.n_seq &&
         (P.head_dim == 64 || P.head_dim == 128 || d256_mirror) &&
         P.qdt == RAD_BF16 && (P.kvdt == RAD_BF16 || P.kvdt == RAD_F8E4M3))
@@ -408,8 +409,9 @@ static int r3d_attn_paged_impl(const RadArgs* a, RadStream s) {
     /* Offer the launch to the WMMA tile first (r3d_attn_paged_wmma.hip). It sees the
      * same P the v1 kernel would have, computed in the same lines; it refuses what it
      * does not serve (chips without a gfx11xx object, q-f32 / kv-f32, head_dim outside
-     * {64,128} -- or outside {64,128,256} with R3D_HD256=1, fp8 KV at 256 --,
-     * R3D_NO_WMMA=1) and a refusal is ordinary traffic, not an error -- v1
+     * {64,128} -- or outside {64,128,256} with R3D_HD256=1 --,
+     * R3D_NO_WMMA=1, fp8 KV at 256 under R3D_F8ST=0) and a refusal is ordinary
+     * traffic, not an error -- v1
      * below was never launched in that case and serves the op exactly as before. */
     if (r3d_attn_paged_wmma_launch(P, stream) == RAD_OK) return RAD_OK;
 

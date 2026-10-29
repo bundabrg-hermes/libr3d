@@ -467,15 +467,17 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
     /* R3D_HD256 (issue #11 milestone 3): head_dim 256 joins the decode row's split-KV
      * family -- the same fitted body at SPLITK=1 (partial store and slice cut are
      * D-generic, see the body's m3 note), merged by the same D-generic merge kernel.
-     * v2/v3 and fp8 KV at 256 have no instantiation (the prefill launcher's law,
-     * mirrored here): those shapes keep d256=0, take tile_or_v1, and land on the m2
-     * tile or v1 exactly as before this row changed. R3D_HD256=0 (the withdrawal,
+     * v2/v3 have no 256 instantiation and keep d256=0, taking tile_or_v1 and landing
+     * on the m2 tile or v1 exactly as before this row changed. fp8 KV at 256 joined in
+     * Q62 (the R3D_DK_L256F8 staging arms; R3D_F8ST=0 keeps that shape on tile_or_v1).
+     * R3D_HD256=0 (the withdrawal,
      * q8x value law): every shape sees the identical gate it saw at v148. Accepted
      * 2026-10-27: the lever defaults ON -- the engine reaches this entry for 256
      * decode shapes through the decode mirror (r3d_attn_paged.hip) and the
      * attn_paged_decode_bf16kv_h256 band row (r3d_rows.cpp). */
     const int hd256 = r3d_hd256_on();
-    const int d256 = hd256 && P.head_dim == 256 && !v2 && P.kvdt == RAD_BF16;
+    const int d256 = hd256 && P.head_dim == 256 && !v2
+                  && (P.kvdt == RAD_BF16 || P.kvdt == RAD_F8E4M3);   /* fp8 arms: Q62 */
     const int wmma_ok = allowed && P.qdt == RAD_BF16
                      && (P.kvdt == RAD_BF16 || P.kvdt == RAD_F8E4M3)
                      && (P.head_dim == 64 || P.head_dim == 128 || d256);
@@ -689,6 +691,37 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
             hipError_t e1 = hipGetLastError();                                                           \
             return e1 == hipSuccess ? RAD_OK : RAD_E_DEVICE;                                             \
         } while (0)
+    /* Q62: the fp8 (E4M3) slice arm at 256 -- the fitted body at SPLITK=1 with the
+     * F8ST staging slot armed (Q10 machinery), PAD pinned to 1: the LUT's static 512 B
+     * does not fit the PAD0 carve's dynamic 65360 B under the 65536 per-WG ceiling
+     * (same law as the prefill launcher's r3d_launch256_f8). No DBUF (the 16B staging
+     * walk is bf16-only); fold composes (FOLD=1 rides SPLITK=1, the kernel's own
+     * static_assert's allowance, witnessed at 128 by the Q10 arms). Attribute failure
+     * falls back to tile_or_v1 like the bf16 arm. */
+    #define R3D_DK_L256F8(FD, ST)                                                                      \
+        do {                                                                                           \
+            static int attr = -1;                                                                      \
+            if (attr < 0)                                                                              \
+                attr = hipFuncSetAttribute(                                                            \
+                           (const void*)&(attn_paged_wmma_kernel<256, RAD_F8E4M3, 1, 0, FD, 1, ST, 0, 0, 0>),\
+                           hipFuncAttributeMaxDynamicSharedMemorySize,                                 \
+                           r3d_attn256_smem(1)) == hipSuccess ? 1 : 0;                                 \
+            if (!attr) return tile_or_v1();                                                            \
+            if (!r3d_256_arm_logged) {                                                                 \
+                r3d_256_arm_logged = 1;                                                                \
+                fprintf(stderr, "DBG attn-decode hd256 fp8 arm launched pad=1 fold=%d f8st=%d\n",     \
+                        FD, ST);                                                                       \
+            }                                                                                          \
+            hipLaunchKernelGGL((attn_paged_wmma_kernel<256, RAD_F8E4M3, 1, 0, FD, 1, ST, 0, 0, 0>),   \
+                               dim3((unsigned)gx, (unsigned)P.n_seq, (unsigned)gz),                    \
+                               dim3(kThreads), r3d_attn256_smem(1), stream, P);                        \
+            hipError_t e0 = hipGetLastError();                                                         \
+            if (e0 != hipSuccess) return RAD_E_DEVICE;   /* partial state: fail the step */            \
+            hipLaunchKernelGGL((attn_splitk_merge_kernel<256>),                                        \
+                               dim3((unsigned)P.q_heads, (unsigned)P.rows), dim3(256), 0, stream, P, spl);\
+            hipError_t e1 = hipGetLastError();                                                         \
+            return e1 == hipSuccess ? RAD_OK : RAD_E_DEVICE;                                           \
+        } while (0)
     if (d256) {
         static int pad256 = -1;
         if (pad256 < 0) pad256 = getenv("R3D_HD256_PAD") ? atoi(getenv("R3D_HD256_PAD")) : 1;
@@ -696,6 +729,21 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
         if (stagebar256 < 0) { const char* e = getenv("R3D_ATTN256_STAGEBAR");
                                stagebar256 = (e && atoi(e) != 0) ? 1 : 0; }
         static int r3d_256_arm_logged = 0;  /* Q45a liveness (stderr law, window 45) */
+        if (!kvbf) {
+            /* fp8 KV at 256 (Q62): the staged arms, lever for lever like 64/128.
+             * R3D_F8ST=0 instantiated nothing for 256: tile_or_v1 (whose WMMA tile
+             * refuses the same way and lands on v1), exactly the lever-off shape. */
+            if (!f8st) return tile_or_v1();
+            if (use_fold) {
+                if      (f8st == 1) R3D_DK_L256F8(1, 1);
+                else if (f8st == 2) R3D_DK_L256F8(1, 2);
+                else                R3D_DK_L256F8(1, 3);
+            } else {
+                if      (f8st == 1) R3D_DK_L256F8(0, 1);
+                else if (f8st == 2) R3D_DK_L256F8(0, 2);
+                else                R3D_DK_L256F8(0, 3);
+            }
+        }
         /* FD/DB/PAD reach the template as literals (two-level dispatch: the runtime
          * gates pick which of the eight instantiations to emit). */
         if (use_fold) {
@@ -767,5 +815,6 @@ extern "C" int r3d_rad_attn_paged_decode(const RadArgs* a, RadStream s) {
     #undef R3D_DK_LAUNCH8
     #undef R3D_DK_F8
     #undef R3D_DK_LAUNCH
+    #undef R3D_DK_L256F8
     return RAD_E_DEVICE;   /* unreachable: every macro arm returns */
 }

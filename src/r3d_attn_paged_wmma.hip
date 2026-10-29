@@ -158,6 +158,32 @@ namespace { __global__ void r3d_dbg_null(int* p) { if (p) *p = 1; } }
  * driver limit, never cost the engine one. `dbg` is the caller's R3D_DEBUG_DECODE
  * read: the launch-proof line names the tile and its arms once per (arm, process) --
  * host printf, never device (the printf+big-LDS 401 trap lives in the kernel body). */
+/* Q62: the fp8 (E4M3) tile arm at head_dim 256 -- the F8ST staging machinery that shipped
+ * for 64/128 (Q10), instantiated on the fitted 256 carve. PAD is pinned to 1: the F8ST
+ * arm declares a 512 B static LUT in shared, and PAD0's 65360 B dynamic plus it exceeds
+ * the 65536 per-WG ceiling -- the attribute raise for that instantiation can only fail,
+ * while PAD1's 64592 + 512 = 65104 fits. DBUF stays 0: DBUF's 16B staging walk is
+ * bf16-only by its gate; the F8ST>=3 wide byte gather is the fp8 vec path. */
+template <int ST>
+static int r3d_launch256_f8(const R3dAttnParams& P, dim3 grid, hipStream_t stream, int dbg) {
+    static int attr = -1;
+    if (attr < 0)
+        attr = hipFuncSetAttribute(
+                   (const void*)&attn_paged_wmma_kernel<256, RAD_F8E4M3, 0, 0, 0, 1, ST>,
+                   hipFuncAttributeMaxDynamicSharedMemorySize,
+                   r3d_attn256_smem(1)) == hipSuccess ? 1 : 0;
+    if (!attr) return RAD_E_DEVICE;
+    static int once = 0;
+    if (dbg && !once) {
+        once = 1;
+        printf("DBG attn-wmma hd256 fp8 tile launch st=%d smem=%d rows=%lld grid(%u,%u,%u)\n",
+               ST, r3d_attn256_smem(1), (long long)P.rows, grid.x, grid.y, grid.z);
+    }
+    hipLaunchKernelGGL((attn_paged_wmma_kernel<256, RAD_F8E4M3, 0, 0, 0, 1, ST>),
+                       grid, dim3(kThreads), r3d_attn256_smem(1), stream, P);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
 template <int DB, int PAD, int SB = 0>
 static int r3d_launch256(const R3dAttnParams& P, dim3 grid, hipStream_t stream, int dbg) {
     static int attr = -1;
@@ -229,8 +255,8 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
      * withdraws this path too (it zeroes `allowed` above, one switch for every WMMA
      * row), and R3D_ATTN_V2/V3 refuse 256 (v2/v3 instantiate 64/128 only -- the
      * refusal lands on v1 inside the entry, never on the engine). fp8 KV at 256
-     * stays v1: no 256-fp8 instantiation exists, and refusing a dtype the entry
-     * backstops is the ordinary contract. Accept evidence: COVERAGE windows 35/37/38
+     * joined in Q62 as the F8ST staging tile (PAD1; the LUT's static 512 B does not
+     * fit the PAD0 carve). Accept evidence: COVERAGE windows 35/37/38
      * (fragment-class drift accepted by the operator; split-KV decode 3.8-5.7x,
      * numeric band flat across SPL 1..64). */
     const int hd256 = r3d_hd256_on();
@@ -251,11 +277,14 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
     static int v3 = -1;
     if (v3 < 0) v3 = getenv("R3D_ATTN_V3") ? 1 : 0;
     /* head_dim 256 rides the v1 body only: v2/v3 have no 256 instantiation (their
-     * carves and thread maps are 64/128-shaped), and fp8-256 has none either. Refuse
+     * carves and thread maps are 64/128-shaped). fp8-256 joined in Q62 (the F8ST
+     * staging arms below). Refuse
      * BEFORE any grid/macro selection: a mis-selected D would launch a 64-wide body
      * over 256-wide operands. The entry's v1 backstop serves what we refuse. */
     const int d256 = hd256 && P.head_dim == 256;
-    if (d256 && (v2 || v3 || P.kvdt != RAD_BF16)) return RAD_E_UNSUPPORTED;
+    /* Q62: fp8 KV at 256 joined the WMMA family (r3d_launch256_f8); v2/v3 still have
+     * no 256 form of any dtype, and f8st=0 withdraws the fp8 arms below. */
+    if (d256 && (v2 || v3)) return RAD_E_UNSUPPORTED;
     /* DBUF: register-prefetched KV staging on v1's geometry (body.inc's DBUF branch).
      * Bit-identical schedule change (same fragments, same order, same LDS slots).
      * Default-on since the paired card bench (build8, 2026-10-20): 1.19-1.27x on all
@@ -351,6 +380,14 @@ int r3d_attn_paged_wmma_launch(const R3dAttnParams& P, hipStream_t stream) {
         static int sb256 = -1;
         if (sb256 < 0) sb256 = getenv("R3D_HD256_SB") ? 1 : 0;
         const int dbg256 = getenv("R3D_DEBUG_DECODE") ? 1 : 0;
+        if (!kvbf) {
+            /* fp8 KV at 256 (Q62): the F8ST staging tile, same R3D_F8ST law as the
+             * 64/128 fp8 arms (0 = not asked for: v1 answers unchanged). */
+            if (!f8st) return RAD_E_UNSUPPORTED;
+            if (f8st == 1) return r3d_launch256_f8<1>(P, grid, stream, dbg256);
+            if (f8st == 2) return r3d_launch256_f8<2>(P, grid, stream, dbg256);
+            return r3d_launch256_f8<3>(P, grid, stream, dbg256);
+        }
         if (dbuf_ok) {
             if (pad) return sb256 ? r3d_launch256<1, 1, 1>(P, grid, stream, dbg256)
                                   : r3d_launch256<1, 1>(P, grid, stream, dbg256);
