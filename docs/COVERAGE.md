@@ -4318,3 +4318,36 @@ re-verified on cat by the manager before booking.
 - QUEUE NEXT: Q61 desk (fp8-emb declare sites); Q57 prefill-latency desk;
   Q54 cold-tail gate (desk); OWNER-GATED Q58/Q28/Q41; Q69 parked (no codeberg
   acct); Q56/Q64 upstream-port residuals stay in w73 tree.
+
+## WINDOW 76 — 2026-10-31 (Q61 PATCH_PROVEN: fp8-embeddings 27B loads; device arm pending)
+- Q61 (desk, child on cat, GPU1 never touched) RAN — verdict PATCH_PROVEN.
+  The W65-built fp8-embeddings container
+  (w65_q59/out/qwen3.8-27b-lm-slim-fp8embd.rad, 14.46 GiB LM — matches W65
+  prediction exactly) now passes DECLARE (1075 ops / 1268 weights / 56
+  buffers / 4 KV groups, exit 0) and boots-to-serve on the HOST backend under
+  a 7-file/197-line qwen35_fp8 patch. Control pair re-derived by manager from
+  raw logs: unpatched engine + fp8embd = refusal
+  "token_embd.weight is declared bf16 ... only an exact widening is done at
+  load" (exit 1); patched = declare pass (exit 0).
+- Patch = declare token_embd at stored-codes dtype via the lm_head
+  weight_codes_dtype precedent + embed_lookup_q per-tile block-scale arm.
+  Branch cat:~/projects/radiance-fix w76-q61-fp8-embd @ 8b92197; arch_test
+  green (115 cases on 1.8.1, 162 on port); byte-identical 19-hunk/zero-
+  adaptation port onto pristine 1.11.0/ABI-26 at w76_q61/port/ (PORT_NOTES.md
+  + w76_port_1110.diff, uncommitted per deploy-gate law).
+- W65 FRAMING CORRECTED: blocker was never just three declare sites —
+  libr4d is RDNA4-ONLY (never built for gfx1100); libr3d src/r3d_rows.cpp:775
+  ships only embed_lookup, no _q arm. Patched logs state it verbatim:
+  "embed_lookup_q ... resolved a host kernel and no device one" — so any
+  fp8embd serve today needs --debug-accept-reference-kernels (host gather).
+- CARD SESSION QUEUED (Q61b, two chained legs): (1) libr3d bench child adds
+  embed_lookup_q RDNA3 device arm (battery+census per Q62 convention);
+  (2) KLD gate fp8embd-vs-slim-bf16 control + VRAM delta (expect -1.18 GiB;
+  embedding IS resident on this host). Engine deploy stays OWNER-GATED.
+- Serve untouched all window: spec9g running, restarts=0, /tokenize 200;
+  flashnext untouched; no w76-* containers left; card idle.
+- Evidence: cat:~/scratch/r3d/w76_q61/ (report.md, logs/{ctl,fix}-{fp8,
+  slim}.{out,err,exit}, port/{PORT_NOTES.md,w76_port_1110.diff,radiance/}).
+- QUEUE NEXT: Q61b card session (embed_lookup_q arm, then KLD+VRAM); Q57
+  prefill-latency desk; Q54 cold-tail gate (desk); OWNER-GATED Q58/Q28/Q41;
+  Q69 parked (no codeberg acct); Q56/Q64 port residuals in w73 tree.
