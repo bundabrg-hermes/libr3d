@@ -4148,3 +4148,62 @@ re-verified on cat by the manager before booking.
 - QUEUE AFTER THIS WINDOW: OWNER Q67 fund-vs-demote; OWNER cat-disk prune;
   Q56/Q64 port-to-1.11.0 (new residual); Q66 (card); Q61; Q57; Q54 cold-tail
   gate; Q55 withdraw-row clause; Q58/Q28/Q41 owner-gated.
+
+## WINDOW 71 (2026-10-30, AWST) — UPSTREAM LIBR3D COMPARISON (DESK, CHILD, READ-ONLY): SHARED-LINEAGE COUSIN CONFIRMED; ENGINE 1.14.0/ABI-31 NOW SHIPS AN IN-TREE libr3d
+- OWNER ASK: radiance upstream merged its own libr3d — compare vs our campaign lib.
+  Full report: local-host /home/hermes/.hermes/cache/scratch/w71_upstream_compare/
+  report.md (20 KB). Trees compared: /tmp/radiance-cb (Codeberg
+  StillDeadcode/radiance HEAD 8df39472, 2026-10-27) vs repo main (v165).
+- PROVENANCE: SHARED-LINEAGE COUSIN, not a fork of ours. Upstream squash-added
+  libr3d in 6cb98269 (Asim Siddiqui, 2026-10-27, 'libr3d: the gfx11 (RDNA3)
+  kernel library', 1193-line README), mirroring their in-tree libr4d; both libs
+  grew from the same radiance plugin skeleton. Zero campaign vocabulary upstream
+  (q8x/SKW8/bwin/mxfp4_sk absent — manager-grepped); upstream explicitly
+  REJECTS WMMA (GEMM-pipe-parity measurements) where we ship it.
+- ENGINE VERSION: /tmp/radiance-cb = radiance 1.14.0 (CMakeLists.txt:4) /
+  RAD_ABI_VERSION 31 (abi/rad_abi.h:20) — verified by manager. Production serve
+  = 1.11.0/ABI-26; libr3d DID NOT EXIST in 1.11.0. Any move to >=1.14.0 breaks
+  our ABI-26 binaries AND introduces a same-named in-tree plugin (loader
+  arbitrates by plugin name — loader.cpp:110/581, semantics unexercised).
+- OUR WINS vs UPSTREAM: variants only, never copies. Their fp8a8_m16 row got
+  LDS-scale staging but NOT our v162 bwin staging window / _decode split; fp8
+  KV exists ONLY at head_dim 128 (hard refuse head_dim != 128,
+  r3d_attn_paged_h128.hip:884/1468 — manager-verified) so our v164 hd256 work
+  is uncovered; their mxfp4 pairs e2m1 weights with FP8 activations, not our
+  q8x int8 ladder. Absent upstream entirely: GDN DEVICE rows (correction: they
+  DO know GDN shapes — comments route them to generic GEMM; manager nit on the
+  child's overstated 'no GDN awareness'), hd256/h64 WMMA attention + split-KV,
+  qk_norm_rope_gate fused prologues, q8x ladder + M9..64 band + round-UP fix,
+  bwin, vectorised b128 elementwise, logit_rerank/rope_table_f32/dflash_conv.
+- UPSTREAM-ONLY CAPABILITY (candidate adoptions/study): fp8a16 M<=1 decode GEMV
+  (fp8 weights x bf16 activations — a regime we lack entirely), inta8 w8a8/
+  w4a8 m16 rows, mxfp4a8 rows, h128 paged attention over bf16-or-e4m3 cache
+  incl fp8-cache PREFILL (absent in ours at any head_dim), split-K vocab GEMM,
+  wide elementwise superset (layernorm/gelu/softmax/gather/scatter/row_topk),
+  dequant family reading container-native quantised weights + E5M2 codecs,
+  gated-MLP one-launch fusion, shipped selftest harness, and the engine-side
+  lfm2 block-fp8 trunk (128x128 E4M3 blocks + bf16 scale planes + dynamic
+  per-128 act quant; its gate_quant_fp8 fused rows exist only in libr4d, so
+  gfx11 falls back UNFUSED there).
+- ABI: same plugin-contract class, standalone-buildable, links rad_abi only —
+  NOT coupled to engine internals. Their built .so reports ABI 31; our sources
+  are ABI-agnostic by design (compile-vs-ABI-31 PROVEN NOT TESTED — owed).
+- STRATEGIC READ (manager-approved): staleness risk is concentrated in the
+  DEPLOYMENT MODEL, not code overlap: upstream solved a different half of the
+  problem; our serve stack (GDN, hd256 attention, qk_norm fusion, q8x mxfp4) is
+  exactly what they lack. Contributable back with low conflict: those four
+  families + bwin + vectorised elementwise. Live collisions needing
+  coordination: mxfp4a8 vs q8x bands; fp8a8_m16 vs sk-walk; dot2-h128 vs WMMA
+  (their WMMA rejection vs our measured wins); duplicated fused quant
+  producers; plugin NAME clash at >=1.14.0.
+- NEW ROWS: Q68 = 1.14.0/ABI-31 rebase EVALUATION (prove v165 sources compile
+  + battery legs vs the 31 headers; desk+build, no serve risk). Q69 = upstream
+  contribution pass (package GDN/hd256/qk_norm/q8x/bwin) — OWNER-GATED,
+  external repo. Q70 = plugin-name-collision arbitration semantics (desk,
+  rides Q68).
+- Q67 NOTE: comparison mildly favors DEMOTE — upstream's fp8-cache rows are
+  h128-only (irrelevant to our hd256 27B), and their INT8 rows (inta8) don't
+  cover KV. Q67 fund-vs-demote stays OWNER.
+- QUEUE AFTER THIS WINDOW: unchanged head (OWNER Q67; Q56/Q64 port-to-1.11.0;
+  Q66 card; Q61; Q57; Q54 cold-tail gate) + NEW Q68/Q70 desk pair; Q69 owner-
+  gated. OWNER-GATED unchanged: Q58/Q28/Q41.
