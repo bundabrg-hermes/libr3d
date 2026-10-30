@@ -4207,3 +4207,32 @@ re-verified on cat by the manager before booking.
 - QUEUE AFTER THIS WINDOW: unchanged head (OWNER Q67; Q56/Q64 port-to-1.11.0;
   Q66 card; Q61; Q57; Q54 cold-tail gate) + NEW Q68/Q70 desk pair; Q69 owner-
   gated. OWNER-GATED unchanged: Q58/Q28/Q41.
+
+## WINDOW 72 — 2026-10-30 (desk pair Q68+Q70; owner calls Q67/Q69)
+- OWNER CALLS BOOKED: Q67 per-block-amax INT8 KV = DEMOTED (131K was an
+  observation of another engine, not a requirement; bf16 = permanent KV
+  default, fp8-KV stays in-tree documented-experimental, no code removal).
+  Q69 upstream-contribution pass = PARKED (owner has no codeberg account yet).
+- Q68 RAN (desk child, manager-verified): rebase to >=1.14.0/ABI-31 = effort
+  M, SOURCE-FREE — header delta 26->31 almost purely additive, zero changed
+  symbols our src references (diffed vs origin/main@8df3947). Cost = the
+  engine's hard ABI gate (loader refuses our ABI-26 .so at dlopen) => full
+  rebuild + battery/kbench re-gate + name-policy BEFORE any serve move.
+  Real compile-vs-31 build still owed; rides an actual move.
+- Q70 RAN: COEXISTENCE FALSIFIED. Stage-time file-STEM shadowing on
+  $RADIANCE_HOME order (earlier home wins, RAD_INFO only) picks one silently;
+  renaming so both stage hits name dedup RAD_E_DUPLICATE => boot-fatal.
+  No deterministic selection exists (--kernels cannot distinguish; RTLD_LOCAL).
+  Deployment rule for any >=1.14 move: exactly one libr3d file in home +
+  rad-info --plugins startup gate. All four code sites manager-verified
+  verbatim (loader.cpp:136-139/164-166/546-556, engine_bringup.cpp:957-965,
+  libr3d/CMakeLists.txt rad_add_plugin).
+- Bonus finding (both Q68/Q70 legs): KV streaming (--kv-resident) has ZERO
+  kv_resolve rows in EITHER library for gfx11 — dead feature on this card
+  until someone writes them. New small row candidate if it ever matters.
+- Report: ~/.hermes/cache/scratch/w72_q68q70/report.md (local host).
+- Serve UNTOUCHED (spec9g v165 healthy). Card idle. No repo tree modified
+  by the child (upstream checkout fetch-only; pre-existing untracked dirs
+  only).
+- QUEUE NEXT: Q56/Q64 port-to-1.11.0 (desk); Q66 card session; Q61; Q57;
+  Q54 cold-tail gate; OWNER-GATED Q58/Q28/Q41; Q69 parked.
