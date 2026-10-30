@@ -4236,3 +4236,34 @@ re-verified on cat by the manager before booking.
   only).
 - QUEUE NEXT: Q56/Q64 port-to-1.11.0 (desk); Q66 card session; Q61; Q57;
   Q54 cold-tail gate; OWNER-GATED Q58/Q28/Q41; Q69 parked.
+
+## WINDOW 73 — 2026-10-31 (Q56/Q64 port-to-1.11.0: PORTED_PROVEN, deploy owner-gated)
+- Q56 (prefill-TPS display honesty) + Q64 (pool-cap graceful end) PORTED from
+  the radiance-fix 1.8.1 tree onto production engine 1.11.0/ABI-26. Source
+  provenance: tag v1.11.0 (9eaf10d) of cat:~/docker/radiance-native; tree
+  verified VERSION 1.11.0 / ABI 26u == spec9g /version. Work tree
+  cat:~/scratch/r3d/w73_port/ (port UNCOMMITTED by protocol; engine binary
+  install-fix/bin/radiance md5 0eeb9f61).
+- Port = 13 hunks / 4 files, semantically identical to the 1.8.1 fix
+  (rates_from_window + open-step windowing for Q56; close_request
+  Finished/"length" + honest wording for Q64). Manager spot-verified hunks
+  verbatim on the cat tree.
+- Runtime proof on XTX (9b-mxfp4 + v165 ABI-26 overlay, throwaway :9009/:9011):
+  OLD 1.11.0 Q56 signature reproduced on production binary — prefill_tps
+  4096.0 CONSTANT across 113 polls vs true 329 t/s. FIXED: 57 distinct values
+  /111 polls, converging through true rate. Q64 OLD: in-band
+  internal_server_error at cap crossing (streamed) / HTTP 500 (w70 non-stream);
+  FIXED: HTTP 200 + finish_reason length + partial + [DONE], polite refusal
+  line. Second independent child re-ran both legs fresh with same results.
+  (PROCESS FLAG: manager dispatched two children overlapping on this card —
+  one-at-a-time rule slipped; second child pivoted to independent verification,
+  no conflict, outcome strengthened. Logged as a manager error.)
+- ctest 109/114 pre==post (5 environmental failures identical; sched_test
+  passes incl. both new tests). Designed residual: <=0.5 s TPS-floor transient.
+- DEPLOY = owner-gated (engine binary swap inside spec9g; rollback = stock
+  radiance-dev:v1.11.0 image retained).
+- Serve UNTOUCHED (spec9g v165 healthy /tokenize 200, flashnext untouched).
+  Card idle at close. Cat root disk 99% again (15 G free) — child freed 14 G
+  of stale build objects; prune candidate list unchanged.
+- QUEUE NEXT: OWNER engine-deploy call; Q66 card session; Q61; Q57;
+  Q54 cold-tail gate; OWNER-GATED Q58/Q28/Q41; Q69 parked.
