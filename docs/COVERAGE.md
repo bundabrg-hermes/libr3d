@@ -4285,3 +4285,36 @@ re-verified on cat by the manager before booking.
   back to 10.09 GB baseline, spec9g restarts=0 /tokenize 200.
 - QUEUE NEXT: OWNER engine-deploy call (Q56/Q64 build, w73_port, md5 0eeb9f61);
   Q61; Q57; Q54 cold-tail gate; OWNER-GATED Q58/Q28/Q41; Q69 parked.
+
+## WINDOW 75 — 2026-10-31 (ENGINE DEPLOY executed: Q56/Q64 build LIVE on spec9g)
+- OWNER BOOKED: "swap to the proven build" (deploy call executed this window).
+- DEPLOY DONE by child, manager-verified: spec9g recreated identical except one
+  added ro-bind w73_port/install-fix/bin/radiance -> /opt/radiance/bin/radiance;
+  in-container radiance md5 0eeb9f61c5acc2b11fe8dea63a89f208 (stock was
+  c23666dc...); image stays radiance-dev:v1.11.0 (id c21457846d47); libr3d.so
+  mount byte-identical before/after (5e9147eb37e2988f5a1e721168e8cbe0).
+  Gates all green: gfx1100 boot, libr3d 754 op bands, ABI-26 via /version,
+  /health 200, /tokenize 200 (prompt-field schema; text-field 400 = normal),
+  chat 200 finish=stop, restarts=0.
+- Q56 LIVE PROOF: 3198-token prefill, 49 polls @200ms -> 46 distinct
+  prefill_tps, longest constant run 4 (designed floor transient); old-bug
+  signature (4096.0 x 113) absent. q56_poll_series.json.
+- MANAGER HASH-AUDIT (child flag: live hash != ledger-recalled 714bd41b):
+  714bd41b was the v163-era serve artifact — stale recall, no live anomaly.
+  Live file == build_v165/radiance_home mount source; vs Q63 promotion artifact
+  e0b523d8 the two differ in 302 bytes ALL in debug sections — objcopy-
+  canonicalized (debug/comment stripped) cmp is EQUAL: fatbin/text/rodata
+  identical. Live serve == v165 canonical. Ledger law amended: serve artifact
+  identity is hash of the MOUNT SOURCE + canonical (debug-stripped) equality,
+  not any single historical full-file md5.
+- FLASHNEXT NOTE: container showed ~7 min uptime at deploy start (its
+  supervisor restarted ~2026-10-30T20:5x AWST); container record untouched
+  since Oct 30 04:05 UTC, restarts=0; deploy ops never touched it, uptime grew
+  monotonically across cutover.
+- Rollback intact: spec9g_v163_rollback Exited-present; stock-recreation path
+  staged w75_deploy/rollback.sh; old config saved spec9g_inspect.json.
+- Evidence: cat:~/scratch/r3d/w75_deploy/ (gates.txt, run.sh, rollback.sh,
+  q56_poll_series.json, spec9g_inspect.json).
+- QUEUE NEXT: Q61 desk (fp8-emb declare sites); Q57 prefill-latency desk;
+  Q54 cold-tail gate (desk); OWNER-GATED Q58/Q28/Q41; Q69 parked (no codeberg
+  acct); Q56/Q64 upstream-port residuals stay in w73 tree.
