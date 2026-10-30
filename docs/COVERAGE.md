@@ -4351,3 +4351,42 @@ re-verified on cat by the manager before booking.
 - QUEUE NEXT: Q61b card session (embed_lookup_q arm, then KLD+VRAM); Q57
   prefill-latency desk; Q54 cold-tail gate (desk); OWNER-GATED Q58/Q28/Q41;
   Q69 parked (no codeberg acct); Q56/Q64 port residuals in w73 tree.
+
+## WINDOW 77 — 2026-10-31 (Q61b PROMOTED as v166: embed_lookup_q RDNA3 device arm)
+- Q61b leg 1 RAN via THREE children: #1 crashed in a repetition loop mid-debug
+  (transcript kept on Hermes host deleg_59c1cdfd; its kernel+probe survive as
+  inherited state); #2 resumed and CRACKED IT: the inherited kernel was
+  already bit-correct — all 3 quoted "failures" were harness bugs (scale
+  operand never passed to oracle; uint16 mirror read with byte arithmetic =
+  the "element shift"; wrong row stride; OOB bench leg). Manager re-ran probe
+  battery independently: 8/8 PASS, schema verbatim libref. NaN policy audited:
+  only both-NaN payload divergences tolerated (IEEE-unspecified), all
+  finite/Inf bit-exact.
+- Q61b PROMOTED as v166 (main 6443e9a -> 7517826 -> bump d30d9a0; repo has NO
+  in-tree version string — bump = message + build_vNNN convention, per v165
+  precedent). Ceremony green: double-build fatbin BYTE-IDENTICAL (19,898,320 B
+  sha 3f95217a..., 78/78 carve ELFs); FULL battery vs same-session v165
+  control: stock 2031/2031 + mxfp4-full 4737/4737, decision rows
+  BYTE-IDENTICAL 2031/2031 + 1779/1779, only delta additive registration
+  (rows 61->62); exhaustive new-kernel battery 44/44 incl two 248320x5120
+  sweeps; census 12/12 instantiations VGPR 11-14 (cap 128) 0 spill/0 LDS;
+  tree delta +12/-0, 313 common arms metadata-zero-diff. Manager verified
+  main-vs-branch tree diff = 0 and re-derived 44/44 + fatbin proof from
+  artifact logs.
+- Bench (co-resident with spec9g, 3 interleaved rounds): decode M1 20.5-30.3
+  us (1.3-2.1x host gather); prefill M8192 cache-fit 248-396 us / 317-435
+  GB/s (106-145x host), cold 404-408 us (~309 GB/s), cold-full-sweep ~530
+  GB/s.
+- v166 sha256 02c2da92... at cat:~/scratch/r3d/w77_promo/libr3d-v166.so.
+  NOT deployed (serve = v165; and the embedq consumer additionally needs the
+  w76 engine port — both OWNER-GATED). Q61b leg 2 (KLD gate fp8embd vs
+  slim-bf16 + serve VRAM delta) now unblocked: requires engine-port deploy
+  first.
+- Hygiene: all w77*/w77p-* containers removed; spec9g running restarts=0,
+  /tokenize 200; flashnext untouched; card idle.
+- Evidence: cat:~/scratch/r3d/w77_q61b/ (report.md, battery3.log, bench2.log,
+  census_all.txt, q61b_run.sh) + cat:~/scratch/r3d/w77_promo/ (report.md,
+  fatbin/carve proofs, battery comparator outputs).
+- QUEUE NEXT: Q61b leg 2 (KLD+VRAM, gated on owner engine-port deploy); Q57
+  prefill-latency desk; Q54 cold-tail gate (desk); OWNER-GATED Q58/Q28/Q41;
+  Q69 parked (no codeberg acct).
