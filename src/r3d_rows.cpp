@@ -70,6 +70,29 @@ static const RadOperandSpec oEmbed[] = {
     { "x",      RAD_OPD_OUT,    0 },
 };
 
+/* embed_lookup_q: param/operand tables verbatim from libr4d (r4d_rows.cpp pEmbed/oEmbedQ),
+ * which are verbatim libref's (ref_registry.cpp) -- the loader refuses a kernel plugin whose
+ * positional schema disagrees with the op's first declarant WHOLE, so this list must match
+ * entry for entry: pEmbed is pEmbedM without `mult` (the quantised table has its scale
+ * operand instead of a row factor), and oEmbedQ adds the optional `scale` weight -- one
+ * entry being the n-gram's whole-table scale, more entries the per-tile plane of a
+ * block-fp8 table -- and the optional `ahead` ids of a host reader that fetches rows. */
+static const RadParamSpec pEmbedQ[] = {
+    { "M",       RAD_P_INT, RAD_REQUIRED },
+    { "n_embd",  RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab", RAD_P_INT, RAD_REQUIRED },
+    { "dtype",   RAD_P_STR, RAD_REQUIRED },
+    { "vocab_offset", RAD_P_INT, RAD_OPTIONAL },
+    { "wscale",  RAD_P_F64, RAD_OPTIONAL },
+};
+static const RadOperandSpec oEmbedQ[] = {
+    { "tokens", RAD_OPD_IN,     0 },
+    { "wte",    RAD_OPD_WEIGHT, 0 },
+    { "scale",  RAD_OPD_WEIGHT, 1 },
+    { "x",      RAD_OPD_OUT,    0 },
+    { "ahead",  RAD_OPD_IN,     1 },
+};
+
 /* kv_store: verbatim libr4d (r4d_rows.cpp pKvStore/oKvStore). The scales are the reader's
  * descales and unused for the bf16 cache this row serves. */
 static const RadParamSpec pKvStore[] = {
@@ -778,6 +801,16 @@ static const RadOpSchema kSchemas[] = {
       "[vocab_offset, vocab_offset + n_vocab) -- which is what makes the table shardable "
       "across the vocabulary, the symmetry lm_head already had. Ids stay GLOBAL; summing the "
       "ranks reconstructs x, so the caller follows this with an exact all_reduce." },
+    { "embed_lookup_q", pEmbedQ, (int)(sizeof(pEmbedQ)/sizeof(pEmbedQ[0])),
+      oEmbedQ, (int)(sizeof(oEmbedQ)/sizeof(oEmbedQ[0])),
+      "the same gather from a table quantised with one scale for all of it, or one per tile: "
+      "x[m] = wte[id] * scale[b]. Qwen3.8-Flash-Next-FP8's 320-million-row n-gram embedding "
+      "is stored with a single bf16 `weight_scale`, and it can be, because E4M3 carries its "
+      "own exponent and a row's dynamic range is 2.3x; a block-fp8 embedding table instead "
+      "carries a bf16 scale plane with one entry per 128x128 tile (the qwen35_fp8 token "
+      "table gathers through this op). Padding and bounds behave exactly as embed_lookup's. "
+      "`ahead` is the next prompt's ids, for a reader that fetches rows ahead of the step; "
+      "a kernel that reads its table in place ignores it." },
     { "kv_store", pKvStore, (int)(sizeof(pKvStore)/sizeof(pKvStore[0])),
       oKvStore,  (int)(sizeof(oKvStore)/sizeof(oKvStore[0])),
       "scatter k and v into kv_cache[n_blocks, kv_heads, block_size, 2*head_dim] -- K at "
@@ -1293,6 +1326,7 @@ static RadConstraint cConvFused[] = {
 
 extern "C" int r3d_rad_rmsnorm(const RadArgs*, RadStream);
 extern "C" int r3d_rad_embed_lookup(const RadArgs*, RadStream);
+extern "C" int r3d_rad_embed_lookup_q(const RadArgs*, RadStream);
 extern "C" int r3d_rad_kv_store(const RadArgs*, RadStream);
 extern "C" int r3d_rad_kv_store_fp8(const RadArgs*, RadStream);
 extern "C" int r3d_rad_act_mul(const RadArgs*, RadStream);
@@ -1405,6 +1439,17 @@ static const RadKernelInfo kRows[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   cBf16Row, 1, nullptr, 0, nullptr,
   nullptr, nullptr, r3d_rad_embed_lookup },
+
+{ "embed_lookup_q_bf16", "embed_lookup_q", "vocab",
+  "quantised embedding gather, four entries a thread (Q61b)",
+  "any n_embd and n_vocab; a negative or out-of-range id writes a zero row",
+  "i32/i64 tokens, an E4M3 table with a bf16 or f32 scale -- one entry for the whole table "
+  "or a per-tile plane (the block-fp8 embedding of qwen35_fp8) -- or a plain bf16 table, "
+  "bf16 output; the product is one f32 rounding (exact there) and one RTNE narrowing, "
+  "bit-equal to libref's embed_gather",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  cBf16Row, 1, nullptr, 0, nullptr,
+  nullptr, nullptr, r3d_rad_embed_lookup_q },
 
 { "kv_store_bf16", "kv_store", "attn",
   "scatter k and v into the paged cache, one workgroup a token",
