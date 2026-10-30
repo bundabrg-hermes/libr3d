@@ -4267,3 +4267,21 @@ re-verified on cat by the manager before booking.
   of stale build objects; prune candidate list unchanged.
 - QUEUE NEXT: OWNER engine-deploy call; Q66 card session; Q61; Q57;
   Q54 cold-tail gate; OWNER-GATED Q58/Q28/Q41; Q69 parked.
+
+## WINDOW 74 — 2026-10-31 (Q66 dflash accept-drift: CLOSED = corpus regime, no drift)
+- Q66 RAN (card child, GPU1, 9b-mxfp4, throwaway w74-* containers; spec9g
+  co-resident untouched). DEPTH CLIFF FALSIFIED: accept pos1/2/3 flat-to-rising
+  512->16.7k prompt tokens on real Gutenberg prose (deepest leg best). BUILD
+  DRIFT FALSIFIED: v163/v164/v165 aggregates agree within noise (pos2
+  .724/.723/.713). CORPUS REGIME CONFIRMED: same serve/build/depth,
+  repetitive text scores pos2/3 .82-.89/.85-.91 vs natural prose .72/.66 —
+  the w63-era "0.88/0.95 reference" was measured on a verbatim-repeating
+  filler battery; ~0.72 IS the natural-prose band. w68 deep legs actually rose
+  0.70->0.80 with depth. Engine has no position-gated path in the dflash2
+  block. Draft is healthy on the live line; user-facing takeaway: accept-rate
+  on the UI reflects TEXT TYPE, not any regression.
+- Evidence: cat:~/scratch/r3d/w74_q66/ (verdict.md, jsonl ladders, one voided
+  run kept as tainted1 evidence). Hygiene clean: containers removed, GPU1
+  back to 10.09 GB baseline, spec9g restarts=0 /tokenize 200.
+- QUEUE NEXT: OWNER engine-deploy call (Q56/Q64 build, w73_port, md5 0eeb9f61);
+  Q61; Q57; Q54 cold-tail gate; OWNER-GATED Q58/Q28/Q41; Q69 parked.
